@@ -17,7 +17,6 @@
 package cmd
 
 import (
-	"context"
 	"os"
 	pathutil "path"
 	"sync"
@@ -51,7 +50,7 @@ func (fsi *fsIOPool) lookupToRead(path string) (*lock.RLockedFile, bool) {
 		if rlkFile.IsClosed() {
 			// Log this as an error.
 			reqInfo := (&logger.ReqInfo{}).AppendTags("path", path)
-			ctx := logger.SetReqInfo(context.Background(), reqInfo)
+			ctx := logger.SetReqInfo(GlobalContext, reqInfo)
 			logger.LogIf(ctx, errUnexpected)
 
 			// Purge the cached lock path from map.
@@ -94,9 +93,9 @@ func (fsi *fsIOPool) Open(path string) (*lock.RLockedFile, error) {
 		newRlkFile, err := lock.RLockedOpenFile(path)
 		if err != nil {
 			switch {
-			case os.IsNotExist(err):
+			case osIsNotExist(err):
 				return nil, errFileNotFound
-			case os.IsPermission(err):
+			case osIsPermission(err):
 				return nil, errFileAccessDenied
 			case isSysErrIsDir(err):
 				return nil, errIsNotRegular
@@ -151,13 +150,16 @@ func (fsi *fsIOPool) Write(path string) (wlk *lock.LockedFile, err error) {
 	wlk, err = lock.LockedOpenFile(path, os.O_RDWR, 0666)
 	if err != nil {
 		switch {
-		case os.IsNotExist(err):
+		case osIsNotExist(err):
 			return nil, errFileNotFound
-		case os.IsPermission(err):
+		case osIsPermission(err):
 			return nil, errFileAccessDenied
 		case isSysErrIsDir(err):
 			return nil, errIsNotRegular
 		default:
+			if isSysErrPathNotFound(err) {
+				return nil, errFileNotFound
+			}
 			return nil, err
 		}
 	}
@@ -180,7 +182,7 @@ func (fsi *fsIOPool) Create(path string) (wlk *lock.LockedFile, err error) {
 	wlk, err = lock.LockedOpenFile(path, os.O_RDWR|os.O_CREATE, 0666)
 	if err != nil {
 		switch {
-		case os.IsPermission(err):
+		case osIsPermission(err):
 			return nil, errFileAccessDenied
 		case isSysErrIsDir(err):
 			return nil, errIsNotRegular

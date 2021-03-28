@@ -18,16 +18,16 @@ MinIO GCS网关将亚马逊S3兼容性添加到Google云存储。
 docker run -p 9000:9000 --name gcs-s3 \
  -v /path/to/credentials.json:/credentials.json \
  -e "GOOGLE_APPLICATION_CREDENTIALS=/credentials.json" \
- -e "MINIO_ACCESS_KEY=minioaccountname" \
- -e "MINIO_SECRET_KEY=minioaccountkey" \
+ -e "MINIO_ROOT_USER=minioaccountname" \
+ -e "MINIO_ROOT_PASSWORD=minioaccountkey" \
  minio/minio gateway gcs yourprojectid
 ```
 
 ### 使用二进制
 ```
 export GOOGLE_APPLICATION_CREDENTIALS=/path/to/credentials.json
-export MINIO_ACCESS_KEY=minioaccesskey
-export MINIO_SECRET_KEY=miniosecretkey
+export MINIO_ROOT_USER=minioaccesskey
+export MINIO_ROOT_PASSWORD=miniosecretkey
 minio gateway gcs yourprojectid
 ```
 
@@ -41,7 +41,7 @@ MinIO Gateway配有嵌入式网络对象浏览器。 将您的Web浏览器指向
 
 ### 配置  `mc`
 ```
-mc config host add mygcs http://gateway-ip:9000 minioaccesskey miniosecretkey
+mc alias set mygcs http://gateway-ip:9000 minioaccesskey miniosecretkey
 ```
 
 ### 列出GCS上的容器

@@ -33,22 +33,27 @@ import (
 	"github.com/minio/minio/pkg/madmin"
 )
 
-// adminXLTestBed - encapsulates subsystems that need to be setup for
+// adminErasureTestBed - encapsulates subsystems that need to be setup for
 // admin-handler unit tests.
-type adminXLTestBed struct {
-	xlDirs   []string
-	objLayer ObjectLayer
-	router   *mux.Router
+type adminErasureTestBed struct {
+	erasureDirs []string
+	objLayer    ObjectLayer
+	router      *mux.Router
 }
 
-// prepareAdminXLTestBed - helper function that setups a single-node
-// XL backend for admin-handler tests.
-func prepareAdminXLTestBed() (*adminXLTestBed, error) {
+// prepareAdminErasureTestBed - helper function that setups a single-node
+// Erasure backend for admin-handler tests.
+func prepareAdminErasureTestBed(ctx context.Context) (*adminErasureTestBed, error) {
+
 	// reset global variables to start afresh.
 	resetTestGlobals()
 
+	// Set globalIsErasure to indicate that the setup uses an erasure
+	// code backend.
+	globalIsErasure = true
+
 	// Initializing objectLayer for HealFormatHandler.
-	objLayer, xlDirs, xlErr := initTestXLObjLayer()
+	objLayer, erasureDirs, xlErr := initTestErasureObjLayer(ctx)
 	if xlErr != nil {
 		return nil, xlErr
 	}
@@ -61,67 +66,40 @@ func prepareAdminXLTestBed() (*adminXLTestBed, error) {
 	// Initialize boot time
 	globalBootTime = UTCNow()
 
-	globalEndpoints = mustGetZoneEndpoints(xlDirs...)
+	globalEndpoints = mustGetPoolEndpoints(erasureDirs...)
 
-	// Set globalIsXL to indicate that the setup uses an erasure
-	// code backend.
-	globalIsXL = true
+	newAllSubsystems()
 
-	// Init global heal state
-	if globalIsXL {
-		globalAllHealState = initHealState()
-	}
-
-	globalConfigSys = NewConfigSys()
-
-	globalIAMSys = NewIAMSys()
-	globalIAMSys.Init(objLayer)
-
-	buckets, err := objLayer.ListBuckets(context.Background())
-	if err != nil {
-		return nil, err
-	}
-
-	globalPolicySys = NewPolicySys()
-	globalPolicySys.Init(buckets, objLayer)
-
-	globalNotificationSys = NewNotificationSys(globalEndpoints)
-	globalNotificationSys.Init(buckets, objLayer)
+	initAllSubsystems(ctx, objLayer)
 
 	// Setup admin mgmt REST API handlers.
 	adminRouter := mux.NewRouter()
 	registerAdminRouter(adminRouter, true, true)
 
-	return &adminXLTestBed{
-		xlDirs:   xlDirs,
-		objLayer: objLayer,
-		router:   adminRouter,
+	return &adminErasureTestBed{
+		erasureDirs: erasureDirs,
+		objLayer:    objLayer,
+		router:      adminRouter,
 	}, nil
 }
 
 // TearDown - method that resets the test bed for subsequent unit
 // tests to start afresh.
-func (atb *adminXLTestBed) TearDown() {
-	removeRoots(atb.xlDirs)
+func (atb *adminErasureTestBed) TearDown() {
+	removeRoots(atb.erasureDirs)
 	resetTestGlobals()
 }
 
-// initTestObjLayer - Helper function to initialize an XL-based object
+// initTestObjLayer - Helper function to initialize an Erasure-based object
 // layer and set globalObjectAPI.
-func initTestXLObjLayer() (ObjectLayer, []string, error) {
-	xlDirs, err := getRandomDisks(16)
+func initTestErasureObjLayer(ctx context.Context) (ObjectLayer, []string, error) {
+	erasureDirs, err := getRandomDisks(16)
 	if err != nil {
 		return nil, nil, err
 	}
-	endpoints := mustGetNewEndpoints(xlDirs...)
-	format, err := waitForFormatXL(true, endpoints, 1, 16, "")
-	if err != nil {
-		removeRoots(xlDirs)
-		return nil, nil, err
-	}
-
+	endpoints := mustGetPoolEndpoints(erasureDirs...)
 	globalPolicySys = NewPolicySys()
-	objLayer, err := newXLSets(endpoints, format, 1, 16)
+	objLayer, err := newErasureServerPools(ctx, endpoints)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -130,7 +108,7 @@ func initTestXLObjLayer() (ObjectLayer, []string, error) {
 	globalObjLayerMutex.Lock()
 	globalObjectAPI = objLayer
 	globalObjLayerMutex.Unlock()
-	return objLayer, xlDirs, nil
+	return objLayer, erasureDirs, nil
 }
 
 // cmdType - Represents different service subcomands like status, stop
@@ -196,9 +174,12 @@ func getServiceCmdRequest(cmd cmdType, cred auth.Credentials) (*http.Request, er
 // testServicesCmdHandler - parametrizes service subcommand tests on
 // cmdType value.
 func testServicesCmdHandler(cmd cmdType, t *testing.T) {
-	adminTestBed, err := prepareAdminXLTestBed()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	adminTestBed, err := prepareAdminErasureTestBed(ctx)
 	if err != nil {
-		t.Fatal("Failed to initialize a single node XL backend for admin handler tests.")
+		t.Fatal("Failed to initialize a single node Erasure backend for admin handler tests.")
 	}
 	defer adminTestBed.TearDown()
 
@@ -264,10 +245,14 @@ func buildAdminRequest(queryVal url.Values, method, path string,
 }
 
 func TestAdminServerInfo(t *testing.T) {
-	adminTestBed, err := prepareAdminXLTestBed()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	adminTestBed, err := prepareAdminErasureTestBed(ctx)
 	if err != nil {
-		t.Fatal("Failed to initialize a single node XL backend for admin handler tests.")
+		t.Fatal("Failed to initialize a single node Erasure backend for admin handler tests.")
 	}
+
 	defer adminTestBed.TearDown()
 
 	// Initialize admin peers to make admin RPC calls.
@@ -307,7 +292,7 @@ func TestToAdminAPIErrCode(t *testing.T) {
 	}{
 		// 1. Server not in quorum.
 		{
-			err:            errXLWriteQuorum,
+			err:            errErasureWriteQuorum,
 			expectedAPIErr: ErrAdminConfigNoQuorum,
 		},
 		// 2. No error.
@@ -318,12 +303,12 @@ func TestToAdminAPIErrCode(t *testing.T) {
 		// 3. Non-admin API specific error.
 		{
 			err:            errDiskNotFound,
-			expectedAPIErr: toAPIErrorCode(context.Background(), errDiskNotFound),
+			expectedAPIErr: toAPIErrorCode(GlobalContext, errDiskNotFound),
 		},
 	}
 
 	for i, test := range testCases {
-		actualErr := toAdminAPIErrCode(context.Background(), test.err)
+		actualErr := toAdminAPIErrCode(GlobalContext, test.err)
 		if actualErr != test.expectedAPIErr {
 			t.Errorf("Test %d: Expected %v but received %v",
 				i+1, test.expectedAPIErr, actualErr)
@@ -335,13 +320,13 @@ func TestExtractHealInitParams(t *testing.T) {
 	mkParams := func(clientToken string, forceStart, forceStop bool) url.Values {
 		v := url.Values{}
 		if clientToken != "" {
-			v.Add(string(mgmtClientToken), clientToken)
+			v.Add(mgmtClientToken, clientToken)
 		}
 		if forceStart {
-			v.Add(string(mgmtForceStart), "")
+			v.Add(mgmtForceStart, "")
 		}
 		if forceStop {
-			v.Add(string(mgmtForceStop), "")
+			v.Add(mgmtForceStop, "")
 		}
 		return v
 	}
@@ -359,11 +344,11 @@ func TestExtractHealInitParams(t *testing.T) {
 	}
 	varsArr := []map[string]string{
 		// Invalid cases
-		{string(mgmtPrefix): "objprefix"},
+		{mgmtPrefix: "objprefix"},
 		// Valid cases
 		{},
-		{string(mgmtBucket): "bucket"},
-		{string(mgmtBucket): "bucket", string(mgmtPrefix): "objprefix"},
+		{mgmtBucket: "bucket"},
+		{mgmtBucket: "bucket", mgmtPrefix: "objprefix"},
 	}
 
 	// Body is always valid - we do not test JSON decoding.
@@ -372,7 +357,7 @@ func TestExtractHealInitParams(t *testing.T) {
 	// Test all combinations!
 	for pIdx, parms := range qParmsArr {
 		for vIdx, vars := range varsArr {
-			_, err := extractHealInitParams(vars, parms, bytes.NewBuffer([]byte(body)))
+			_, err := extractHealInitParams(vars, parms, bytes.NewReader([]byte(body)))
 			isErrCase := false
 			if pIdx < 4 || vIdx < 1 {
 				isErrCase = true

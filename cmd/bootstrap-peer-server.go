@@ -18,18 +18,16 @@ package cmd
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"runtime"
-	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/mux"
-	"github.com/minio/minio-go/v6/pkg/set"
+	"github.com/minio/minio-go/v7/pkg/set"
 	xhttp "github.com/minio/minio/cmd/http"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/cmd/rest"
@@ -43,6 +41,7 @@ const (
 )
 
 const (
+	bootstrapRESTMethodHealth = "/health"
 	bootstrapRESTMethodVerify = "/verify"
 )
 
@@ -53,7 +52,7 @@ type bootstrapRESTServer struct{}
 type ServerSystemConfig struct {
 	MinioPlatform  string
 	MinioRuntime   string
-	MinioEndpoints EndpointZones
+	MinioEndpoints EndpointServerPools
 }
 
 // Diff - returns error on first difference found in two configs.
@@ -62,9 +61,9 @@ func (s1 ServerSystemConfig) Diff(s2 ServerSystemConfig) error {
 		return fmt.Errorf("Expected platform '%s', found to be running '%s'",
 			s1.MinioPlatform, s2.MinioPlatform)
 	}
-	if s1.MinioEndpoints.Nodes() != s2.MinioEndpoints.Nodes() {
-		return fmt.Errorf("Expected number of endpoints %d, seen %d", s1.MinioEndpoints.Nodes(),
-			s2.MinioEndpoints.Nodes())
+	if s1.MinioEndpoints.NEndpoints() != s2.MinioEndpoints.NEndpoints() {
+		return fmt.Errorf("Expected number of endpoints %d, seen %d", s1.MinioEndpoints.NEndpoints(),
+			s2.MinioEndpoints.NEndpoints())
 	}
 
 	for i, ep := range s1.MinioEndpoints {
@@ -94,6 +93,9 @@ func getServerSystemCfg() ServerSystemConfig {
 	}
 }
 
+// HealthHandler returns success if request is valid
+func (b *bootstrapRESTServer) HealthHandler(w http.ResponseWriter, r *http.Request) {}
+
 func (b *bootstrapRESTServer) VerifyHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "VerifyHandler")
 	cfg := getServerSystemCfg()
@@ -106,48 +108,30 @@ func registerBootstrapRESTHandlers(router *mux.Router) {
 	server := &bootstrapRESTServer{}
 	subrouter := router.PathPrefix(bootstrapRESTPrefix).Subrouter()
 
+	subrouter.Methods(http.MethodPost).Path(bootstrapRESTVersionPrefix + bootstrapRESTMethodHealth).HandlerFunc(
+		httpTraceHdrs(server.HealthHandler))
+
 	subrouter.Methods(http.MethodPost).Path(bootstrapRESTVersionPrefix + bootstrapRESTMethodVerify).HandlerFunc(
 		httpTraceHdrs(server.VerifyHandler))
 }
 
-// client to talk to bootstrap Nodes.
+// client to talk to bootstrap NEndpoints.
 type bootstrapRESTClient struct {
 	endpoint   Endpoint
 	restClient *rest.Client
-	connected  int32
-}
-
-// Reconnect to a bootstrap rest server.k
-func (client *bootstrapRESTClient) reConnect() {
-	atomic.StoreInt32(&client.connected, 1)
-}
-
-// Wrapper to restClient.Call to handle network errors, in case of network error the connection is marked disconnected
-// permanently. The only way to restore the connection is at the xl-sets layer by xlsets.monitorAndConnectEndpoints()
-// after verifying format.json
-func (client *bootstrapRESTClient) call(method string, values url.Values, body io.Reader, length int64) (respBody io.ReadCloser, err error) {
-	return client.callWithContext(context.Background(), method, values, body, length)
 }
 
 // Wrapper to restClient.Call to handle network errors, in case of network error the connection is marked disconnected
 // permanently. The only way to restore the connection is at the xl-sets layer by xlsets.monitorAndConnectEndpoints()
 // after verifying format.json
 func (client *bootstrapRESTClient) callWithContext(ctx context.Context, method string, values url.Values, body io.Reader, length int64) (respBody io.ReadCloser, err error) {
-	if !client.IsOnline() {
-		client.reConnect()
-	}
-
 	if values == nil {
 		values = make(url.Values)
 	}
 
-	respBody, err = client.restClient.CallWithContext(ctx, method, values, body, length)
+	respBody, err = client.restClient.Call(ctx, method, values, body, length)
 	if err == nil {
 		return respBody, nil
-	}
-
-	if isNetworkError(err) {
-		atomic.StoreInt32(&client.connected, 0)
 	}
 
 	return nil, err
@@ -158,24 +142,12 @@ func (client *bootstrapRESTClient) String() string {
 	return client.endpoint.String()
 }
 
-// IsOnline - returns whether RPC client failed to connect or not.
-func (client *bootstrapRESTClient) IsOnline() bool {
-	return atomic.LoadInt32(&client.connected) == 1
-}
-
-// Close - marks the client as closed.
-func (client *bootstrapRESTClient) Close() error {
-	atomic.StoreInt32(&client.connected, 0)
-	client.restClient.Close()
-	return nil
-}
-
 // Verify - fetches system server config.
-func (client *bootstrapRESTClient) Verify(srcCfg ServerSystemConfig) (err error) {
+func (client *bootstrapRESTClient) Verify(ctx context.Context, srcCfg ServerSystemConfig) (err error) {
 	if newObjectLayerFn() != nil {
 		return nil
 	}
-	respBody, err := client.call(bootstrapRESTMethodVerify, nil, nil, -1)
+	respBody, err := client.callWithContext(ctx, bootstrapRESTMethodVerify, nil, nil, -1)
 	if err != nil {
 		return
 	}
@@ -187,31 +159,47 @@ func (client *bootstrapRESTClient) Verify(srcCfg ServerSystemConfig) (err error)
 	return srcCfg.Diff(recvCfg)
 }
 
-func verifyServerSystemConfig(endpointZones EndpointZones) error {
+func verifyServerSystemConfig(ctx context.Context, endpointServerPools EndpointServerPools) error {
 	srcCfg := getServerSystemCfg()
-	clnts := newBootstrapRESTClients(endpointZones)
+	clnts := newBootstrapRESTClients(endpointServerPools)
 	var onlineServers int
+	var offlineEndpoints []string
+	var retries int
 	for onlineServers < len(clnts)/2 {
 		for _, clnt := range clnts {
-			if err := clnt.Verify(srcCfg); err != nil {
+			if err := clnt.Verify(ctx, srcCfg); err != nil {
 				if isNetworkError(err) {
+					offlineEndpoints = append(offlineEndpoints, clnt.String())
 					continue
 				}
 				return fmt.Errorf("%s as has incorrect configuration: %w", clnt.String(), err)
 			}
 			onlineServers++
 		}
-		// Sleep for a while - so that we don't go into
-		// 100% CPU when half the endpoints are offline.
-		time.Sleep(500 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			// Sleep for a while - so that we don't go into
+			// 100% CPU when half the endpoints are offline.
+			time.Sleep(100 * time.Millisecond)
+			retries++
+			// after 5 retries start logging that servers are not reachable yet
+			if retries >= 5 {
+				logger.Info(fmt.Sprintf("Waiting for atleast %d remote servers to be online for bootstrap check", len(clnts)/2))
+				logger.Info(fmt.Sprintf("Following servers are currently offline or unreachable %s", offlineEndpoints))
+				retries = 0 // reset to log again after 5 retries.
+			}
+			offlineEndpoints = nil
+		}
 	}
 	return nil
 }
 
-func newBootstrapRESTClients(endpointZones EndpointZones) []*bootstrapRESTClient {
+func newBootstrapRESTClients(endpointServerPools EndpointServerPools) []*bootstrapRESTClient {
 	seenHosts := set.NewStringSet()
 	var clnts []*bootstrapRESTClient
-	for _, ep := range endpointZones {
+	for _, ep := range endpointServerPools {
 		for _, endpoint := range ep.Endpoints {
 			if seenHosts.Contains(endpoint.Host) {
 				continue
@@ -220,11 +208,7 @@ func newBootstrapRESTClients(endpointZones EndpointZones) []*bootstrapRESTClient
 
 			// Only proceed for remote endpoints.
 			if !endpoint.IsLocal {
-				clnt, err := newBootstrapRESTClient(endpoint)
-				if err != nil {
-					continue
-				}
-				clnts = append(clnts, clnt)
+				clnts = append(clnts, newBootstrapRESTClient(endpoint))
 			}
 		}
 	}
@@ -232,26 +216,15 @@ func newBootstrapRESTClients(endpointZones EndpointZones) []*bootstrapRESTClient
 }
 
 // Returns a new bootstrap client.
-func newBootstrapRESTClient(endpoint Endpoint) (*bootstrapRESTClient, error) {
+func newBootstrapRESTClient(endpoint Endpoint) *bootstrapRESTClient {
 	serverURL := &url.URL{
 		Scheme: endpoint.Scheme,
 		Host:   endpoint.Host,
 		Path:   bootstrapRESTPath,
 	}
 
-	var tlsConfig *tls.Config
-	if globalIsSSL {
-		tlsConfig = &tls.Config{
-			ServerName: endpoint.Hostname(),
-			RootCAs:    globalRootCAs,
-		}
-	}
+	restClient := rest.NewClient(serverURL, globalInternodeTransport, newAuthToken)
+	restClient.HealthCheckFn = nil
 
-	trFn := newCustomHTTPTransport(tlsConfig, rest.DefaultRESTTimeout, rest.DefaultRESTTimeout)
-	restClient, err := rest.NewClient(serverURL, trFn, newAuthToken)
-	if err != nil {
-		return nil, err
-	}
-
-	return &bootstrapRESTClient{endpoint: endpoint, restClient: restClient, connected: 1}, nil
+	return &bootstrapRESTClient{endpoint: endpoint, restClient: restClient}
 }

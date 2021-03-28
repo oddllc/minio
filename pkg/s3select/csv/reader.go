@@ -19,12 +19,13 @@ package csv
 import (
 	"bufio"
 	"bytes"
-	"encoding/csv"
 	"fmt"
 	"io"
 	"runtime"
 	"sync"
+	"unicode/utf8"
 
+	csv "github.com/minio/minio/pkg/csvparser"
 	"github.com/minio/minio/pkg/s3select/sql"
 )
 
@@ -159,6 +160,9 @@ func (r *Reader) startReaders(newReader func(io.Reader) *csv.Reader) error {
 			r.err = err
 			return err
 		}
+		if !utf8.Valid(b) {
+			return errInvalidTextEncodingError()
+		}
 		reader := newReader(bytes.NewReader(b))
 		record, err := reader.Read()
 		if err != nil {
@@ -181,6 +185,13 @@ func (r *Reader) startReaders(newReader func(io.Reader) *csv.Reader) error {
 		return make([]byte, csvSplitSize+1024)
 	}
 
+	// Return first block
+	next, nextErr := r.nextSplit(csvSplitSize, r.bufferPool.Get().([]byte))
+	// Check if first block is valid.
+	if !utf8.Valid(next) {
+		return errInvalidTextEncodingError()
+	}
+
 	// Create queue
 	r.queue = make(chan *queueItem, runtime.GOMAXPROCS(0))
 	r.input = make(chan *queueItem, runtime.GOMAXPROCS(0))
@@ -192,11 +203,10 @@ func (r *Reader) startReaders(newReader func(io.Reader) *csv.Reader) error {
 		defer close(r.queue)
 		defer r.readerWg.Done()
 		for {
-			next, err := r.nextSplit(csvSplitSize, r.bufferPool.Get().([]byte))
 			q := queueItem{
 				input: next,
 				dst:   make(chan [][]string, 1),
-				err:   err,
+				err:   nextErr,
 			}
 			select {
 			case <-r.close:
@@ -209,10 +219,11 @@ func (r *Reader) startReaders(newReader func(io.Reader) *csv.Reader) error {
 				return
 			case r.input <- &q:
 			}
-			if err != nil {
+			if nextErr != nil {
 				// Exit on any error.
 				return
 			}
+			next, nextErr = r.nextSplit(csvSplitSize, r.bufferPool.Get().([]byte))
 		}
 	}()
 
@@ -294,6 +305,12 @@ func NewReader(readCloser io.ReadCloser, args *ReaderArgs) (*Reader, error) {
 		ret := csv.NewReader(r)
 		ret.Comma = []rune(args.FieldDelimiter)[0]
 		ret.Comment = []rune(args.CommentCharacter)[0]
+		ret.Quote = []rune{}
+		if len([]rune(args.QuoteCharacter)) > 0 {
+			// Add the first rune of args.QuoteChracter
+			ret.Quote = append(ret.Quote, []rune(args.QuoteCharacter)[0])
+		}
+		ret.QuoteEscape = []rune(args.QuoteEscapeCharacter)[0]
 		ret.FieldsPerRecord = -1
 		// If LazyQuotes is true, a quote may appear in an unquoted field and a
 		// non-doubled quote may appear in a quoted field.

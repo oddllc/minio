@@ -17,78 +17,28 @@
 package cmd
 
 import (
-	"flag"
 	"fmt"
 	"net"
 	"net/url"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 
-	"github.com/minio/cli"
-	"github.com/minio/minio-go/v6/pkg/set"
+	"github.com/minio/minio-go/v7/pkg/set"
 )
-
-func TestSubOptimalEndpointInput(t *testing.T) {
-	args1 := []string{"http://localhost/d1", "http://localhost/d2", "http://localhost/d3", "http://localhost/d4"}
-	args2 := []string{"http://example.org/d1", "http://example.com/d1", "http://example.net/d1", "http://example.edu/d1"}
-
-	tests := []struct {
-		setupType SetupType
-		ctx       *cli.Context
-		endpoints EndpointZones
-		isErr     bool
-	}{
-		{
-			setupType: DistXLSetupType,
-			ctx:       cli.NewContext(cli.NewApp(), flag.NewFlagSet("", flag.ContinueOnError), nil),
-			endpoints: mustGetZoneEndpoints(args1...),
-			isErr:     false,
-		},
-		{
-			setupType: DistXLSetupType,
-			ctx:       cli.NewContext(cli.NewApp(), flag.NewFlagSet("", flag.ContinueOnError), nil),
-			endpoints: mustGetZoneEndpoints(args2...),
-			isErr:     false,
-		},
-	}
-	for i, test := range tests {
-		test := test
-		t.Run(fmt.Sprintf("Test%d", i+1), func(t *testing.T) {
-			err := checkEndpointsSubOptimal(test.ctx, test.setupType, test.endpoints)
-			if test.isErr && err == nil {
-				t.Error("expected err but found nil")
-			}
-			if !test.isErr && err != nil {
-				t.Errorf("expected err nil but found an err %s", err)
-			}
-		})
-	}
-}
 
 func TestNewEndpoint(t *testing.T) {
 	u2, _ := url.Parse("https://example.org/path")
 	u4, _ := url.Parse("http://192.168.253.200/path")
-
+	rootSlashFoo, _ := filepath.Abs("/foo")
 	testCases := []struct {
 		arg              string
 		expectedEndpoint Endpoint
 		expectedType     EndpointType
 		expectedErr      error
 	}{
-		{"foo", Endpoint{URL: &url.URL{Path: "foo"}, IsLocal: true}, PathEndpointType, nil},
-		{"/foo", Endpoint{URL: &url.URL{Path: "/foo"}, IsLocal: true}, PathEndpointType, nil},
-		{`\foo`, Endpoint{URL: &url.URL{Path: `\foo`}, IsLocal: true}, PathEndpointType, nil},
-		{"C", Endpoint{URL: &url.URL{Path: `C`}, IsLocal: true}, PathEndpointType, nil},
-		{"C:", Endpoint{URL: &url.URL{Path: `C:`}, IsLocal: true}, PathEndpointType, nil},
-		{"C:/", Endpoint{URL: &url.URL{Path: "C:"}, IsLocal: true}, PathEndpointType, nil},
-		{`C:\`, Endpoint{URL: &url.URL{Path: `C:\`}, IsLocal: true}, PathEndpointType, nil},
-		{`C:\foo`, Endpoint{URL: &url.URL{Path: `C:\foo`}, IsLocal: true}, PathEndpointType, nil},
-		{"C:/foo", Endpoint{URL: &url.URL{Path: "C:/foo"}, IsLocal: true}, PathEndpointType, nil},
-		{`C:\\foo`, Endpoint{URL: &url.URL{Path: `C:\\foo`}, IsLocal: true}, PathEndpointType, nil},
-		{"http:path", Endpoint{URL: &url.URL{Path: "http:path"}, IsLocal: true}, PathEndpointType, nil},
-		{"http:/path", Endpoint{URL: &url.URL{Path: "http:/path"}, IsLocal: true}, PathEndpointType, nil},
-		{"http:///path", Endpoint{URL: &url.URL{Path: "http:/path"}, IsLocal: true}, PathEndpointType, nil},
+		{"/foo", Endpoint{URL: &url.URL{Path: rootSlashFoo}, IsLocal: true}, PathEndpointType, nil},
 		{"https://example.org/path", Endpoint{URL: u2, IsLocal: false}, URLEndpointType, nil},
 		{"http://192.168.253.200/path", Endpoint{URL: u4, IsLocal: false}, URLEndpointType, nil},
 		{"", Endpoint{}, -1, fmt.Errorf("empty or root endpoint is not supported")},
@@ -106,30 +56,38 @@ func TestNewEndpoint(t *testing.T) {
 		{"192.168.1.210:9000", Endpoint{}, -1, fmt.Errorf("invalid URL endpoint format: missing scheme http or https")},
 	}
 
-	for _, testCase := range testCases {
-		testCase := testCase
-		t.Run("", func(t *testing.T) {
-			endpoint, err := NewEndpoint(testCase.arg)
+	for i, test := range testCases {
+		t.Run(fmt.Sprint("case-", i), func(t *testing.T) {
+			endpoint, err := NewEndpoint(test.arg)
 			if err == nil {
 				err = endpoint.UpdateIsLocal()
 			}
 
-			if testCase.expectedErr == nil {
+			if test.expectedErr == nil {
 				if err != nil {
 					t.Errorf("error: expected = <nil>, got = %v", err)
 				}
 			} else if err == nil {
-				t.Errorf("error: expected = %v, got = <nil>", testCase.expectedErr)
-			} else if testCase.expectedErr.Error() != err.Error() {
-				t.Errorf("error: expected = %v, got = %v", testCase.expectedErr, err)
+				t.Errorf("error: expected = %v, got = <nil>", test.expectedErr)
+			} else if test.expectedErr.Error() != err.Error() {
+				t.Errorf("error: expected = %v, got = %v", test.expectedErr, err)
 			}
 
-			if err == nil && !reflect.DeepEqual(testCase.expectedEndpoint, endpoint) {
-				t.Errorf("endpoint: expected = %#v, got = %#v", testCase.expectedEndpoint, endpoint)
+			if err == nil {
+				if (test.expectedEndpoint.URL == nil) != (endpoint.URL == nil) {
+					t.Errorf("endpoint url: expected = %#v, got = %#v", test.expectedEndpoint.URL, endpoint.URL)
+					return
+				} else if test.expectedEndpoint.URL.String() != endpoint.URL.String() {
+					t.Errorf("endpoint url: expected = %#v, got = %#v", test.expectedEndpoint.URL.String(), endpoint.URL.String())
+					return
+				}
+				if !reflect.DeepEqual(test.expectedEndpoint, endpoint) {
+					t.Errorf("endpoint: expected = %#v, got = %#v", test.expectedEndpoint, endpoint)
+				}
 			}
 
-			if err == nil && testCase.expectedType != endpoint.Type() {
-				t.Errorf("type: expected = %+v, got = %+v", testCase.expectedType, endpoint.Type())
+			if err == nil && test.expectedType != endpoint.Type() {
+				t.Errorf("type: expected = %+v, got = %+v", test.expectedType, endpoint.Type())
 			}
 		})
 	}
@@ -140,7 +98,6 @@ func TestNewEndpoints(t *testing.T) {
 		args        []string
 		expectedErr error
 	}{
-		{[]string{"d1", "d2", "d3", "d4"}, nil},
 		{[]string{"/d1", "/d2", "/d3", "/d4"}, nil},
 		{[]string{"http://localhost/d1", "http://localhost/d2", "http://localhost/d3", "http://localhost/d4"}, nil},
 		{[]string{"http://example.org/d1", "http://example.com/d1", "http://example.net/d1", "http://example.edu/d1"}, nil},
@@ -181,6 +138,13 @@ func TestCreateEndpoints(t *testing.T) {
 	}
 	nonLoopBackIP := nonLoopBackIPs.ToSlice()[0]
 
+	mustAbs := func(s string) string {
+		s, err := filepath.Abs(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
 	getExpectedEndpoints := func(args []string, prefix string) ([]*url.URL, []bool) {
 		var URLs []*url.URL
 		var localFlags []bool
@@ -264,78 +228,75 @@ func TestCreateEndpoints(t *testing.T) {
 
 		// FS Setup
 		{"localhost:9000", [][]string{{"http://localhost/d1"}}, "", Endpoints{}, -1, fmt.Errorf("use path style endpoint for FS setup")},
-		{":443", [][]string{{"d1"}}, ":443", Endpoints{Endpoint{URL: &url.URL{Path: "d1"}, IsLocal: true}}, FSSetupType, nil},
-		{"localhost:10000", [][]string{{"/d1"}}, "localhost:10000", Endpoints{Endpoint{URL: &url.URL{Path: "/d1"}, IsLocal: true}}, FSSetupType, nil},
-		{"localhost:10000", [][]string{{"./d1"}}, "localhost:10000", Endpoints{Endpoint{URL: &url.URL{Path: "d1"}, IsLocal: true}}, FSSetupType, nil},
-		{"localhost:10000", [][]string{{`\d1`}}, "localhost:10000", Endpoints{Endpoint{URL: &url.URL{Path: `\d1`}, IsLocal: true}}, FSSetupType, nil},
-		{"localhost:10000", [][]string{{`.\d1`}}, "localhost:10000", Endpoints{Endpoint{URL: &url.URL{Path: `.\d1`}, IsLocal: true}}, FSSetupType, nil},
+		{":443", [][]string{{"/d1"}}, ":443", Endpoints{Endpoint{URL: &url.URL{Path: mustAbs("/d1")}, IsLocal: true}}, FSSetupType, nil},
+		{"localhost:10000", [][]string{{"/d1"}}, "localhost:10000", Endpoints{Endpoint{URL: &url.URL{Path: mustAbs("/d1")}, IsLocal: true}}, FSSetupType, nil},
 		{"localhost:9000", [][]string{{"https://127.0.0.1:9000/d1", "https://localhost:9001/d1", "https://example.com/d1", "https://example.com/d2"}}, "", Endpoints{}, -1, fmt.Errorf("path '/d1' can not be served by different port on same address")},
 
-		// XL Setup with PathEndpointType
-		{":1234", [][]string{{"/d1", "/d2", "d3", "d4"}}, ":1234",
+		// Erasure Setup with PathEndpointType
+		{":1234", [][]string{{"/d1", "/d2", "/d3", "/d4"}}, ":1234",
 			Endpoints{
-				Endpoint{URL: &url.URL{Path: "/d1"}, IsLocal: true},
-				Endpoint{URL: &url.URL{Path: "/d2"}, IsLocal: true},
-				Endpoint{URL: &url.URL{Path: "d3"}, IsLocal: true},
-				Endpoint{URL: &url.URL{Path: "d4"}, IsLocal: true},
-			}, XLSetupType, nil},
-		// DistXL Setup with URLEndpointType
+				Endpoint{URL: &url.URL{Path: mustAbs("/d1")}, IsLocal: true},
+				Endpoint{URL: &url.URL{Path: mustAbs("/d2")}, IsLocal: true},
+				Endpoint{URL: &url.URL{Path: mustAbs("/d3")}, IsLocal: true},
+				Endpoint{URL: &url.URL{Path: mustAbs("/d4")}, IsLocal: true},
+			}, ErasureSetupType, nil},
+		// DistErasure Setup with URLEndpointType
 		{":9000", [][]string{{"http://localhost/d1", "http://localhost/d2", "http://localhost/d3", "http://localhost/d4"}}, ":9000", Endpoints{
 			Endpoint{URL: &url.URL{Scheme: "http", Host: "localhost", Path: "/d1"}, IsLocal: true},
 			Endpoint{URL: &url.URL{Scheme: "http", Host: "localhost", Path: "/d2"}, IsLocal: true},
 			Endpoint{URL: &url.URL{Scheme: "http", Host: "localhost", Path: "/d3"}, IsLocal: true},
 			Endpoint{URL: &url.URL{Scheme: "http", Host: "localhost", Path: "/d4"}, IsLocal: true},
-		}, XLSetupType, nil},
-		// DistXL Setup with URLEndpointType having mixed naming to local host.
+		}, ErasureSetupType, nil},
+		// DistErasure Setup with URLEndpointType having mixed naming to local host.
 		{"127.0.0.1:10000", [][]string{{"http://localhost/d1", "http://localhost/d2", "http://127.0.0.1/d3", "http://127.0.0.1/d4"}}, "", Endpoints{}, -1, fmt.Errorf("all local endpoints should not have different hostnames/ips")},
 
 		{":9001", [][]string{{"http://10.0.0.1:9000/export", "http://10.0.0.2:9000/export", "http://" + nonLoopBackIP + ":9001/export", "http://10.0.0.2:9001/export"}}, "", Endpoints{}, -1, fmt.Errorf("path '/export' can not be served by different port on same address")},
 
 		{":9000", [][]string{{"http://127.0.0.1:9000/export", "http://" + nonLoopBackIP + ":9000/export", "http://10.0.0.1:9000/export", "http://10.0.0.2:9000/export"}}, "", Endpoints{}, -1, fmt.Errorf("path '/export' cannot be served by different address on same server")},
 
-		// DistXL type
+		// DistErasure type
 		{"127.0.0.1:10000", [][]string{{case1Endpoint1, case1Endpoint2, "http://example.org/d3", "http://example.com/d4"}}, "127.0.0.1:10000", Endpoints{
 			Endpoint{URL: case1URLs[0], IsLocal: case1LocalFlags[0]},
 			Endpoint{URL: case1URLs[1], IsLocal: case1LocalFlags[1]},
 			Endpoint{URL: case1URLs[2], IsLocal: case1LocalFlags[2]},
 			Endpoint{URL: case1URLs[3], IsLocal: case1LocalFlags[3]},
-		}, DistXLSetupType, nil},
+		}, DistErasureSetupType, nil},
 
 		{"127.0.0.1:10000", [][]string{{case2Endpoint1, case2Endpoint2, "http://example.org/d3", "http://example.com/d4"}}, "127.0.0.1:10000", Endpoints{
 			Endpoint{URL: case2URLs[0], IsLocal: case2LocalFlags[0]},
 			Endpoint{URL: case2URLs[1], IsLocal: case2LocalFlags[1]},
 			Endpoint{URL: case2URLs[2], IsLocal: case2LocalFlags[2]},
 			Endpoint{URL: case2URLs[3], IsLocal: case2LocalFlags[3]},
-		}, DistXLSetupType, nil},
+		}, DistErasureSetupType, nil},
 
 		{":80", [][]string{{case3Endpoint1, "http://example.org:9000/d2", "http://example.com/d3", "http://example.net/d4"}}, ":80", Endpoints{
 			Endpoint{URL: case3URLs[0], IsLocal: case3LocalFlags[0]},
 			Endpoint{URL: case3URLs[1], IsLocal: case3LocalFlags[1]},
 			Endpoint{URL: case3URLs[2], IsLocal: case3LocalFlags[2]},
 			Endpoint{URL: case3URLs[3], IsLocal: case3LocalFlags[3]},
-		}, DistXLSetupType, nil},
+		}, DistErasureSetupType, nil},
 
 		{":9000", [][]string{{case4Endpoint1, "http://example.org/d2", "http://example.com/d3", "http://example.net/d4"}}, ":9000", Endpoints{
 			Endpoint{URL: case4URLs[0], IsLocal: case4LocalFlags[0]},
 			Endpoint{URL: case4URLs[1], IsLocal: case4LocalFlags[1]},
 			Endpoint{URL: case4URLs[2], IsLocal: case4LocalFlags[2]},
 			Endpoint{URL: case4URLs[3], IsLocal: case4LocalFlags[3]},
-		}, DistXLSetupType, nil},
+		}, DistErasureSetupType, nil},
 
 		{":9000", [][]string{{case5Endpoint1, case5Endpoint2, case5Endpoint3, case5Endpoint4}}, ":9000", Endpoints{
 			Endpoint{URL: case5URLs[0], IsLocal: case5LocalFlags[0]},
 			Endpoint{URL: case5URLs[1], IsLocal: case5LocalFlags[1]},
 			Endpoint{URL: case5URLs[2], IsLocal: case5LocalFlags[2]},
 			Endpoint{URL: case5URLs[3], IsLocal: case5LocalFlags[3]},
-		}, DistXLSetupType, nil},
+		}, DistErasureSetupType, nil},
 
-		// DistXL Setup using only local host.
+		// DistErasure Setup using only local host.
 		{":9003", [][]string{{"http://localhost:9000/d1", "http://localhost:9001/d2", "http://127.0.0.1:9002/d3", case6Endpoint}}, ":9003", Endpoints{
 			Endpoint{URL: case6URLs[0], IsLocal: case6LocalFlags[0]},
 			Endpoint{URL: case6URLs[1], IsLocal: case6LocalFlags[1]},
 			Endpoint{URL: case6URLs[2], IsLocal: case6LocalFlags[2]},
 			Endpoint{URL: case6URLs[3], IsLocal: case6LocalFlags[3]},
-		}, DistXLSetupType, nil},
+		}, DistErasureSetupType, nil},
 	}
 
 	for _, testCase := range testCases {
@@ -373,15 +334,6 @@ func TestCreateEndpoints(t *testing.T) {
 // So it means that if you have say localhost:9000 and localhost:9001 as endpointArgs then localhost:9001
 // is considered a remote service from localhost:9000 perspective.
 func TestGetLocalPeer(t *testing.T) {
-	tempGlobalMinioAddr := globalMinioAddr
-	tempGlobalMinioPort := globalMinioPort
-	defer func() {
-		globalMinioAddr = tempGlobalMinioAddr
-		globalMinioPort = tempGlobalMinioPort
-	}()
-	globalMinioAddr = ":9000"
-	globalMinioPort = "9000"
-
 	testCases := []struct {
 		endpointArgs   []string
 		expectedResult string
@@ -396,15 +348,15 @@ func TestGetLocalPeer(t *testing.T) {
 	}
 
 	for i, testCase := range testCases {
-		zendpoints := mustGetZoneEndpoints(testCase.endpointArgs...)
+		zendpoints := mustGetPoolEndpoints(testCase.endpointArgs...)
 		if !zendpoints[0].Endpoints[0].IsLocal {
 			if err := zendpoints[0].Endpoints.UpdateIsLocal(false); err != nil {
 				t.Fatalf("error: expected = <nil>, got = %v", err)
 			}
 		}
-		remotePeer := GetLocalPeer(zendpoints)
-		if remotePeer != testCase.expectedResult {
-			t.Fatalf("Test %d: expected: %v, got: %v", i+1, testCase.expectedResult, remotePeer)
+		localPeer := GetLocalPeer(zendpoints, "", "9000")
+		if localPeer != testCase.expectedResult {
+			t.Fatalf("Test %d: expected: %v, got: %v", i+1, testCase.expectedResult, localPeer)
 		}
 	}
 }
@@ -419,24 +371,28 @@ func TestGetRemotePeers(t *testing.T) {
 	testCases := []struct {
 		endpointArgs   []string
 		expectedResult []string
+		expectedLocal  string
 	}{
-		{[]string{"/d1", "/d2", "d3", "d4"}, []string{}},
-		{[]string{"http://localhost:9000/d1", "http://localhost:9000/d2", "http://example.org:9000/d3", "http://example.com:9000/d4"}, []string{"example.com:9000", "example.org:9000"}},
-		{[]string{"http://localhost:9000/d1", "http://localhost:10000/d2", "http://example.org:9000/d3", "http://example.com:9000/d4"}, []string{"example.com:9000", "example.org:9000", "localhost:10000"}},
-		{[]string{"http://localhost:9000/d1", "http://example.org:9000/d2", "http://example.com:9000/d3", "http://example.net:9000/d4"}, []string{"example.com:9000", "example.net:9000", "example.org:9000"}},
-		{[]string{"http://localhost:9000/d1", "http://localhost:9001/d2", "http://localhost:9002/d3", "http://localhost:9003/d4"}, []string{"localhost:9001", "localhost:9002", "localhost:9003"}},
+		{[]string{"/d1", "/d2", "d3", "d4"}, []string{}, ""},
+		{[]string{"http://localhost:9000/d1", "http://localhost:9000/d2", "http://example.org:9000/d3", "http://example.com:9000/d4"}, []string{"example.com:9000", "example.org:9000", "localhost:9000"}, "localhost:9000"},
+		{[]string{"http://localhost:9000/d1", "http://localhost:10000/d2", "http://example.org:9000/d3", "http://example.com:9000/d4"}, []string{"example.com:9000", "example.org:9000", "localhost:10000", "localhost:9000"}, "localhost:9000"},
+		{[]string{"http://localhost:9000/d1", "http://example.org:9000/d2", "http://example.com:9000/d3", "http://example.net:9000/d4"}, []string{"example.com:9000", "example.net:9000", "example.org:9000", "localhost:9000"}, "localhost:9000"},
+		{[]string{"http://localhost:9000/d1", "http://localhost:9001/d2", "http://localhost:9002/d3", "http://localhost:9003/d4"}, []string{"localhost:9000", "localhost:9001", "localhost:9002", "localhost:9003"}, "localhost:9000"},
 	}
 
 	for _, testCase := range testCases {
-		zendpoints := mustGetZoneEndpoints(testCase.endpointArgs...)
+		zendpoints := mustGetPoolEndpoints(testCase.endpointArgs...)
 		if !zendpoints[0].Endpoints[0].IsLocal {
 			if err := zendpoints[0].Endpoints.UpdateIsLocal(false); err != nil {
-				t.Fatalf("error: expected = <nil>, got = %v", err)
+				t.Errorf("error: expected = <nil>, got = %v", err)
 			}
 		}
-		remotePeers := GetRemotePeers(zendpoints)
+		remotePeers, local := zendpoints.peers()
 		if !reflect.DeepEqual(remotePeers, testCase.expectedResult) {
-			t.Fatalf("expected: %v, got: %v", testCase.expectedResult, remotePeers)
+			t.Errorf("expected: %v, got: %v", testCase.expectedResult, remotePeers)
+		}
+		if local != testCase.expectedLocal {
+			t.Errorf("expected: %v, got: %v", testCase.expectedLocal, local)
 		}
 	}
 }

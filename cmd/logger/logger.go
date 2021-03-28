@@ -19,9 +19,11 @@ package logger
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"go/build"
 	"hash"
+	"net/http"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -29,7 +31,7 @@ import (
 	"time"
 
 	"github.com/minio/highwayhash"
-	"github.com/minio/minio-go/v6/pkg/set"
+	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/cmd/logger/message/log"
 )
 
@@ -60,11 +62,6 @@ var globalDeploymentID string
 // TimeFormat - logging time format.
 const TimeFormat string = "15:04:05 MST 01/02/2006"
 
-// List of error strings to be ignored by LogIf
-const (
-	diskNotFoundError = "disk not found"
-)
-
 var matchingFuncNames = [...]string{
 	"http.HandlerFunc.ServeHTTP",
 	"cmd.serverMain",
@@ -75,9 +72,7 @@ var matchingFuncNames = [...]string{
 	"cmd.(*webAPIHandlers).ListObjects",
 	"cmd.(*webAPIHandlers).RemoveObject",
 	"cmd.(*webAPIHandlers).Login",
-	"cmd.(*webAPIHandlers).GenerateAuth",
 	"cmd.(*webAPIHandlers).SetAuth",
-	"cmd.(*webAPIHandlers).GetAuth",
 	"cmd.(*webAPIHandlers).CreateURLToken",
 	"cmd.(*webAPIHandlers).Upload",
 	"cmd.(*webAPIHandlers).Download",
@@ -303,9 +298,15 @@ func LogIf(ctx context.Context, err error, errKind ...interface{}) {
 		return
 	}
 
-	if err.Error() != diskNotFoundError {
-		logIf(ctx, err, errKind...)
+	if errors.Is(err, context.Canceled) {
+		return
 	}
+
+	if err.Error() == http.ErrServerClosed.Error() || err.Error() == "disk not found" {
+		return
+	}
+
+	logIf(ctx, err, errKind...)
 }
 
 // logIf prints a detailed error message during
@@ -331,8 +332,9 @@ func logIf(ctx context.Context, err error, errKind ...interface{}) {
 		API = req.API
 	}
 
-	tags := make(map[string]string)
-	for _, entry := range req.GetTags() {
+	kv := req.GetTags()
+	tags := make(map[string]interface{}, len(kv))
+	for _, entry := range kv {
 		tags[entry.Key] = entry.Val
 	}
 
@@ -340,7 +342,7 @@ func logIf(ctx context.Context, err error, errKind ...interface{}) {
 	trace := getTrace(3)
 
 	// Get the cause for the Error
-	message := err.Error()
+	message := fmt.Sprintf("%v (%T)", err, err)
 	if req.DeploymentID == "" {
 		req.DeploymentID = globalDeploymentID
 	}
@@ -372,7 +374,7 @@ func logIf(ctx context.Context, err error, errKind ...interface{}) {
 		entry.API.Args.Object = hashString(entry.API.Args.Object)
 		entry.RemoteHost = hashString(entry.RemoteHost)
 		entry.Trace.Message = reflect.TypeOf(err).String()
-		entry.Trace.Variables = make(map[string]string)
+		entry.Trace.Variables = make(map[string]interface{})
 	}
 
 	// Iterate over all logger targets to send the log entry

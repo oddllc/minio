@@ -24,12 +24,15 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	jwtgo "github.com/dgrijalva/jwt-go"
 	"github.com/minio/minio/cmd/config"
 	"github.com/minio/minio/pkg/auth"
 	"github.com/minio/minio/pkg/env"
+	iampolicy "github.com/minio/minio/pkg/iam/policy"
 	xnet "github.com/minio/minio/pkg/net"
 )
 
@@ -41,15 +44,20 @@ type Config struct {
 	} `json:"jwks"`
 	URL          *xnet.URL `json:"url,omitempty"`
 	ClaimPrefix  string    `json:"claimPrefix,omitempty"`
+	ClaimName    string    `json:"claimName,omitempty"`
 	DiscoveryDoc DiscoveryDoc
 	ClientID     string
 	publicKeys   map[string]crypto.PublicKey
 	transport    *http.Transport
 	closeRespFn  func(io.ReadCloser)
+	mutex        *sync.Mutex
 }
 
 // PopulatePublicKey - populates a new publickey from the JWKS URL.
 func (r *Config) PopulatePublicKey() error {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
 	if r.JWKS.URL == nil || r.JWKS.URL.String() == "" {
 		return nil
 	}
@@ -120,8 +128,8 @@ func GetDefaultExpiration(dsecs string) (time.Duration, error) {
 
 		// The duration, in seconds, of the role session.
 		// The value can range from 900 seconds (15 minutes)
-		// to 12 hours.
-		if expirySecs < 900 || expirySecs > 43200 {
+		// up to 7 days.
+		if expirySecs < 900 || expirySecs > 604800 {
 			return 0, auth.ErrInvalidDuration
 		}
 
@@ -166,7 +174,10 @@ func updateClaimsExpiry(dsecs string, claims map[string]interface{}) error {
 // Validate - validates the access token.
 func (p *JWT) Validate(token, dsecs string) (map[string]interface{}, error) {
 	jp := new(jwtgo.Parser)
-	jp.ValidMethods = []string{"RS256", "RS384", "RS512", "ES256", "ES384", "ES512"}
+	jp.ValidMethods = []string{
+		"RS256", "RS384", "RS512", "ES256", "ES384", "ES512",
+		"RS3256", "RS3384", "RS3512", "ES3256", "ES3384", "ES3512",
+	}
 
 	keyFuncCallback := func(jwtToken *jwtgo.Token) (interface{}, error) {
 		kid, ok := jwtToken.Header["kid"].(string)
@@ -179,6 +190,8 @@ func (p *JWT) Validate(token, dsecs string) (map[string]interface{}, error) {
 	var claims jwtgo.MapClaims
 	jwtToken, err := jp.ParseWithClaims(token, &claims, keyFuncCallback)
 	if err != nil {
+		// Re-populate the public key in-case the JWKS
+		// pubkeys are refreshed
 		if err = p.PopulatePublicKey(); err != nil {
 			return nil, err
 		}
@@ -197,7 +210,6 @@ func (p *JWT) Validate(token, dsecs string) (map[string]interface{}, error) {
 	}
 
 	return claims, nil
-
 }
 
 // ID returns the provider name and authentication type.
@@ -209,13 +221,17 @@ func (p *JWT) ID() ID {
 const (
 	JwksURL     = "jwks_url"
 	ConfigURL   = "config_url"
+	ClaimName   = "claim_name"
 	ClaimPrefix = "claim_prefix"
 	ClientID    = "client_id"
+	Scopes      = "scopes"
 
 	EnvIdentityOpenIDClientID    = "MINIO_IDENTITY_OPENID_CLIENT_ID"
 	EnvIdentityOpenIDJWKSURL     = "MINIO_IDENTITY_OPENID_JWKS_URL"
 	EnvIdentityOpenIDURL         = "MINIO_IDENTITY_OPENID_CONFIG_URL"
+	EnvIdentityOpenIDClaimName   = "MINIO_IDENTITY_OPENID_CLAIM_NAME"
 	EnvIdentityOpenIDClaimPrefix = "MINIO_IDENTITY_OPENID_CLAIM_PREFIX"
+	EnvIdentityOpenIDScopes      = "MINIO_IDENTITY_OPENID_SCOPES"
 )
 
 // DiscoveryDoc - parses the output from openid-configuration
@@ -247,6 +263,7 @@ func parseDiscoveryDoc(u *xnet.URL, transport *http.Transport, closeRespFn func(
 	}
 	resp, err := clnt.Do(req)
 	if err != nil {
+		clnt.CloseIdleConnections()
 		return d, err
 	}
 	defer closeRespFn(resp.Body)
@@ -272,7 +289,15 @@ var (
 			Value: "",
 		},
 		config.KV{
+			Key:   ClaimName,
+			Value: iampolicy.PolicyName,
+		},
+		config.KV{
 			Key:   ClaimPrefix,
+			Value: "",
+		},
+		config.KV{
+			Key:   Scopes,
 			Value: "",
 		},
 		config.KV{
@@ -299,11 +324,13 @@ func LookupConfig(kvs config.KVS, transport *http.Transport, closeRespFn func(io
 	}
 
 	c = Config{
+		ClaimName:   env.Get(EnvIdentityOpenIDClaimName, kvs.Get(ClaimName)),
 		ClaimPrefix: env.Get(EnvIdentityOpenIDClaimPrefix, kvs.Get(ClaimPrefix)),
 		publicKeys:  make(map[string]crypto.PublicKey),
 		ClientID:    env.Get(EnvIdentityOpenIDClientID, kvs.Get(ClientID)),
 		transport:   transport,
 		closeRespFn: closeRespFn,
+		mutex:       &sync.Mutex{}, // allocate for copying
 	}
 
 	configURL := env.Get(EnvIdentityOpenIDURL, kvs.Get(ConfigURL))
@@ -317,6 +344,24 @@ func LookupConfig(kvs config.KVS, transport *http.Transport, closeRespFn func(io
 			return c, err
 		}
 	}
+
+	if scopeList := env.Get(EnvIdentityOpenIDScopes, kvs.Get(Scopes)); scopeList != "" {
+		var scopes []string
+		for _, scope := range strings.Split(scopeList, ",") {
+			scope = strings.TrimSpace(scope)
+			if scope == "" {
+				return c, config.Errorf("empty scope value is not allowed '%s', please refer to our documentation", scopeList)
+			}
+			scopes = append(scopes, scope)
+		}
+		// Replace the discovery document scopes by client customized scopes.
+		c.DiscoveryDoc.ScopesSupported = scopes
+	}
+
+	if c.ClaimName == "" {
+		c.ClaimName = iampolicy.PolicyName
+	}
+
 	if jwksURL == "" {
 		// Fallback to discovery document jwksURL
 		jwksURL = c.DiscoveryDoc.JwksURI
@@ -330,9 +375,11 @@ func LookupConfig(kvs config.KVS, transport *http.Transport, closeRespFn func(io
 	if err != nil {
 		return c, err
 	}
+
 	if err = c.PopulatePublicKey(); err != nil {
 		return c, err
 	}
+
 	return c, nil
 }
 

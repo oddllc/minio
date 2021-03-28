@@ -23,13 +23,16 @@ import (
 
 // Name - event type enum.
 // Refer http://docs.aws.amazon.com/AmazonS3/latest/dev/NotificationHowTo.html#notification-how-to-event-types-and-destinations
+// for most basic values we have since extend this and its not really much applicable other than a reference point.
+// "s3:Replication:OperationCompletedReplication" is a MinIO extension.
 type Name int
 
-// Values of Name
+// Values of event Name
 const (
 	ObjectAccessedAll Name = 1 + iota
 	ObjectAccessedGet
 	ObjectAccessedGetRetention
+	ObjectAccessedGetLegalHold
 	ObjectAccessedHead
 	ObjectCreatedAll
 	ObjectCreatedCompleteMultipartUpload
@@ -37,19 +40,70 @@ const (
 	ObjectCreatedPost
 	ObjectCreatedPut
 	ObjectCreatedPutRetention
+	ObjectCreatedPutLegalHold
+	ObjectCreatedPutTagging
+	ObjectCreatedDeleteTagging
 	ObjectRemovedAll
 	ObjectRemovedDelete
+	ObjectRemovedDeleteMarkerCreated
+	BucketCreated
+	BucketRemoved
+	ObjectReplicationAll
+	ObjectReplicationFailed
+	ObjectReplicationComplete
+	ObjectReplicationMissedThreshold
+	ObjectReplicationReplicatedAfterThreshold
+	ObjectReplicationNotTracked
+	ObjectRestorePostInitiated
+	ObjectRestorePostCompleted
+	ObjectRestorePostAll
+	ObjectTransitionAll
+	ObjectTransitionFailed
+	ObjectTransitionComplete
 )
 
 // Expand - returns expanded values of abbreviated event type.
 func (name Name) Expand() []Name {
 	switch name {
+	case BucketCreated:
+		return []Name{BucketCreated}
+	case BucketRemoved:
+		return []Name{BucketRemoved}
 	case ObjectAccessedAll:
-		return []Name{ObjectAccessedGet, ObjectAccessedHead, ObjectAccessedGetRetention}
+		return []Name{
+			ObjectAccessedGet, ObjectAccessedHead,
+			ObjectAccessedGetRetention, ObjectAccessedGetLegalHold,
+		}
 	case ObjectCreatedAll:
-		return []Name{ObjectCreatedCompleteMultipartUpload, ObjectCreatedCopy, ObjectCreatedPost, ObjectCreatedPut, ObjectCreatedPutRetention}
+		return []Name{
+			ObjectCreatedCompleteMultipartUpload, ObjectCreatedCopy,
+			ObjectCreatedPost, ObjectCreatedPut,
+			ObjectCreatedPutRetention, ObjectCreatedPutLegalHold,
+			ObjectCreatedPutTagging, ObjectCreatedDeleteTagging,
+		}
 	case ObjectRemovedAll:
-		return []Name{ObjectRemovedDelete}
+		return []Name{
+			ObjectRemovedDelete,
+			ObjectRemovedDeleteMarkerCreated,
+		}
+	case ObjectReplicationAll:
+		return []Name{
+			ObjectReplicationFailed,
+			ObjectReplicationComplete,
+			ObjectReplicationNotTracked,
+			ObjectReplicationMissedThreshold,
+			ObjectReplicationReplicatedAfterThreshold,
+		}
+	case ObjectRestorePostAll:
+		return []Name{
+			ObjectRestorePostInitiated,
+			ObjectRestorePostCompleted,
+		}
+	case ObjectTransitionAll:
+		return []Name{
+			ObjectTransitionFailed,
+			ObjectTransitionComplete,
+		}
 	default:
 		return []Name{name}
 	}
@@ -58,12 +112,18 @@ func (name Name) Expand() []Name {
 // String - returns string representation of event type.
 func (name Name) String() string {
 	switch name {
+	case BucketCreated:
+		return "s3:BucketCreated:*"
+	case BucketRemoved:
+		return "s3:BucketRemoved:*"
 	case ObjectAccessedAll:
 		return "s3:ObjectAccessed:*"
 	case ObjectAccessedGet:
 		return "s3:ObjectAccessed:Get"
 	case ObjectAccessedGetRetention:
 		return "s3:ObjectAccessed:GetRetention"
+	case ObjectAccessedGetLegalHold:
+		return "s3:ObjectAccessed:GetLegalHold"
 	case ObjectAccessedHead:
 		return "s3:ObjectAccessed:Head"
 	case ObjectCreatedAll:
@@ -76,12 +136,42 @@ func (name Name) String() string {
 		return "s3:ObjectCreated:Post"
 	case ObjectCreatedPut:
 		return "s3:ObjectCreated:Put"
+	case ObjectCreatedPutTagging:
+		return "s3:ObjectCreated:PutTagging"
+	case ObjectCreatedDeleteTagging:
+		return "s3:ObjectCreated:DeleteTagging"
 	case ObjectCreatedPutRetention:
 		return "s3:ObjectCreated:PutRetention"
+	case ObjectCreatedPutLegalHold:
+		return "s3:ObjectCreated:PutLegalHold"
 	case ObjectRemovedAll:
 		return "s3:ObjectRemoved:*"
 	case ObjectRemovedDelete:
 		return "s3:ObjectRemoved:Delete"
+	case ObjectRemovedDeleteMarkerCreated:
+		return "s3:ObjectRemoved:DeleteMarkerCreated"
+	case ObjectReplicationAll:
+		return "s3:Replication:*"
+	case ObjectReplicationFailed:
+		return "s3:Replication:OperationFailedReplication"
+	case ObjectReplicationComplete:
+		return "s3:Replication:OperationCompletedReplication"
+	case ObjectReplicationNotTracked:
+		return "s3:Replication:OperationNotTracked"
+	case ObjectReplicationMissedThreshold:
+		return "s3:Replication:OperationMissedThreshold"
+	case ObjectReplicationReplicatedAfterThreshold:
+		return "s3:Replication:OperationReplicatedAfterThreshold"
+	case ObjectRestorePostInitiated:
+		return "s3:ObjectRestore:Post"
+	case ObjectRestorePostCompleted:
+		return "s3:ObjectRestore:Completed"
+	case ObjectTransitionAll:
+		return "s3:ObjectTransition:*"
+	case ObjectTransitionFailed:
+		return "s3:ObjectTransition:Failed"
+	case ObjectTransitionComplete:
+		return "s3:ObjectTransition:Complete"
 	}
 
 	return ""
@@ -132,12 +222,18 @@ func (name *Name) UnmarshalJSON(data []byte) error {
 // ParseName - parses string to Name.
 func ParseName(s string) (Name, error) {
 	switch s {
+	case "s3:BucketCreated:*":
+		return BucketCreated, nil
+	case "s3:BucketRemoved:*":
+		return BucketRemoved, nil
 	case "s3:ObjectAccessed:*":
 		return ObjectAccessedAll, nil
 	case "s3:ObjectAccessed:Get":
 		return ObjectAccessedGet, nil
 	case "s3:ObjectAccessed:GetRetention":
 		return ObjectAccessedGetRetention, nil
+	case "s3:ObjectAccessed:GetLegalHold":
+		return ObjectAccessedGetLegalHold, nil
 	case "s3:ObjectAccessed:Head":
 		return ObjectAccessedHead, nil
 	case "s3:ObjectCreated:*":
@@ -152,10 +248,42 @@ func ParseName(s string) (Name, error) {
 		return ObjectCreatedPut, nil
 	case "s3:ObjectCreated:PutRetention":
 		return ObjectCreatedPutRetention, nil
+	case "s3:ObjectCreated:PutLegalHold":
+		return ObjectCreatedPutLegalHold, nil
+	case "s3:ObjectCreated:PutTagging":
+		return ObjectCreatedPutTagging, nil
+	case "s3:ObjectCreated:DeleteTagging":
+		return ObjectCreatedDeleteTagging, nil
 	case "s3:ObjectRemoved:*":
 		return ObjectRemovedAll, nil
 	case "s3:ObjectRemoved:Delete":
 		return ObjectRemovedDelete, nil
+	case "s3:ObjectRemoved:DeleteMarkerCreated":
+		return ObjectRemovedDeleteMarkerCreated, nil
+	case "s3:Replication:*":
+		return ObjectReplicationAll, nil
+	case "s3:Replication:OperationFailedReplication":
+		return ObjectReplicationFailed, nil
+	case "s3:Replication:OperationCompletedReplication":
+		return ObjectReplicationComplete, nil
+	case "s3:Replication:OperationMissedThreshold":
+		return ObjectReplicationMissedThreshold, nil
+	case "s3:Replication:OperationReplicatedAfterThreshold":
+		return ObjectReplicationReplicatedAfterThreshold, nil
+	case "s3:Replication:OperationNotTracked":
+		return ObjectReplicationNotTracked, nil
+	case "s3:ObjectRestore:*":
+		return ObjectRestorePostAll, nil
+	case "s3:ObjectRestore:Post":
+		return ObjectRestorePostInitiated, nil
+	case "s3:ObjectRestore:Completed":
+		return ObjectRestorePostCompleted, nil
+	case "s3:ObjectTransition:Failed":
+		return ObjectTransitionFailed, nil
+	case "s3:ObjectTransition:Complete":
+		return ObjectTransitionComplete, nil
+	case "s3:ObjectTransition:*":
+		return ObjectTransitionAll, nil
 	default:
 		return 0, &ErrInvalidEventName{s}
 	}

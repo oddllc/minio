@@ -18,6 +18,7 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 	"hash"
 	"io"
 
@@ -34,14 +35,14 @@ type wholeBitrotWriter struct {
 }
 
 func (b *wholeBitrotWriter) Write(p []byte) (int, error) {
-	err := b.disk.AppendFile(b.volume, b.filePath, p)
+	err := b.disk.AppendFile(context.TODO(), b.volume, b.filePath, p)
 	if err != nil {
-		logger.LogIf(context.Background(), err)
+		logger.LogIf(GlobalContext, fmt.Errorf("Disk: %s returned %w", b.disk, err))
 		return 0, err
 	}
 	_, err = b.Hash.Write(p)
 	if err != nil {
-		logger.LogIf(context.Background(), err)
+		logger.LogIf(GlobalContext, fmt.Errorf("Disk: %s returned %w", b.disk, err))
 		return 0, err
 	}
 	return len(p), nil
@@ -69,15 +70,13 @@ type wholeBitrotReader struct {
 func (b *wholeBitrotReader) ReadAt(buf []byte, offset int64) (n int, err error) {
 	if b.buf == nil {
 		b.buf = make([]byte, b.tillOffset-offset)
-		if _, err := b.disk.ReadFile(b.volume, b.filePath, offset, b.buf, b.verifier); err != nil {
-			ctx := context.Background()
-			logger.GetReqInfo(ctx).AppendTags("disk", b.disk.String())
-			logger.LogIf(ctx, err)
+		if _, err := b.disk.ReadFile(context.TODO(), b.volume, b.filePath, offset, b.buf, b.verifier); err != nil {
+			logger.LogIf(GlobalContext, fmt.Errorf("Disk: %s -> %s/%s returned %w", b.disk, b.volume, b.filePath, err))
 			return 0, err
 		}
 	}
 	if len(b.buf) < len(buf) {
-		logger.LogIf(context.Background(), errLessData)
+		logger.LogIf(GlobalContext, fmt.Errorf("Disk: %s -> %s/%s returned %w", b.disk, b.volume, b.filePath, errLessData))
 		return 0, errLessData
 	}
 	n = copy(buf, b.buf)

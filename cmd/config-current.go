@@ -18,26 +18,30 @@ package cmd
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"strings"
 	"sync"
 
 	"github.com/minio/minio/cmd/config"
+	"github.com/minio/minio/cmd/config/api"
 	"github.com/minio/minio/cmd/config/cache"
 	"github.com/minio/minio/cmd/config/compress"
+	"github.com/minio/minio/cmd/config/dns"
 	"github.com/minio/minio/cmd/config/etcd"
-	xetcd "github.com/minio/minio/cmd/config/etcd"
-	"github.com/minio/minio/cmd/config/etcd/dns"
+	"github.com/minio/minio/cmd/config/heal"
 	xldap "github.com/minio/minio/cmd/config/identity/ldap"
 	"github.com/minio/minio/cmd/config/identity/openid"
 	"github.com/minio/minio/cmd/config/notify"
 	"github.com/minio/minio/cmd/config/policy/opa"
+	"github.com/minio/minio/cmd/config/scanner"
 	"github.com/minio/minio/cmd/config/storageclass"
 	"github.com/minio/minio/cmd/crypto"
 	xhttp "github.com/minio/minio/cmd/http"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/cmd/logger/target/http"
 	"github.com/minio/minio/pkg/env"
+	"github.com/minio/minio/pkg/madmin"
 )
 
 func initHelp() {
@@ -49,16 +53,19 @@ func initHelp() {
 		config.IdentityOpenIDSubSys: openid.DefaultKVS,
 		config.PolicyOPASubSys:      opa.DefaultKVS,
 		config.RegionSubSys:         config.DefaultRegionKVS,
+		config.APISubSys:            api.DefaultKVS,
 		config.CredentialsSubSys:    config.DefaultCredentialKVS,
 		config.KmsVaultSubSys:       crypto.DefaultVaultKVS,
 		config.KmsKesSubSys:         crypto.DefaultKesKVS,
 		config.LoggerWebhookSubSys:  logger.DefaultKVS,
 		config.AuditWebhookSubSys:   logger.DefaultAuditKVS,
+		config.HealSubSys:           heal.DefaultKVS,
+		config.ScannerSubSys:        scanner.DefaultKVS,
 	}
 	for k, v := range notify.DefaultNotificationKVS {
 		kvs[k] = v
 	}
-	if globalIsXL {
+	if globalIsErasure {
 		kvs[config.StorageClassSubSys] = storageclass.DefaultKVS
 	}
 	config.RegisterDefaultKVS(kvs)
@@ -91,7 +98,7 @@ func initHelp() {
 		},
 		config.HelpKV{
 			Key:         config.PolicyOPASubSys,
-			Description: "enable external OPA for policy enforcement",
+			Description: "[DEPRECATED] enable external OPA for policy enforcement",
 		},
 		config.HelpKV{
 			Key:         config.KmsVaultSubSys,
@@ -100,6 +107,18 @@ func initHelp() {
 		config.HelpKV{
 			Key:         config.KmsKesSubSys,
 			Description: "enable external MinIO key encryption service",
+		},
+		config.HelpKV{
+			Key:         config.APISubSys,
+			Description: "manage global HTTP API call specific features, such as throttling, authentication types, etc.",
+		},
+		config.HelpKV{
+			Key:         config.HealSubSys,
+			Description: "manage object healing frequency and bitrot verification checks",
+		},
+		config.HelpKV{
+			Key:         config.ScannerSubSys,
+			Description: "manage namespace scanning for usage calculation, lifecycle, healing and more",
 		},
 		config.HelpKV{
 			Key:             config.LoggerWebhookSubSys,
@@ -163,7 +182,7 @@ func initHelp() {
 		},
 	}
 
-	if globalIsXL {
+	if globalIsErasure {
 		helpSubSys = append(helpSubSys, config.HelpKV{})
 		copy(helpSubSys[2:], helpSubSys[1:])
 		helpSubSys[1] = config.HelpKV{
@@ -175,10 +194,13 @@ func initHelp() {
 	var helpMap = map[string]config.HelpKVS{
 		"":                          helpSubSys, // Help for all sub-systems.
 		config.RegionSubSys:         config.RegionHelp,
+		config.APISubSys:            api.Help,
 		config.StorageClassSubSys:   storageclass.Help,
 		config.EtcdSubSys:           etcd.Help,
 		config.CacheSubSys:          cache.Help,
 		config.CompressionSubSys:    compress.Help,
+		config.HealSubSys:           heal.Help,
+		config.ScannerSubSys:        scanner.Help,
 		config.IdentityOpenIDSubSys: openid.Help,
 		config.IdentityLDAPSubSys:   xldap.Help,
 		config.PolicyOPASubSys:      opa.Help,
@@ -207,7 +229,10 @@ var (
 	globalServerConfigMu sync.RWMutex
 )
 
-func validateConfig(s config.Config) error {
+func validateConfig(s config.Config, setDriveCounts []int) error {
+	// We must have a global lock for this so nobody else modifies env while we do.
+	defer env.LockSetEnv()()
+
 	// Disable merging env values with config for validation.
 	env.SetEnvOff()
 
@@ -222,10 +247,15 @@ func validateConfig(s config.Config) error {
 		return err
 	}
 
-	if globalIsXL {
-		if _, err := storageclass.LookupConfig(s[config.StorageClassSubSys][config.Default],
-			globalXLSetDriveCount); err != nil {
-			return err
+	if _, err := api.LookupConfig(s[config.APISubSys][config.Default]); err != nil {
+		return err
+	}
+
+	if globalIsErasure {
+		for _, setDriveCount := range setDriveCounts {
+			if _, err := storageclass.LookupConfig(s[config.StorageClassSubSys][config.Default], setDriveCount); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -233,7 +263,22 @@ func validateConfig(s config.Config) error {
 		return err
 	}
 
-	if _, err := compress.LookupConfig(s[config.CompressionSubSys][config.Default]); err != nil {
+	compCfg, err := compress.LookupConfig(s[config.CompressionSubSys][config.Default])
+	if err != nil {
+		return err
+	}
+	objAPI := newObjectLayerFn()
+	if objAPI != nil {
+		if compCfg.Enabled && !objAPI.IsCompressionSupported() {
+			return fmt.Errorf("Backend does not support compression")
+		}
+	}
+
+	if _, err = heal.LookupConfig(s[config.HealSubSys][config.Default]); err != nil {
+		return err
+	}
+
+	if _, err = scanner.LookupConfig(s[config.ScannerSubSys][config.Default]); err != nil {
 		return err
 	}
 
@@ -251,7 +296,10 @@ func validateConfig(s config.Config) error {
 		}
 	}
 	{
-		kmsCfg, err := crypto.LookupConfig(s, globalCertsCADir.Get(), NewCustomHTTPTransport())
+		kmsCfg, err := crypto.LookupConfig(s, globalCertsCADir.Get(), newCustomHTTPTransportWithHTTP2(
+			&tls.Config{
+				RootCAs: globalRootCAs,
+			}, defaultDialTimeout)())
 		if err != nil {
 			return err
 		}
@@ -269,17 +317,27 @@ func validateConfig(s config.Config) error {
 	}
 
 	if _, err := openid.LookupConfig(s[config.IdentityOpenIDSubSys][config.Default],
-		NewCustomHTTPTransport(), xhttp.DrainBody); err != nil {
+		NewGatewayHTTPTransport(), xhttp.DrainBody); err != nil {
 		return err
 	}
 
-	if _, err := xldap.Lookup(s[config.IdentityLDAPSubSys][config.Default],
-		globalRootCAs); err != nil {
-		return err
+	{
+		cfg, err := xldap.Lookup(s[config.IdentityLDAPSubSys][config.Default],
+			globalRootCAs)
+		if err != nil {
+			return err
+		}
+		if cfg.Enabled {
+			conn, cerr := cfg.Connect()
+			if cerr != nil {
+				return cerr
+			}
+			conn.Close()
+		}
 	}
 
 	if _, err := opa.LookupConfig(s[config.PolicyOPASubSys][config.Default],
-		NewCustomHTTPTransport(), xhttp.DrainBody); err != nil {
+		NewGatewayHTTPTransport(), xhttp.DrainBody); err != nil {
 		return err
 	}
 
@@ -287,12 +345,11 @@ func validateConfig(s config.Config) error {
 		return err
 	}
 
-	return notify.TestNotificationTargets(s, GlobalServiceDoneCh, NewCustomHTTPTransport(),
-		globalNotificationSys.ConfiguredTargetIDs())
+	return notify.TestNotificationTargets(GlobalContext, s, NewGatewayHTTPTransport(), globalNotificationSys.ConfiguredTargetIDs())
 }
 
-func lookupConfigs(s config.Config) {
-	ctx := context.Background()
+func lookupConfigs(s config.Config, setDriveCounts []int) {
+	ctx := GlobalContext
 
 	var err error
 	if !globalActiveCred.IsValid() {
@@ -303,15 +360,61 @@ func lookupConfigs(s config.Config) {
 		}
 	}
 
-	etcdCfg, err := xetcd.LookupConfig(s[config.EtcdSubSys][config.Default], globalRootCAs)
+	if dnsURL, dnsUser, dnsPass, ok := env.LookupEnv(config.EnvDNSWebhook); ok {
+		globalDNSConfig, err = dns.NewOperatorDNS(dnsURL,
+			dns.Authentication(dnsUser, dnsPass),
+			dns.RootCAs(globalRootCAs))
+		if err != nil {
+			if globalIsGateway {
+				logger.FatalIf(err, "Unable to initialize remote webhook DNS config")
+			} else {
+				logger.LogIf(ctx, fmt.Errorf("Unable to initialize remote webhook DNS config %w", err))
+			}
+		}
+	}
+
+	etcdCfg, err := etcd.LookupConfig(s[config.EtcdSubSys][config.Default], globalRootCAs)
 	if err != nil {
-		logger.LogIf(ctx, fmt.Errorf("Unable to initialize etcd config: %w", err))
+		if globalIsGateway {
+			logger.FatalIf(err, "Unable to initialize etcd config")
+		} else {
+			logger.LogIf(ctx, fmt.Errorf("Unable to initialize etcd config: %w", err))
+		}
 	}
 
 	if etcdCfg.Enabled {
-		globalEtcdClient, err = xetcd.New(etcdCfg)
-		if err != nil {
-			logger.LogIf(ctx, fmt.Errorf("Unable to initialize etcd config: %w", err))
+		if globalEtcdClient == nil {
+			globalEtcdClient, err = etcd.New(etcdCfg)
+			if err != nil {
+				if globalIsGateway {
+					logger.FatalIf(err, "Unable to initialize etcd config")
+				} else {
+					logger.LogIf(ctx, fmt.Errorf("Unable to initialize etcd config: %w", err))
+				}
+			}
+		}
+
+		if len(globalDomainNames) != 0 && !globalDomainIPs.IsEmpty() && globalEtcdClient != nil {
+			if globalDNSConfig != nil {
+				// if global DNS is already configured, indicate with a warning, incase
+				// users are confused.
+				logger.LogIf(ctx, fmt.Errorf("DNS store is already configured with %s, not using etcd for DNS store", globalDNSConfig))
+			} else {
+				globalDNSConfig, err = dns.NewCoreDNS(etcdCfg.Config,
+					dns.DomainNames(globalDomainNames),
+					dns.DomainIPs(globalDomainIPs),
+					dns.DomainPort(globalMinioPort),
+					dns.CoreDNSPath(etcdCfg.CoreDNSPath),
+				)
+				if err != nil {
+					if globalIsGateway {
+						logger.FatalIf(err, "Unable to initialize DNS config")
+					} else {
+						logger.LogIf(ctx, fmt.Errorf("Unable to initialize DNS config for %s: %w",
+							globalDomainNames, err))
+					}
+				}
+			}
 		}
 	}
 
@@ -322,35 +425,45 @@ func lookupConfigs(s config.Config) {
 	// but not federation.
 	globalBucketFederation = etcdCfg.PathPrefix == "" && etcdCfg.Enabled
 
-	if len(globalDomainNames) != 0 && !globalDomainIPs.IsEmpty() && globalEtcdClient != nil {
-		globalDNSConfig, err = dns.NewCoreDNS(etcdCfg.Config,
-			dns.DomainNames(globalDomainNames),
-			dns.DomainIPs(globalDomainIPs),
-			dns.DomainPort(globalMinioPort),
-			dns.CoreDNSPath(etcdCfg.CoreDNSPath),
-		)
-		if err != nil {
-			logger.LogIf(ctx, fmt.Errorf("Unable to initialize DNS config for %s: %w",
-				globalDomainNames, err))
-		}
-	}
-
 	globalServerRegion, err = config.LookupRegion(s[config.RegionSubSys][config.Default])
 	if err != nil {
 		logger.LogIf(ctx, fmt.Errorf("Invalid region configuration: %w", err))
 	}
 
-	if globalIsXL {
-		globalStorageClass, err = storageclass.LookupConfig(s[config.StorageClassSubSys][config.Default],
-			globalXLSetDriveCount)
-		if err != nil {
-			logger.LogIf(ctx, fmt.Errorf("Unable to initialize storage class config: %w", err))
+	apiConfig, err := api.LookupConfig(s[config.APISubSys][config.Default])
+	if err != nil {
+		logger.LogIf(ctx, fmt.Errorf("Invalid api configuration: %w", err))
+	}
+
+	globalAPIConfig.init(apiConfig, setDriveCounts)
+
+	// Initialize remote instance transport once.
+	getRemoteInstanceTransportOnce.Do(func() {
+		getRemoteInstanceTransport = newGatewayHTTPTransport(apiConfig.RemoteTransportDeadline)
+	})
+
+	if globalIsErasure {
+		for i, setDriveCount := range setDriveCounts {
+			sc, err := storageclass.LookupConfig(s[config.StorageClassSubSys][config.Default], setDriveCount)
+			if err != nil {
+				logger.LogIf(ctx, fmt.Errorf("Unable to initialize storage class config: %w", err))
+				break
+			}
+			// if we validated all setDriveCounts and it was successful
+			// proceed to store the correct storage class globally.
+			if i == len(setDriveCounts)-1 {
+				globalStorageClass = sc
+			}
 		}
 	}
 
 	globalCacheConfig, err = cache.LookupConfig(s[config.CacheSubSys][config.Default])
 	if err != nil {
-		logger.LogIf(ctx, fmt.Errorf("Unable to setup cache: %w", err))
+		if globalIsGateway {
+			logger.FatalIf(err, "Unable to setup cache")
+		} else {
+			logger.LogIf(ctx, fmt.Errorf("Unable to setup cache: %w", err))
+		}
 	}
 
 	if globalCacheConfig.Enabled {
@@ -362,7 +475,10 @@ func lookupConfigs(s config.Config) {
 		}
 	}
 
-	kmsCfg, err := crypto.LookupConfig(s, globalCertsCADir.Get(), NewCustomHTTPTransport())
+	kmsCfg, err := crypto.LookupConfig(s, globalCertsCADir.Get(), newCustomHTTPTransportWithHTTP2(
+		&tls.Config{
+			RootCAs: globalRootCAs,
+		}, defaultDialTimeout)())
 	if err != nil {
 		logger.LogIf(ctx, fmt.Errorf("Unable to setup KMS config: %w", err))
 	}
@@ -371,23 +487,23 @@ func lookupConfigs(s config.Config) {
 	if err != nil {
 		logger.LogIf(ctx, fmt.Errorf("Unable to setup KMS with current KMS config: %w", err))
 	}
+	globalAutoEncryption = kmsCfg.AutoEncryption // Enable auto-encryption if enabled
 
-	// Enable auto-encryption if enabled
-	globalAutoEncryption = kmsCfg.AutoEncryption
-
-	globalCompressConfig, err = compress.LookupConfig(s[config.CompressionSubSys][config.Default])
-	if err != nil {
-		logger.LogIf(ctx, fmt.Errorf("Unable to setup Compression: %w", err))
+	if kmsCfg.Vault.Enabled {
+		const deprecationWarning = `Native Hashicorp Vault support is deprecated and will be removed on 2021-10-01. Please migrate to KES + Hashicorp Vault: https://github.com/minio/kes/wiki/Hashicorp-Vault-Keystore
+Note that native Hashicorp Vault and KES + Hashicorp Vault are not compatible.
+If you need help to migrate smoothly visit: https://min.io/pricing`
+		logger.LogIf(ctx, fmt.Errorf(deprecationWarning))
 	}
 
 	globalOpenIDConfig, err = openid.LookupConfig(s[config.IdentityOpenIDSubSys][config.Default],
-		NewCustomHTTPTransport(), xhttp.DrainBody)
+		NewGatewayHTTPTransport(), xhttp.DrainBody)
 	if err != nil {
 		logger.LogIf(ctx, fmt.Errorf("Unable to initialize OpenID: %w", err))
 	}
 
 	opaCfg, err := opa.LookupConfig(s[config.PolicyOPASubSys][config.Default],
-		NewCustomHTTPTransport(), xhttp.DrainBody)
+		NewGatewayHTTPTransport(), xhttp.DrainBody)
 	if err != nil {
 		logger.LogIf(ctx, fmt.Errorf("Unable to initialize OPA: %w", err))
 	}
@@ -409,24 +525,116 @@ func lookupConfigs(s config.Config) {
 		logger.LogIf(ctx, fmt.Errorf("Unable to initialize logger: %w", err))
 	}
 
-	for _, l := range loggerCfg.HTTP {
+	for k, l := range loggerCfg.HTTP {
 		if l.Enabled {
 			// Enable http logging
-			logger.AddTarget(http.New(l.Endpoint, loggerUserAgent, string(logger.All), NewCustomHTTPTransport()))
+			if err = logger.AddTarget(
+				http.New(
+					http.WithTargetName(k),
+					http.WithEndpoint(l.Endpoint),
+					http.WithAuthToken(l.AuthToken),
+					http.WithUserAgent(loggerUserAgent),
+					http.WithLogKind(string(logger.All)),
+					http.WithTransport(NewGatewayHTTPTransport()),
+				),
+			); err != nil {
+				logger.LogIf(ctx, fmt.Errorf("Unable to initialize console HTTP target: %w", err))
+			}
 		}
 	}
 
-	for _, l := range loggerCfg.Audit {
+	for k, l := range loggerCfg.Audit {
 		if l.Enabled {
 			// Enable http audit logging
-			logger.AddAuditTarget(http.New(l.Endpoint, loggerUserAgent, string(logger.All), NewCustomHTTPTransport()))
+			if err = logger.AddAuditTarget(
+				http.New(
+					http.WithTargetName(k),
+					http.WithEndpoint(l.Endpoint),
+					http.WithAuthToken(l.AuthToken),
+					http.WithUserAgent(loggerUserAgent),
+					http.WithLogKind(string(logger.All)),
+					http.WithTransport(NewGatewayHTTPTransportWithClientCerts(l.ClientCert, l.ClientKey)),
+				),
+			); err != nil {
+				logger.LogIf(ctx, fmt.Errorf("Unable to initialize audit HTTP target: %w", err))
+			}
 		}
 	}
 
-	globalConfigTargetList, err = notify.GetNotificationTargets(s, GlobalServiceDoneCh, NewCustomHTTPTransport())
+	globalConfigTargetList, err = notify.GetNotificationTargets(GlobalContext, s, NewGatewayHTTPTransport(), false)
 	if err != nil {
 		logger.LogIf(ctx, fmt.Errorf("Unable to initialize notification target(s): %w", err))
 	}
+
+	globalEnvTargetList, err = notify.GetNotificationTargets(GlobalContext, newServerConfig(), NewGatewayHTTPTransport(), true)
+	if err != nil {
+		logger.LogIf(ctx, fmt.Errorf("Unable to initialize notification target(s): %w", err))
+	}
+
+	// Apply dynamic config values
+	logger.LogIf(ctx, applyDynamicConfig(ctx, newObjectLayerFn(), s))
+}
+
+// applyDynamicConfig will apply dynamic config values.
+// Dynamic systems should be in config.SubSystemsDynamic as well.
+func applyDynamicConfig(ctx context.Context, objAPI ObjectLayer, s config.Config) error {
+	if objAPI == nil {
+		return nil
+	}
+
+	// Read all dynamic configs.
+	// API
+	apiConfig, err := api.LookupConfig(s[config.APISubSys][config.Default])
+	if err != nil {
+		logger.LogIf(ctx, fmt.Errorf("Invalid api configuration: %w", err))
+	}
+
+	// Compression
+	cmpCfg, err := compress.LookupConfig(s[config.CompressionSubSys][config.Default])
+	if err != nil {
+		return fmt.Errorf("Unable to setup Compression: %w", err)
+	}
+
+	// Validate if the object layer supports compression.
+	if cmpCfg.Enabled && !objAPI.IsCompressionSupported() {
+		return fmt.Errorf("Backend does not support compression")
+	}
+
+	// Heal
+	healCfg, err := heal.LookupConfig(s[config.HealSubSys][config.Default])
+	if err != nil {
+		return fmt.Errorf("Unable to apply heal config: %w", err)
+	}
+
+	// Scanner
+	scannerCfg, err := scanner.LookupConfig(s[config.ScannerSubSys][config.Default])
+	if err != nil {
+		return fmt.Errorf("Unable to apply scanner config: %w", err)
+	}
+
+	// Apply configurations.
+	// We should not fail after this.
+	globalAPIConfig.init(apiConfig, objAPI.SetDriveCounts())
+
+	globalCompressConfigMu.Lock()
+	globalCompressConfig = cmpCfg
+	globalCompressConfigMu.Unlock()
+
+	globalHealConfigMu.Lock()
+	globalHealConfig = healCfg
+	globalHealConfigMu.Unlock()
+
+	logger.LogIf(ctx, scannerSleeper.Update(scannerCfg.Delay, scannerCfg.MaxWait))
+
+	// Update all dynamic config values in memory.
+	globalServerConfigMu.Lock()
+	defer globalServerConfigMu.Unlock()
+	if globalServerConfig != nil {
+		for k := range config.SubSystemsDynamic {
+			globalServerConfig[k] = s[k]
+		}
+	}
+	return nil
 }
 
 // Help - return sub-system level help
@@ -469,6 +677,20 @@ func GetHelp(subSys, key string, envOnly bool) (Help, error) {
 
 	envHelp := config.HelpKVS{}
 	if envOnly {
+		// Only for multiple targets, make sure
+		// to list the ENV, for regular k/v EnableKey is
+		// implicit, for ENVs we cannot make it implicit.
+		if subSysHelp.MultipleTargets {
+			envK := config.EnvPrefix + strings.Join([]string{
+				strings.ToTitle(subSys), strings.ToTitle(madmin.EnableKey),
+			}, config.EnvWordDelimiter)
+			envHelp = append(envHelp, config.HelpKV{
+				Key:         envK,
+				Description: fmt.Sprintf("enable %s target, default is 'off'", subSys),
+				Optional:    false,
+				Type:        "on|off",
+			})
+		}
 		for _, hkv := range h {
 			envK := config.EnvPrefix + strings.Join([]string{
 				strings.ToTitle(subSys), strings.ToTitle(hkv.Key),
@@ -501,20 +723,17 @@ func newSrvConfig(objAPI ObjectLayer) error {
 	// Initialize server config.
 	srvCfg := newServerConfig()
 
-	// Override any values from ENVs.
-	lookupConfigs(srvCfg)
-
 	// hold the mutex lock before a new config is assigned.
 	globalServerConfigMu.Lock()
 	globalServerConfig = srvCfg
 	globalServerConfigMu.Unlock()
 
 	// Save config into file.
-	return saveServerConfig(context.Background(), objAPI, globalServerConfig)
+	return saveServerConfig(GlobalContext, objAPI, globalServerConfig)
 }
 
 func getValidConfig(objAPI ObjectLayer) (config.Config, error) {
-	return readServerConfig(context.Background(), objAPI)
+	return readServerConfig(GlobalContext, objAPI)
 }
 
 // loadConfig - loads a new config from disk, overrides params
@@ -526,7 +745,7 @@ func loadConfig(objAPI ObjectLayer) error {
 	}
 
 	// Override any values from ENVs.
-	lookupConfigs(srvCfg)
+	lookupConfigs(srvCfg, objAPI.SetDriveCounts())
 
 	// hold the mutex lock before a new config is assigned.
 	globalServerConfigMu.Lock()

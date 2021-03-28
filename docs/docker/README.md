@@ -1,4 +1,4 @@
-# MinIO Docker Quickstart Guide [![Slack](https://slack.min.io/slack?type=svg)](https://slack.min.io) [![Go Report Card](https://goreportcard.com/badge/minio/minio)](https://goreportcard.com/report/minio/minio) [![Docker Pulls](https://img.shields.io/docker/pulls/minio/minio.svg?maxAge=604800)](https://hub.docker.com/r/minio/minio/)
+# MinIO Docker Quickstart Guide [![Slack](https://slack.min.io/slack?type=svg)](https://slack.min.io) [![Docker Pulls](https://img.shields.io/docker/pulls/minio/minio.svg?maxAge=604800)](https://hub.docker.com/r/minio/minio/)
 
 ## Prerequisites
 Docker installed on your machine. Download the relevant installer from [here](https://www.docker.com/community-edition#/download).
@@ -7,22 +7,31 @@ Docker installed on your machine. Download the relevant installer from [here](ht
 MinIO needs a persistent volume to store configuration and application data. However, for testing purposes, you can launch MinIO by simply passing a directory (`/data` in the example below). This directory gets created in the container filesystem at the time of container start. But all the data is lost after container exits.
 
 ```sh
-docker run -p 9000:9000 minio/minio server /data
+docker run -p 9000:9000 \
+  -e "MINIO_ROOT_USER=AKIAIOSFODNN7EXAMPLE" \
+  -e "MINIO_ROOT_PASSWORD=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" \
+  minio/minio server /data
 ```
 
 To create a MinIO container with persistent storage, you need to map local persistent directories from the host OS to virtual config `~/.minio` and export `/data` directories. To do this, run the below commands
 
 #### GNU/Linux and macOS
 ```sh
-docker run -p 9000:9000 --name minio1 \
+docker run -p 9000:9000 \
+  --name minio1 \
   -v /mnt/data:/data \
+  -e "MINIO_ROOT_USER=AKIAIOSFODNN7EXAMPLE" \
+  -e "MINIO_ROOT_PASSWORD=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" \
   minio/minio server /data
 ```
 
 #### Windows
 ```sh
-docker run -p 9000:9000 --name minio1 \
+docker run -p 9000:9000 \
+  --name minio1 \
   -v D:\data:/data \
+  -e "MINIO_ROOT_USER=AKIAIOSFODNN7EXAMPLE" \
+  -e "MINIO_ROOT_PASSWORD=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" \
   minio/minio server /data
 ```
 
@@ -39,8 +48,8 @@ To override MinIO's auto-generated keys, you may pass secret and access keys exp
 #### GNU/Linux and macOS
 ```sh
 docker run -p 9000:9000 --name minio1 \
-  -e "MINIO_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE" \
-  -e "MINIO_SECRET_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" \
+  -e "MINIO_ROOT_USER=AKIAIOSFODNN7EXAMPLE" \
+  -e "MINIO_ROOT_PASSWORD=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" \
   -v /mnt/data:/data \
   minio/minio server /data
 ```
@@ -48,8 +57,8 @@ docker run -p 9000:9000 --name minio1 \
 #### Windows
 ```powershell
 docker run -p 9000:9000 --name minio1 \
-  -e "MINIO_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE" \
-  -e "MINIO_SECRET_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" \
+  -e "MINIO_ROOT_USER=AKIAIOSFODNN7EXAMPLE" \
+  -e "MINIO_ROOT_PASSWORD=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" \
   -v D:\data:/data \
   minio/minio server /data
 ```
@@ -66,8 +75,8 @@ mkdir -p ${HOME}/data
 docker run -p 9000:9000 \
   --user $(id -u):$(id -g) \
   --name minio1 \
-  -e "MINIO_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE" \
-  -e "MINIO_SECRET_KEY=wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY" \
+  -e "MINIO_ROOT_USER=AKIAIOSFODNN7EXAMPLE" \
+  -e "MINIO_ROOT_PASSWORD=wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY" \
   -v ${HOME}/data:/data \
   minio/minio server /data
 ```
@@ -81,8 +90,8 @@ On windows you would need to use [Docker integrated windows authentication](http
 docker run -p 9000:9000 \
   --name minio1 \
   --security-opt "credentialspec=file://myuser.json"
-  -e "MINIO_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE" \
-  -e "MINIO_SECRET_KEY=wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY" \
+  -e "MINIO_ROOT_USER=AKIAIOSFODNN7EXAMPLE" \
+  -e "MINIO_ROOT_PASSWORD=wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY" \
   -v D:\data:/data \
   minio/minio server /data
 ```
@@ -108,9 +117,14 @@ To use other secret names follow the instructions above and replace `access_key`
 docker service create --name="minio-service" \
   --secret="my_access_key" \
   --secret="my_secret_key" \
-  --env="MINIO_ACCESS_KEY_FILE=my_access_key" \
-  --env="MINIO_SECRET_KEY_FILE=my_secret_key" \
+  --env="MINIO_ROOT_USER_FILE=my_access_key" \
+  --env="MINIO_ROOT_PASSWORD_FILE=my_secret_key" \
   minio/minio server /data
+```
+`MINIO_ROOT_USER_FILE` and `MINIO_ROOT_PASSWORD_FILE` also support custom absolute paths, in case Docker secrets are mounted to custom locations or other tools are used to mount secrets into the container. For example, HashiCorp Vault injects secrets to `/vault/secrets`. With the custom names above, set the environment variables to
+```
+MINIO_ROOT_USER_FILE=/vault/secrets/my_access_key
+MINIO_ROOT_PASSWORD_FILE=/vault/secrets/my_secret_key
 ```
 
 ### Retrieving Container ID

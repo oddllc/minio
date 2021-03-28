@@ -18,6 +18,7 @@ package cmd
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"net/http"
 	"reflect"
@@ -27,6 +28,7 @@ import (
 	"github.com/klauspost/compress/s2"
 	"github.com/minio/minio/cmd/config/compress"
 	"github.com/minio/minio/cmd/crypto"
+	"github.com/minio/minio/pkg/trie"
 )
 
 // Tests validate bucket name.
@@ -105,13 +107,24 @@ func TestIsValidObjectName(t *testing.T) {
 		{"f*le", true},
 		{"contains-^-carret", true},
 		{"contains-|-pipe", true},
-		{"contains-\"-quote", true},
 		{"contains-`-tick", true},
 		{"..test", true},
 		{".. test", true},
 		{". test", true},
 		{".test", true},
 		{"There are far too many object names, and far too few bucket names!", true},
+		{"!\"#$%&'()*+,-.／:;<=>?@[\\]^_`{|}~/!\"#$%&'()*+,-.／:;<=>?@[\\]^_`{|}~)", true},
+		{"!\"#$%&'()*+,-.／:;<=>?@[\\]^_`{|}~", true},
+		{"␀␁␂␃␄␅␆␇␈␉␊␋␌␍␎␏␐␑␒␓␔␕␖␗␘␙␚␛␜␝␞␟␡", true},
+		{"trailing VT␋/trailing VT␋", true},
+		{"␋leading VT/␋leading VT", true},
+		{"~leading tilde", true},
+		{"\rleading CR", true},
+		{"\nleading LF", true},
+		{"\tleading HT", true},
+		{"trailing CR\r", true},
+		{"trailing LF\n", true},
+		{"trailing HT\t", true},
 		// cases for which test should fail.
 		// passing invalid object names.
 		{"", false},
@@ -122,7 +135,8 @@ func TestIsValidObjectName(t *testing.T) {
 		{" ../etc", false},
 		{"./././", false},
 		{"./etc", false},
-		{"contains-\\-backslash", false},
+		{`contains//double/forwardslash`, false},
+		{`//contains/double-forwardslash-prefix`, false},
 		{string([]byte{0xff, 0xfe, 0xfd}), false},
 	}
 
@@ -303,7 +317,7 @@ func TestIsCompressed(t *testing.T) {
 		result  bool
 		err     bool
 	}{
-		{
+		0: {
 			objInfo: ObjectInfo{
 				UserDefined: map[string]string{"X-Minio-Internal-compression": compressionAlgorithmV1,
 					"content-type": "application/octet-stream",
@@ -311,7 +325,7 @@ func TestIsCompressed(t *testing.T) {
 			},
 			result: true,
 		},
-		{
+		1: {
 			objInfo: ObjectInfo{
 				UserDefined: map[string]string{"X-Minio-Internal-compression": compressionAlgorithmV2,
 					"content-type": "application/octet-stream",
@@ -319,7 +333,7 @@ func TestIsCompressed(t *testing.T) {
 			},
 			result: true,
 		},
-		{
+		2: {
 			objInfo: ObjectInfo{
 				UserDefined: map[string]string{"X-Minio-Internal-compression": "unknown/compression/type",
 					"content-type": "application/octet-stream",
@@ -328,18 +342,18 @@ func TestIsCompressed(t *testing.T) {
 			result: true,
 			err:    true,
 		},
-		{
+		3: {
 			objInfo: ObjectInfo{
 				UserDefined: map[string]string{"X-Minio-Internal-compression": compressionAlgorithmV2,
 					"content-type": "application/octet-stream",
 					"etag":         "b3ff3ef3789147152fbfbc50efba4bfd-2",
-					crypto.SSEIV:   "yes",
+					crypto.MetaIV:  "yes",
 				},
 			},
 			result: true,
-			err:    true,
+			err:    false,
 		},
-		{
+		4: {
 			objInfo: ObjectInfo{
 				UserDefined: map[string]string{"X-Minio-Internal-XYZ": "klauspost/compress/s2",
 					"content-type": "application/octet-stream",
@@ -347,7 +361,7 @@ func TestIsCompressed(t *testing.T) {
 			},
 			result: false,
 		},
-		{
+		5: {
 			objInfo: ObjectInfo{
 				UserDefined: map[string]string{"content-type": "application/octet-stream",
 					"etag": "b3ff3ef3789147152fbfbc50efba4bfd-2"},
@@ -428,40 +442,22 @@ func TestExcludeForCompression(t *testing.T) {
 	}
 }
 
-// Test getPartFile function.
-func TestGetPartFile(t *testing.T) {
-	testCases := []struct {
-		entries    []string
-		partNumber int
-		etag       string
-		result     string
-	}{
-		{
-			entries:    []string{"00001.8a034f82cb9cb31140d87d3ce2a9ede3.67108864", "fs.json", "00002.d73d8ab724016dfb051e2d3584495c54.32891137"},
-			partNumber: 1,
-			etag:       "8a034f82cb9cb31140d87d3ce2a9ede3",
-			result:     "00001.8a034f82cb9cb31140d87d3ce2a9ede3.67108864",
-		},
-		{
-			entries:    []string{"00001.8a034f82cb9cb31140d87d3ce2a9ede3.67108864", "fs.json", "00002.d73d8ab724016dfb051e2d3584495c54.32891137"},
-			partNumber: 2,
-			etag:       "d73d8ab724016dfb051e2d3584495c54",
-			result:     "00002.d73d8ab724016dfb051e2d3584495c54.32891137",
-		},
-		{
-			entries:    []string{"00001.8a034f82cb9cb31140d87d3ce2a9ede3.67108864", "fs.json", "00002.d73d8ab724016dfb051e2d3584495c54.32891137"},
-			partNumber: 1,
-			etag:       "d73d8ab724016dfb051e2d3584495c54",
-			result:     "",
-		},
+func BenchmarkGetPartFileWithTrie(b *testing.B) {
+	b.ResetTimer()
+
+	entriesTrie := trie.NewTrie()
+	for i := 1; i <= 10000; i++ {
+		entriesTrie.Insert(fmt.Sprintf("%.5d.8a034f82cb9cb31140d87d3ce2a9ede3.67108864", i))
 	}
-	for i, test := range testCases {
-		got := getPartFile(test.entries, test.partNumber, test.etag)
-		if got != test.result {
-			t.Errorf("Test %d - expected %s but received %s",
-				i+1, test.result, got)
+
+	for i := 1; i <= 10000; i++ {
+		partFile := getPartFile(entriesTrie, i, "8a034f82cb9cb31140d87d3ce2a9ede3")
+		if partFile == "" {
+			b.Fatal("partFile returned is empty")
 		}
 	}
+
+	b.ReportAllocs()
 }
 
 func TestGetActualSize(t *testing.T) {
@@ -509,7 +505,7 @@ func TestGetActualSize(t *testing.T) {
 		},
 	}
 	for i, test := range testCases {
-		got := test.objInfo.GetActualSize()
+		got, _ := test.objInfo.GetActualSize()
 		if got != test.result {
 			t.Errorf("Test %d - expected %d but received %d",
 				i+1, test.result, got)
@@ -523,8 +519,9 @@ func TestGetCompressedOffsets(t *testing.T) {
 		offset            int64
 		startOffset       int64
 		snappyStartOffset int64
+		firstPart         int
 	}{
-		{
+		0: {
 			objInfo: ObjectInfo{
 				Parts: []ObjectPartInfo{
 					{
@@ -540,8 +537,9 @@ func TestGetCompressedOffsets(t *testing.T) {
 			offset:            79109865,
 			startOffset:       39235668,
 			snappyStartOffset: 12001001,
+			firstPart:         1,
 		},
-		{
+		1: {
 			objInfo: ObjectInfo{
 				Parts: []ObjectPartInfo{
 					{
@@ -558,7 +556,7 @@ func TestGetCompressedOffsets(t *testing.T) {
 			startOffset:       0,
 			snappyStartOffset: 19109865,
 		},
-		{
+		2: {
 			objInfo: ObjectInfo{
 				Parts: []ObjectPartInfo{
 					{
@@ -577,14 +575,18 @@ func TestGetCompressedOffsets(t *testing.T) {
 		},
 	}
 	for i, test := range testCases {
-		startOffset, snappyStartOffset := getCompressedOffsets(test.objInfo, test.offset)
+		startOffset, snappyStartOffset, firstPart := getCompressedOffsets(test.objInfo, test.offset)
 		if startOffset != test.startOffset {
 			t.Errorf("Test %d - expected startOffset %d but received %d",
-				i+1, test.startOffset, startOffset)
+				i, test.startOffset, startOffset)
 		}
 		if snappyStartOffset != test.snappyStartOffset {
 			t.Errorf("Test %d - expected snappyOffset %d but received %d",
-				i+1, test.snappyStartOffset, snappyStartOffset)
+				i, test.snappyStartOffset, snappyStartOffset)
+		}
+		if firstPart != test.firstPart {
+			t.Errorf("Test %d - expected firstPart %d but received %d",
+				i, test.firstPart, firstPart)
 		}
 	}
 }
@@ -603,7 +605,7 @@ func TestS2CompressReader(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			buf := make([]byte, 100) // make small buffer to ensure multiple reads are required for large case
 
-			r := newS2CompressReader(bytes.NewReader(tt.data))
+			r := newS2CompressReader(bytes.NewReader(tt.data), int64(len(tt.data)))
 			defer r.Close()
 
 			var rdrBuf bytes.Buffer

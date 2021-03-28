@@ -18,13 +18,68 @@
 package madmin
 
 import (
+	"context"
 	"encoding/json"
 	"io/ioutil"
 	"net/http"
 	"net/url"
+	"time"
 
 	"github.com/minio/minio/pkg/auth"
+	iampolicy "github.com/minio/minio/pkg/iam/policy"
 )
+
+// AccountAccess contains information about
+type AccountAccess struct {
+	Read  bool `json:"read"`
+	Write bool `json:"write"`
+}
+
+// BucketUsageInfo represents bucket usage of a bucket, and its relevant
+// access type for an account
+type BucketUsageInfo struct {
+	Name    string        `json:"name"`
+	Size    uint64        `json:"size"`
+	Created time.Time     `json:"created"`
+	Access  AccountAccess `json:"access"`
+}
+
+// AccountInfo represents the account usage info of an
+// account across buckets.
+type AccountInfo struct {
+	AccountName string
+	Policy      iampolicy.Policy
+	Buckets     []BucketUsageInfo
+}
+
+// AccountInfo returns the usage info for the authenticating account.
+func (adm *AdminClient) AccountInfo(ctx context.Context) (AccountInfo, error) {
+	resp, err := adm.executeMethod(ctx, http.MethodGet, requestData{relPath: adminAPIPrefix + "/accountinfo"})
+	defer closeResponse(resp)
+	if err != nil {
+		return AccountInfo{}, err
+	}
+
+	// Check response http status code
+	if resp.StatusCode != http.StatusOK {
+		return AccountInfo{}, httpRespToErrorResponse(resp)
+	}
+
+	// Unmarshal the server's json response
+	var accountInfo AccountInfo
+
+	respBytes, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return AccountInfo{}, err
+	}
+
+	err = json.Unmarshal(respBytes, &accountInfo)
+	if err != nil {
+		return AccountInfo{}, err
+	}
+
+	return accountInfo, nil
+}
 
 // AccountStatus - account status.
 type AccountStatus string
@@ -44,7 +99,7 @@ type UserInfo struct {
 }
 
 // RemoveUser - remove a user.
-func (adm *AdminClient) RemoveUser(accessKey string) error {
+func (adm *AdminClient) RemoveUser(ctx context.Context, accessKey string) error {
 	queryValues := url.Values{}
 	queryValues.Set("accessKey", accessKey)
 
@@ -53,8 +108,8 @@ func (adm *AdminClient) RemoveUser(accessKey string) error {
 		queryValues: queryValues,
 	}
 
-	// Execute DELETE on /minio/admin/v2/remove-user to remove a user.
-	resp, err := adm.executeMethod("DELETE", reqData)
+	// Execute DELETE on /minio/admin/v3/remove-user to remove a user.
+	resp, err := adm.executeMethod(ctx, http.MethodDelete, reqData)
 
 	defer closeResponse(resp)
 	if err != nil {
@@ -69,13 +124,13 @@ func (adm *AdminClient) RemoveUser(accessKey string) error {
 }
 
 // ListUsers - list all users.
-func (adm *AdminClient) ListUsers() (map[string]UserInfo, error) {
+func (adm *AdminClient) ListUsers(ctx context.Context) (map[string]UserInfo, error) {
 	reqData := requestData{
 		relPath: adminAPIPrefix + "/list-users",
 	}
 
-	// Execute GET on /minio/admin/v2/list-users
-	resp, err := adm.executeMethod("GET", reqData)
+	// Execute GET on /minio/admin/v3/list-users
+	resp, err := adm.executeMethod(ctx, http.MethodGet, reqData)
 
 	defer closeResponse(resp)
 	if err != nil {
@@ -86,7 +141,7 @@ func (adm *AdminClient) ListUsers() (map[string]UserInfo, error) {
 		return nil, httpRespToErrorResponse(resp)
 	}
 
-	data, err := DecryptData(adm.secretAccessKey, resp.Body)
+	data, err := DecryptData(adm.getSecretKey(), resp.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -100,7 +155,7 @@ func (adm *AdminClient) ListUsers() (map[string]UserInfo, error) {
 }
 
 // GetUserInfo - get info on a user
-func (adm *AdminClient) GetUserInfo(name string) (u UserInfo, err error) {
+func (adm *AdminClient) GetUserInfo(ctx context.Context, name string) (u UserInfo, err error) {
 	queryValues := url.Values{}
 	queryValues.Set("accessKey", name)
 
@@ -109,8 +164,8 @@ func (adm *AdminClient) GetUserInfo(name string) (u UserInfo, err error) {
 		queryValues: queryValues,
 	}
 
-	// Execute GET on /minio/admin/v2/user-info
-	resp, err := adm.executeMethod("GET", reqData)
+	// Execute GET on /minio/admin/v3/user-info
+	resp, err := adm.executeMethod(ctx, http.MethodGet, reqData)
 
 	defer closeResponse(resp)
 	if err != nil {
@@ -134,7 +189,7 @@ func (adm *AdminClient) GetUserInfo(name string) (u UserInfo, err error) {
 }
 
 // SetUser - sets a user info.
-func (adm *AdminClient) SetUser(accessKey, secretKey string, status AccountStatus) error {
+func (adm *AdminClient) SetUser(ctx context.Context, accessKey, secretKey string, status AccountStatus) error {
 
 	if !auth.IsAccessKeyValid(accessKey) {
 		return auth.ErrInvalidAccessKeyLength
@@ -151,7 +206,7 @@ func (adm *AdminClient) SetUser(accessKey, secretKey string, status AccountStatu
 	if err != nil {
 		return err
 	}
-	econfigBytes, err := EncryptData(adm.secretAccessKey, data)
+	econfigBytes, err := EncryptData(adm.getSecretKey(), data)
 	if err != nil {
 		return err
 	}
@@ -165,8 +220,8 @@ func (adm *AdminClient) SetUser(accessKey, secretKey string, status AccountStatu
 		content:     econfigBytes,
 	}
 
-	// Execute PUT on /minio/admin/v2/add-user to set a user.
-	resp, err := adm.executeMethod("PUT", reqData)
+	// Execute PUT on /minio/admin/v3/add-user to set a user.
+	resp, err := adm.executeMethod(ctx, http.MethodPut, reqData)
 
 	defer closeResponse(resp)
 	if err != nil {
@@ -181,12 +236,12 @@ func (adm *AdminClient) SetUser(accessKey, secretKey string, status AccountStatu
 }
 
 // AddUser - adds a user.
-func (adm *AdminClient) AddUser(accessKey, secretKey string) error {
-	return adm.SetUser(accessKey, secretKey, AccountEnabled)
+func (adm *AdminClient) AddUser(ctx context.Context, accessKey, secretKey string) error {
+	return adm.SetUser(ctx, accessKey, secretKey, AccountEnabled)
 }
 
 // SetUserStatus - adds a status for a user.
-func (adm *AdminClient) SetUserStatus(accessKey string, status AccountStatus) error {
+func (adm *AdminClient) SetUserStatus(ctx context.Context, accessKey string, status AccountStatus) error {
 	queryValues := url.Values{}
 	queryValues.Set("accessKey", accessKey)
 	queryValues.Set("status", string(status))
@@ -196,8 +251,8 @@ func (adm *AdminClient) SetUserStatus(accessKey string, status AccountStatus) er
 		queryValues: queryValues,
 	}
 
-	// Execute PUT on /minio/admin/v2/set-user-status to set status.
-	resp, err := adm.executeMethod("PUT", reqData)
+	// Execute PUT on /minio/admin/v3/set-user-status to set status.
+	resp, err := adm.executeMethod(ctx, http.MethodPut, reqData)
 
 	defer closeResponse(resp)
 	if err != nil {
@@ -205,6 +260,128 @@ func (adm *AdminClient) SetUserStatus(accessKey string, status AccountStatus) er
 	}
 
 	if resp.StatusCode != http.StatusOK {
+		return httpRespToErrorResponse(resp)
+	}
+
+	return nil
+}
+
+// AddServiceAccountReq is the request body of the add service account admin call
+type AddServiceAccountReq struct {
+	Policy *iampolicy.Policy `json:"policy,omitempty"`
+}
+
+// AddServiceAccountResp is the response body of the add service account admin call
+type AddServiceAccountResp struct {
+	Credentials auth.Credentials `json:"credentials"`
+}
+
+// AddServiceAccount - creates a new service account belonging to the user sending
+// the request while restricting the service account permission by the given policy document.
+func (adm *AdminClient) AddServiceAccount(ctx context.Context, policy *iampolicy.Policy) (auth.Credentials, error) {
+	if policy != nil {
+		if err := policy.Validate(); err != nil {
+			return auth.Credentials{}, err
+		}
+	}
+
+	data, err := json.Marshal(AddServiceAccountReq{
+		Policy: policy,
+	})
+	if err != nil {
+		return auth.Credentials{}, err
+	}
+
+	econfigBytes, err := EncryptData(adm.getSecretKey(), data)
+	if err != nil {
+		return auth.Credentials{}, err
+	}
+
+	reqData := requestData{
+		relPath: adminAPIPrefix + "/add-service-account",
+		content: econfigBytes,
+	}
+
+	// Execute PUT on /minio/admin/v3/add-service-account to set a user.
+	resp, err := adm.executeMethod(ctx, http.MethodPut, reqData)
+	defer closeResponse(resp)
+	if err != nil {
+		return auth.Credentials{}, err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return auth.Credentials{}, httpRespToErrorResponse(resp)
+	}
+
+	data, err = DecryptData(adm.getSecretKey(), resp.Body)
+	if err != nil {
+		return auth.Credentials{}, err
+	}
+
+	var serviceAccountResp AddServiceAccountResp
+	if err = json.Unmarshal(data, &serviceAccountResp); err != nil {
+		return auth.Credentials{}, err
+	}
+	return serviceAccountResp.Credentials, nil
+}
+
+// ListServiceAccountsResp is the response body of the list service accounts call
+type ListServiceAccountsResp struct {
+	Accounts []string `json:"accounts"`
+}
+
+// ListServiceAccounts - list service accounts belonging to the specified user
+func (adm *AdminClient) ListServiceAccounts(ctx context.Context) (ListServiceAccountsResp, error) {
+	reqData := requestData{
+		relPath: adminAPIPrefix + "/list-service-accounts",
+	}
+
+	// Execute GET on /minio/admin/v3/list-service-accounts
+	resp, err := adm.executeMethod(ctx, http.MethodGet, reqData)
+	defer closeResponse(resp)
+	if err != nil {
+		return ListServiceAccountsResp{}, err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return ListServiceAccountsResp{}, httpRespToErrorResponse(resp)
+	}
+
+	data, err := DecryptData(adm.getSecretKey(), resp.Body)
+	if err != nil {
+		return ListServiceAccountsResp{}, err
+	}
+
+	var listResp ListServiceAccountsResp
+	if err = json.Unmarshal(data, &listResp); err != nil {
+		return ListServiceAccountsResp{}, err
+	}
+	return listResp, nil
+}
+
+// DeleteServiceAccount - delete a specified service account. The server will reject
+// the request if the service account does not belong to the user initiating the request
+func (adm *AdminClient) DeleteServiceAccount(ctx context.Context, serviceAccount string) error {
+	if !auth.IsAccessKeyValid(serviceAccount) {
+		return auth.ErrInvalidAccessKeyLength
+	}
+
+	queryValues := url.Values{}
+	queryValues.Set("accessKey", serviceAccount)
+
+	reqData := requestData{
+		relPath:     adminAPIPrefix + "/delete-service-account",
+		queryValues: queryValues,
+	}
+
+	// Execute DELETE on /minio/admin/v3/delete-service-account
+	resp, err := adm.executeMethod(ctx, http.MethodDelete, reqData)
+	defer closeResponse(resp)
+	if err != nil {
+		return err
+	}
+
+	if resp.StatusCode != http.StatusNoContent {
 		return httpRespToErrorResponse(resp)
 	}
 

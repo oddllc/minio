@@ -18,7 +18,6 @@ package cmd
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -29,6 +28,7 @@ import (
 	"reflect"
 	"strings"
 
+	jsoniter "github.com/json-iterator/go"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/sio"
 )
@@ -131,29 +131,11 @@ func createFormatCache(fsFormatPath string, format *formatCacheV1) error {
 // of format cache config
 func initFormatCache(ctx context.Context, drives []string) (formats []*formatCacheV2, err error) {
 	nformats := newFormatCacheV2(drives)
-	for _, drive := range drives {
-		_, err = os.Stat(drive)
-		if err == nil {
-			continue
-		}
-		if !os.IsNotExist(err) {
-			logger.GetReqInfo(ctx).AppendTags("drive", drive)
-			logger.LogIf(ctx, err, logger.Application)
-			return nil, err
-		}
-		if err = os.Mkdir(drive, 0777); err != nil {
-			logger.GetReqInfo(ctx).AppendTags("drive", drive)
-			logger.LogIf(ctx, err, logger.Application)
-			return nil, err
-		}
-	}
 	for i, drive := range drives {
-		if err = os.Mkdir(pathJoin(drive, minioMetaBucket), 0777); err != nil {
-			if !os.IsExist(err) {
-				logger.GetReqInfo(ctx).AppendTags("drive", drive)
-				logger.LogIf(ctx, err)
-				return nil, err
-			}
+		if err = os.MkdirAll(pathJoin(drive, minioMetaBucket), 0777); err != nil {
+			logger.GetReqInfo(ctx).AppendTags("drive", drive)
+			logger.LogIf(ctx, err)
+			return nil, err
 		}
 		cacheFormatPath := pathJoin(drive, minioMetaBucket, formatConfigFile)
 		// Fresh disk - create format.json for this cfs
@@ -175,7 +157,7 @@ func loadFormatCache(ctx context.Context, drives []string) ([]*formatCacheV2, bo
 		f, err := os.OpenFile(cacheFormatPath, os.O_RDWR, 0)
 
 		if err != nil {
-			if os.IsNotExist(err) {
+			if osIsNotExist(err) {
 				continue
 			}
 			logger.LogIf(ctx, err)
@@ -336,7 +318,7 @@ func cacheDrivesUnformatted(drives []string) bool {
 	count := 0
 	for _, drive := range drives {
 		cacheFormatPath := pathJoin(drive, minioMetaBucket, formatConfigFile)
-		if _, err := os.Stat(cacheFormatPath); os.IsNotExist(err) {
+		if _, err := os.Stat(cacheFormatPath); osIsNotExist(err) {
 			count++
 		}
 	}
@@ -366,7 +348,7 @@ func loadAndValidateCacheFormat(ctx context.Context, drives []string) (formats [
 func migrateCacheData(ctx context.Context, c *diskCache, bucket, object, oldfile, destDir string, metadata map[string]string) error {
 	st, err := os.Stat(oldfile)
 	if err != nil {
-		err = osErrToFSFileErr(err)
+		err = osErrToFileErr(err)
 		return err
 	}
 	readCloser, err := readCacheFileStream(oldfile, 0, st.Size())
@@ -383,7 +365,7 @@ func migrateCacheData(ctx context.Context, c *diskCache, bucket, object, oldfile
 		}
 		actualSize, _ = sio.EncryptedSize(uint64(st.Size()))
 	}
-	_, err = c.bitrotWriteToCache(destDir, cacheDataFile, reader, uint64(actualSize))
+	_, _, err = c.bitrotWriteToCache(destDir, cacheDataFile, reader, actualSize)
 	return err
 }
 
@@ -444,6 +426,7 @@ func migrateOldCache(ctx context.Context, c *diskCache) error {
 			}
 			// marshal cache metadata after adding version and stat info
 			meta := &cacheMeta{}
+			var json = jsoniter.ConfigCompatibleWithStandardLibrary
 			if err = json.Unmarshal(metaBytes, &meta); err != nil {
 				return err
 			}

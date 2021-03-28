@@ -18,7 +18,6 @@ package cmd
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -29,8 +28,8 @@ import (
 	"testing"
 
 	"github.com/minio/minio/pkg/auth"
-	"github.com/minio/minio/pkg/policy"
-	"github.com/minio/minio/pkg/policy/condition"
+	"github.com/minio/minio/pkg/bucket/policy"
+	"github.com/minio/minio/pkg/bucket/policy/condition"
 )
 
 func getAnonReadOnlyBucketPolicy(bucketName string) *policy.Policy {
@@ -93,7 +92,7 @@ func getAnonWriteOnlyObjectPolicy(bucketName, prefix string) *policy.Policy {
 	}
 }
 
-// Wrapper for calling Put Bucket Policy HTTP handler tests for both XL multiple disks and single node setup.
+// Wrapper for calling Put Bucket Policy HTTP handler tests for both Erasure multiple disks and single node setup.
 func TestPutBucketPolicyHandler(t *testing.T) {
 	ExecObjectLayerAPITest(t, testPutBucketPolicyHandler, []string{"PutBucketPolicy"})
 }
@@ -103,7 +102,7 @@ func testPutBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string
 	credentials auth.Credentials, t *testing.T) {
 
 	bucketName1 := fmt.Sprintf("%s-1", bucketName)
-	if err := obj.MakeBucketWithLocation(context.Background(), bucketName1, ""); err != nil {
+	if err := obj.MakeBucketWithLocation(GlobalContext, bucketName1, BucketOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -253,7 +252,7 @@ func testPutBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string
 		// initialize HTTP NewRecorder, this records any mutations to response writer inside the handler.
 		recV4 := httptest.NewRecorder()
 		// construct HTTP request for PUT bucket policy endpoint.
-		reqV4, err := newTestSignedRequestV4("PUT", getPutPolicyURL("", testCase.bucketName),
+		reqV4, err := newTestSignedRequestV4(http.MethodPut, getPutPolicyURL("", testCase.bucketName),
 			int64(testCase.policyLen), testCase.bucketPolicyReader, testCase.accessKey, testCase.secretKey, nil)
 		if err != nil {
 			t.Fatalf("Test %d: %s: Failed to create HTTP request for PutBucketPolicyHandler: <ERROR> %v", i+1, instanceType, err)
@@ -267,7 +266,7 @@ func testPutBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string
 		// initialize HTTP NewRecorder, this records any mutations to response writer inside the handler.
 		recV2 := httptest.NewRecorder()
 		// construct HTTP request for PUT bucket policy endpoint.
-		reqV2, err := newTestSignedRequestV2("PUT", getPutPolicyURL("", testCase.bucketName),
+		reqV2, err := newTestSignedRequestV2(http.MethodPut, getPutPolicyURL("", testCase.bucketName),
 			int64(testCase.policyLen), testCase.bucketPolicyReader, testCase.accessKey, testCase.secretKey, nil)
 		if err != nil {
 			t.Fatalf("Test %d: %s: Failed to create HTTP request for PutBucketPolicyHandler: <ERROR> %v", i+1, instanceType, err)
@@ -284,7 +283,7 @@ func testPutBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string
 	// Bucket policy related functions doesn't support anonymous requests, setting policies shouldn't make a difference.
 	bucketPolicyStr := fmt.Sprintf(bucketPolicyTemplate, bucketName, bucketName)
 	// create unsigned HTTP request for PutBucketPolicyHandler.
-	anonReq, err := newTestRequest("PUT", getPutPolicyURL("", bucketName),
+	anonReq, err := newTestRequest(http.MethodPut, getPutPolicyURL("", bucketName),
 		int64(len(bucketPolicyStr)), bytes.NewReader([]byte(bucketPolicyStr)))
 
 	if err != nil {
@@ -303,7 +302,7 @@ func testPutBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string
 	// The only aim is to generate an HTTP request in a way that the relevant/registered end point is evoked/called.
 	nilBucket := "dummy-bucket"
 
-	nilReq, err := newTestSignedRequestV4("PUT", getPutPolicyURL("", nilBucket),
+	nilReq, err := newTestSignedRequestV4(http.MethodPut, getPutPolicyURL("", nilBucket),
 		0, nil, "", "", nil)
 
 	if err != nil {
@@ -315,7 +314,7 @@ func testPutBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string
 
 }
 
-// Wrapper for calling Get Bucket Policy HTTP handler tests for both XL multiple disks and single node setup.
+// Wrapper for calling Get Bucket Policy HTTP handler tests for both Erasure multiple disks and single node setup.
 func TestGetBucketPolicyHandler(t *testing.T) {
 	ExecObjectLayerAPITest(t, testGetBucketPolicyHandler, []string{"PutBucketPolicy", "GetBucketPolicy"})
 }
@@ -345,7 +344,7 @@ func testGetBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string
 		// initialize HTTP NewRecorder, this records any mutations to response writer inside the handler.
 		recV4 := httptest.NewRecorder()
 		// construct HTTP request for PUT bucket policy endpoint.
-		reqV4, err := newTestSignedRequestV4("PUT", getPutPolicyURL("", testPolicy.bucketName),
+		reqV4, err := newTestSignedRequestV4(http.MethodPut, getPutPolicyURL("", testPolicy.bucketName),
 			int64(len(bucketPolicyStr)), bytes.NewReader([]byte(bucketPolicyStr)), testPolicy.accessKey, testPolicy.secretKey, nil)
 		if err != nil {
 			t.Fatalf("Test %d: Failed to create HTTP request for PutBucketPolicyHandler: <ERROR> %v", i+1, err)
@@ -359,7 +358,7 @@ func testGetBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string
 		// initialize HTTP NewRecorder, this records any mutations to response writer inside the handler.
 		recV2 := httptest.NewRecorder()
 		// construct HTTP request for PUT bucket policy endpoint.
-		reqV2, err := newTestSignedRequestV2("PUT", getPutPolicyURL("", testPolicy.bucketName),
+		reqV2, err := newTestSignedRequestV2(http.MethodPut, getPutPolicyURL("", testPolicy.bucketName),
 			int64(len(bucketPolicyStr)), bytes.NewReader([]byte(bucketPolicyStr)), testPolicy.accessKey, testPolicy.secretKey, nil)
 		if err != nil {
 			t.Fatalf("Test %d: Failed to create HTTP request for PutBucketPolicyHandler: <ERROR> %v", i+1, err)
@@ -416,7 +415,7 @@ func testGetBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string
 		// initialize HTTP NewRecorder, this records any mutations to response writer inside the handler.
 		recV4 := httptest.NewRecorder()
 		// construct HTTP request for PUT bucket policy endpoint.
-		reqV4, err := newTestSignedRequestV4("GET", getGetPolicyURL("", testCase.bucketName),
+		reqV4, err := newTestSignedRequestV4(http.MethodGet, getGetPolicyURL("", testCase.bucketName),
 			0, nil, testCase.accessKey, testCase.secretKey, nil)
 
 		if err != nil {
@@ -455,7 +454,7 @@ func testGetBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string
 		// initialize HTTP NewRecorder, this records any mutations to response writer inside the handler.
 		recV2 := httptest.NewRecorder()
 		// construct HTTP request for PUT bucket policy endpoint.
-		reqV2, err := newTestSignedRequestV2("GET", getGetPolicyURL("", testCase.bucketName),
+		reqV2, err := newTestSignedRequestV2(http.MethodGet, getGetPolicyURL("", testCase.bucketName),
 			0, nil, testCase.accessKey, testCase.secretKey, nil)
 		if err != nil {
 			t.Fatalf("Test %d: Failed to create HTTP request for GetBucketPolicyHandler: <ERROR> %v", i+1, err)
@@ -492,7 +491,7 @@ func testGetBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string
 	// Test for Anonymous/unsigned http request.
 	// Bucket policy related functions doesn't support anonymous requests, setting policies shouldn't make a difference.
 	// create unsigned HTTP request for PutBucketPolicyHandler.
-	anonReq, err := newTestRequest("GET", getPutPolicyURL("", bucketName), 0, nil)
+	anonReq, err := newTestRequest(http.MethodGet, getPutPolicyURL("", bucketName), 0, nil)
 
 	if err != nil {
 		t.Fatalf("MinIO %s: Failed to create an anonymous request for bucket \"%s\": <ERROR> %v",
@@ -510,7 +509,7 @@ func testGetBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string
 	// The only aim is to generate an HTTP request in a way that the relevant/registered end point is evoked/called.
 	nilBucket := "dummy-bucket"
 
-	nilReq, err := newTestSignedRequestV4("GET", getGetPolicyURL("", nilBucket),
+	nilReq, err := newTestSignedRequestV4(http.MethodGet, getGetPolicyURL("", nilBucket),
 		0, nil, "", "", nil)
 
 	if err != nil {
@@ -521,7 +520,7 @@ func testGetBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string
 	ExecObjectLayerAPINilTest(t, nilBucket, "", instanceType, apiRouter, nilReq)
 }
 
-// Wrapper for calling Delete Bucket Policy HTTP handler tests for both XL multiple disks and single node setup.
+// Wrapper for calling Delete Bucket Policy HTTP handler tests for both Erasure multiple disks and single node setup.
 func TestDeleteBucketPolicyHandler(t *testing.T) {
 	ExecObjectLayerAPITest(t, testDeleteBucketPolicyHandler, []string{"PutBucketPolicy", "DeleteBucketPolicy"})
 }
@@ -590,7 +589,7 @@ func testDeleteBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName str
 		// initialize HTTP NewRecorder, this records any mutations to response writer inside the handler.
 		recV4 := httptest.NewRecorder()
 		// construct HTTP request for PUT bucket policy endpoint.
-		reqV4, err := newTestSignedRequestV4("PUT", getPutPolicyURL("", testPolicy.bucketName),
+		reqV4, err := newTestSignedRequestV4(http.MethodPut, getPutPolicyURL("", testPolicy.bucketName),
 			int64(len(bucketPolicyStr)), bytes.NewReader([]byte(bucketPolicyStr)), testPolicy.accessKey, testPolicy.secretKey, nil)
 		if err != nil {
 			t.Fatalf("Test %d: Failed to create HTTP request for PutBucketPolicyHandler: <ERROR> %v", i+1, err)
@@ -640,7 +639,7 @@ func testDeleteBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName str
 		// initialize HTTP NewRecorder, this records any mutations to response writer inside the handler.
 		recV4 := httptest.NewRecorder()
 		// construct HTTP request for Delete bucket policy endpoint.
-		reqV4, err := newTestSignedRequestV4("DELETE", getDeletePolicyURL("", testCase.bucketName),
+		reqV4, err := newTestSignedRequestV4(http.MethodDelete, getDeletePolicyURL("", testCase.bucketName),
 			0, nil, testCase.accessKey, testCase.secretKey, nil)
 		if err != nil {
 			t.Fatalf("Test %d: Failed to create HTTP request for GetBucketPolicyHandler: <ERROR> %v", i+1, err)
@@ -662,7 +661,7 @@ func testDeleteBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName str
 		// initialize HTTP NewRecorder, this records any mutations to response writer inside the handler.
 		recV2 := httptest.NewRecorder()
 		// construct HTTP request for PUT bucket policy endpoint.
-		reqV2, err := newTestSignedRequestV2("PUT", getPutPolicyURL("", testPolicy.bucketName),
+		reqV2, err := newTestSignedRequestV2(http.MethodPut, getPutPolicyURL("", testPolicy.bucketName),
 			int64(len(bucketPolicyStr)), bytes.NewReader([]byte(bucketPolicyStr)), testPolicy.accessKey, testPolicy.secretKey, nil)
 		if err != nil {
 			t.Fatalf("Test %d: Failed to create HTTP request for PutBucketPolicyHandler: <ERROR> %v", i+1, err)
@@ -679,7 +678,7 @@ func testDeleteBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName str
 		// initialize HTTP NewRecorder, this records any mutations to response writer inside the handler.
 		recV2 := httptest.NewRecorder()
 		// construct HTTP request for Delete bucket policy endpoint.
-		reqV2, err := newTestSignedRequestV2("DELETE", getDeletePolicyURL("", testCase.bucketName),
+		reqV2, err := newTestSignedRequestV2(http.MethodDelete, getDeletePolicyURL("", testCase.bucketName),
 			0, nil, testCase.accessKey, testCase.secretKey, nil)
 		if err != nil {
 			t.Fatalf("Test %d: Failed to create HTTP request for GetBucketPolicyHandler: <ERROR> %v", i+1, err)
@@ -695,7 +694,7 @@ func testDeleteBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName str
 	// Test for Anonymous/unsigned http request.
 	// Bucket policy related functions doesn't support anonymous requests, setting policies shouldn't make a difference.
 	// create unsigned HTTP request for PutBucketPolicyHandler.
-	anonReq, err := newTestRequest("DELETE", getPutPolicyURL("", bucketName), 0, nil)
+	anonReq, err := newTestRequest(http.MethodDelete, getPutPolicyURL("", bucketName), 0, nil)
 
 	if err != nil {
 		t.Fatalf("MinIO %s: Failed to create an anonymous request for bucket \"%s\": <ERROR> %v",
@@ -713,7 +712,7 @@ func testDeleteBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName str
 	// The only aim is to generate an HTTP request in a way that the relevant/registered end point is evoked/called.
 	nilBucket := "dummy-bucket"
 
-	nilReq, err := newTestSignedRequestV4("DELETE", getDeletePolicyURL("", nilBucket),
+	nilReq, err := newTestSignedRequestV4(http.MethodDelete, getDeletePolicyURL("", nilBucket),
 		0, nil, "", "", nil)
 
 	if err != nil {

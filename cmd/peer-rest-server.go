@@ -24,121 +24,21 @@ import (
 	"io"
 	"io/ioutil"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gorilla/mux"
 	"github.com/minio/minio/cmd/logger"
+	b "github.com/minio/minio/pkg/bucket/bandwidth"
 	"github.com/minio/minio/pkg/event"
-	"github.com/minio/minio/pkg/lifecycle"
-	"github.com/minio/minio/pkg/policy"
+	"github.com/minio/minio/pkg/madmin"
 	trace "github.com/minio/minio/pkg/trace"
+	"github.com/tinylib/msgp/msgp"
 )
 
 // To abstract a node over network.
-type peerRESTServer struct {
-}
-
-func getServerInfo() (*ServerInfoData, error) {
-	objLayer := newObjectLayerWithoutSafeModeFn()
-	if objLayer == nil {
-		return nil, errServerNotInitialized
-	}
-
-	// Server info data.
-	return &ServerInfoData{
-		ConnStats: globalConnStats.toServerConnStats(),
-		HTTPStats: globalHTTPStats.toServerHTTPStats(),
-		Properties: ServerProperties{
-			Uptime:       UTCNow().Unix() - globalBootTime.Unix(),
-			Version:      Version,
-			CommitID:     CommitID,
-			DeploymentID: globalDeploymentID,
-			SQSARN:       globalNotificationSys.GetARNList(),
-			Region:       globalServerRegion,
-		},
-	}, nil
-}
-
-// NetReadPerfInfoHandler - returns network read performance information.
-func (s *peerRESTServer) NetReadPerfInfoHandler(w http.ResponseWriter, r *http.Request) {
-	if !s.IsValid(w, r) {
-		s.writeErrorResponse(w, errors.New("Invalid request"))
-		return
-	}
-
-	params := mux.Vars(r)
-
-	sizeStr, found := params[peerRESTNetPerfSize]
-	if !found {
-		s.writeErrorResponse(w, errors.New("size is missing"))
-		return
-	}
-
-	size, err := strconv.ParseInt(sizeStr, 10, 64)
-	if err != nil || size < 0 {
-		s.writeErrorResponse(w, errInvalidArgument)
-		return
-	}
-
-	start := time.Now()
-	n, err := io.CopyN(ioutil.Discard, r.Body, size)
-	end := time.Now()
-
-	if err != nil {
-		s.writeErrorResponse(w, err)
-		return
-	}
-
-	if n != size {
-		s.writeErrorResponse(w, fmt.Errorf("short read; expected: %v, got: %v", size, n))
-		return
-	}
-
-	addr := r.Host
-	if globalIsDistXL {
-		addr = GetLocalPeer(globalEndpoints)
-	}
-
-	d := end.Sub(start)
-	info := ServerNetReadPerfInfo{
-		Addr:           addr,
-		ReadThroughput: uint64(int64(time.Second) * size / int64(d)),
-	}
-
-	ctx := newContext(r, w, "NetReadPerfInfo")
-	logger.LogIf(ctx, gob.NewEncoder(w).Encode(info))
-	w.(http.Flusher).Flush()
-}
-
-// CollectNetPerfInfoHandler - returns network performance information collected from other peers.
-func (s *peerRESTServer) CollectNetPerfInfoHandler(w http.ResponseWriter, r *http.Request) {
-	if !s.IsValid(w, r) {
-		s.writeErrorResponse(w, errors.New("Invalid request"))
-		return
-	}
-
-	params := mux.Vars(r)
-	sizeStr, found := params[peerRESTNetPerfSize]
-	if !found {
-		s.writeErrorResponse(w, errors.New("size is missing"))
-		return
-	}
-
-	size, err := strconv.ParseInt(sizeStr, 10, 64)
-	if err != nil || size < 0 {
-		s.writeErrorResponse(w, errInvalidArgument)
-		return
-	}
-
-	info := globalNotificationSys.NetReadPerfInfo(size)
-
-	ctx := newContext(r, w, "CollectNetPerfInfo")
-	logger.LogIf(ctx, gob.NewEncoder(w).Encode(info))
-	w.(http.Flusher).Flush()
-}
+type peerRESTServer struct{}
 
 // GetLocksHandler - returns list of older lock from the server.
 func (s *peerRESTServer) GetLocksHandler(w http.ResponseWriter, r *http.Request) {
@@ -148,12 +48,7 @@ func (s *peerRESTServer) GetLocksHandler(w http.ResponseWriter, r *http.Request)
 	}
 
 	ctx := newContext(r, w, "GetLocks")
-
-	var llockers []map[string][]lockRequesterInfo
-	for _, llocker := range globalLockServers {
-		llockers = append(llockers, llocker.DupLockMap())
-	}
-	logger.LogIf(ctx, gob.NewEncoder(w).Encode(llockers))
+	logger.LogIf(ctx, gob.NewEncoder(w).Encode(globalLockServer.DupLockMap()))
 
 	w.(http.Flusher).Flush()
 
@@ -166,13 +61,8 @@ func (s *peerRESTServer) DeletePolicyHandler(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	objAPI := newObjectLayerWithoutSafeModeFn()
+	objAPI := newObjectLayerFn()
 	if objAPI == nil {
-		s.writeErrorResponse(w, errServerNotInitialized)
-		return
-	}
-
-	if globalIAMSys == nil {
 		s.writeErrorResponse(w, errServerNotInitialized)
 		return
 	}
@@ -199,13 +89,8 @@ func (s *peerRESTServer) LoadPolicyHandler(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	objAPI := newObjectLayerWithoutSafeModeFn()
+	objAPI := newObjectLayerFn()
 	if objAPI == nil {
-		s.writeErrorResponse(w, errServerNotInitialized)
-		return
-	}
-
-	if globalIAMSys == nil {
 		s.writeErrorResponse(w, errServerNotInitialized)
 		return
 	}
@@ -232,13 +117,8 @@ func (s *peerRESTServer) LoadPolicyMappingHandler(w http.ResponseWriter, r *http
 		return
 	}
 
-	objAPI := newObjectLayerWithoutSafeModeFn()
+	objAPI := newObjectLayerFn()
 	if objAPI == nil {
-		s.writeErrorResponse(w, errServerNotInitialized)
-		return
-	}
-
-	if globalIAMSys == nil {
 		s.writeErrorResponse(w, errServerNotInitialized)
 		return
 	}
@@ -259,6 +139,62 @@ func (s *peerRESTServer) LoadPolicyMappingHandler(w http.ResponseWriter, r *http
 	w.(http.Flusher).Flush()
 }
 
+// DeleteServiceAccountHandler - deletes a service account on the server.
+func (s *peerRESTServer) DeleteServiceAccountHandler(w http.ResponseWriter, r *http.Request) {
+	if !s.IsValid(w, r) {
+		s.writeErrorResponse(w, errors.New("Invalid request"))
+		return
+	}
+
+	objAPI := newObjectLayerFn()
+	if objAPI == nil {
+		s.writeErrorResponse(w, errServerNotInitialized)
+		return
+	}
+
+	vars := mux.Vars(r)
+	accessKey := vars[peerRESTUser]
+	if accessKey == "" {
+		s.writeErrorResponse(w, errors.New("service account name is missing"))
+		return
+	}
+
+	if err := globalIAMSys.DeleteServiceAccount(r.Context(), accessKey); err != nil {
+		s.writeErrorResponse(w, err)
+		return
+	}
+
+	w.(http.Flusher).Flush()
+}
+
+// LoadServiceAccountHandler - reloads a service account on the server.
+func (s *peerRESTServer) LoadServiceAccountHandler(w http.ResponseWriter, r *http.Request) {
+	if !s.IsValid(w, r) {
+		s.writeErrorResponse(w, errors.New("Invalid request"))
+		return
+	}
+
+	objAPI := newObjectLayerFn()
+	if objAPI == nil {
+		s.writeErrorResponse(w, errServerNotInitialized)
+		return
+	}
+
+	vars := mux.Vars(r)
+	accessKey := vars[peerRESTUser]
+	if accessKey == "" {
+		s.writeErrorResponse(w, errors.New("service account parameter is missing"))
+		return
+	}
+
+	if err := globalIAMSys.LoadServiceAccount(accessKey); err != nil {
+		s.writeErrorResponse(w, err)
+		return
+	}
+
+	w.(http.Flusher).Flush()
+}
+
 // DeleteUserHandler - deletes a user on the server.
 func (s *peerRESTServer) DeleteUserHandler(w http.ResponseWriter, r *http.Request) {
 	if !s.IsValid(w, r) {
@@ -266,13 +202,8 @@ func (s *peerRESTServer) DeleteUserHandler(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	objAPI := newObjectLayerWithoutSafeModeFn()
+	objAPI := newObjectLayerFn()
 	if objAPI == nil {
-		s.writeErrorResponse(w, errServerNotInitialized)
-		return
-	}
-
-	if globalIAMSys == nil {
 		s.writeErrorResponse(w, errServerNotInitialized)
 		return
 	}
@@ -299,13 +230,8 @@ func (s *peerRESTServer) LoadUserHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	objAPI := newObjectLayerWithoutSafeModeFn()
+	objAPI := newObjectLayerFn()
 	if objAPI == nil {
-		s.writeErrorResponse(w, errServerNotInitialized)
-		return
-	}
-
-	if globalIAMSys == nil {
 		s.writeErrorResponse(w, errServerNotInitialized)
 		return
 	}
@@ -323,34 +249,12 @@ func (s *peerRESTServer) LoadUserHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if err = globalIAMSys.LoadUser(objAPI, accessKey, temp); err != nil {
-		s.writeErrorResponse(w, err)
-		return
+	var userType = regularUser
+	if temp {
+		userType = stsUser
 	}
 
-	w.(http.Flusher).Flush()
-}
-
-// LoadUsersHandler - reloads all users and canned policies.
-func (s *peerRESTServer) LoadUsersHandler(w http.ResponseWriter, r *http.Request) {
-	if !s.IsValid(w, r) {
-		s.writeErrorResponse(w, errors.New("Invalid request"))
-		return
-	}
-
-	objAPI := newObjectLayerWithoutSafeModeFn()
-	if objAPI == nil {
-		s.writeErrorResponse(w, errServerNotInitialized)
-		return
-	}
-
-	if globalIAMSys == nil {
-		s.writeErrorResponse(w, errServerNotInitialized)
-		return
-	}
-
-	err := globalIAMSys.Load()
-	if err != nil {
+	if err = globalIAMSys.LoadUser(objAPI, accessKey, userType); err != nil {
 		s.writeErrorResponse(w, err)
 		return
 	}
@@ -365,13 +269,8 @@ func (s *peerRESTServer) LoadGroupHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	objAPI := newObjectLayerWithoutSafeModeFn()
+	objAPI := newObjectLayerFn()
 	if objAPI == nil {
-		s.writeErrorResponse(w, errServerNotInitialized)
-		return
-	}
-
-	if globalIAMSys == nil {
 		s.writeErrorResponse(w, errServerNotInitialized)
 		return
 	}
@@ -395,28 +294,41 @@ func (s *peerRESTServer) StartProfilingHandler(w http.ResponseWriter, r *http.Re
 	}
 
 	vars := mux.Vars(r)
-	profiler := vars[peerRESTProfiler]
-	if profiler == "" {
+	profiles := strings.Split(vars[peerRESTProfiler], ",")
+	if len(profiles) == 0 {
 		s.writeErrorResponse(w, errors.New("profiler name is missing"))
 		return
 	}
-
-	if globalProfiler != nil {
-		globalProfiler.Stop()
+	globalProfilerMu.Lock()
+	defer globalProfilerMu.Unlock()
+	if globalProfiler == nil {
+		globalProfiler = make(map[string]minioProfiler, 10)
 	}
 
-	var err error
-	globalProfiler, err = startProfiler(profiler, "")
-	if err != nil {
-		s.writeErrorResponse(w, err)
-		return
+	// Stop profiler of all types if already running
+	for k, v := range globalProfiler {
+		for _, p := range profiles {
+			if p == k {
+				v.Stop()
+				delete(globalProfiler, k)
+			}
+		}
+	}
+
+	for _, profiler := range profiles {
+		prof, err := startProfiler(profiler)
+		if err != nil {
+			s.writeErrorResponse(w, err)
+			return
+		}
+		globalProfiler[profiler] = prof
 	}
 
 	w.(http.Flusher).Flush()
 }
 
-// DownloadProflingDataHandler - returns proflied data.
-func (s *peerRESTServer) DownloadProflingDataHandler(w http.ResponseWriter, r *http.Request) {
+// DownloadProfilingDataHandler - returns profiled data.
+func (s *peerRESTServer) DownloadProfilingDataHandler(w http.ResponseWriter, r *http.Request) {
 	if !s.IsValid(w, r) {
 		s.writeErrorResponse(w, errors.New("Invalid request"))
 		return
@@ -433,48 +345,6 @@ func (s *peerRESTServer) DownloadProflingDataHandler(w http.ResponseWriter, r *h
 	logger.LogIf(ctx, gob.NewEncoder(w).Encode(profileData))
 }
 
-// CPULoadInfoHandler - returns CPU Load info.
-func (s *peerRESTServer) CPULoadInfoHandler(w http.ResponseWriter, r *http.Request) {
-	if !s.IsValid(w, r) {
-		s.writeErrorResponse(w, errors.New("Invalid request"))
-		return
-	}
-
-	ctx := newContext(r, w, "CPULoadInfo")
-	info := getLocalCPULoad(globalEndpoints, r)
-
-	defer w.(http.Flusher).Flush()
-	logger.LogIf(ctx, gob.NewEncoder(w).Encode(info))
-}
-
-// CPUInfoHandler - returns CPU Hardware info.
-func (s *peerRESTServer) CPUInfoHandler(w http.ResponseWriter, r *http.Request) {
-	if !s.IsValid(w, r) {
-		s.writeErrorResponse(w, errors.New("Invalid request"))
-		return
-	}
-
-	ctx := newContext(r, w, "CPUInfo")
-	info := getLocalCPUInfo(globalEndpoints, r)
-
-	defer w.(http.Flusher).Flush()
-	logger.LogIf(ctx, gob.NewEncoder(w).Encode(info))
-}
-
-// NetworkInfoHandler - returns Network Hardware info.
-func (s *peerRESTServer) NetworkInfoHandler(w http.ResponseWriter, r *http.Request) {
-	if !s.IsValid(w, r) {
-		s.writeErrorResponse(w, errors.New("Invalid request"))
-		return
-	}
-
-	ctx := newContext(r, w, "NetworkInfo")
-	info := getLocalNetworkInfo(globalEndpoints, r)
-
-	defer w.(http.Flusher).Flush()
-	logger.LogIf(ctx, gob.NewEncoder(w).Encode(info))
-}
-
 // ServerInfoHandler - returns Server Info
 func (s *peerRESTServer) ServerInfoHandler(w http.ResponseWriter, r *http.Request) {
 	if !s.IsValid(w, r) {
@@ -489,50 +359,167 @@ func (s *peerRESTServer) ServerInfoHandler(w http.ResponseWriter, r *http.Reques
 	logger.LogIf(ctx, gob.NewEncoder(w).Encode(info))
 }
 
-// DrivePerfInfoHandler - returns Drive Performance info.
-func (s *peerRESTServer) DrivePerfInfoHandler(w http.ResponseWriter, r *http.Request) {
+func (s *peerRESTServer) NetInfoHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "NetInfo")
 	if !s.IsValid(w, r) {
 		s.writeErrorResponse(w, errors.New("Invalid request"))
 		return
 	}
 
-	params := mux.Vars(r)
+	// Use this trailer to send additional headers after sending body
+	w.Header().Set("Trailer", "FinalStatus")
 
-	sizeStr, found := params[peerRESTDrivePerfSize]
-	if !found {
-		s.writeErrorResponse(w, errors.New("size is missing"))
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.WriteHeader(http.StatusOK)
+
+	n, err := io.Copy(ioutil.Discard, r.Body)
+	if err == io.ErrUnexpectedEOF {
+		w.Header().Set("FinalStatus", err.Error())
 		return
 	}
-
-	size, err := strconv.ParseInt(sizeStr, 10, 64)
-	if err != nil || size < 0 {
-		s.writeErrorResponse(w, errInvalidArgument)
+	if err != nil && err != io.EOF {
+		logger.LogIf(ctx, err)
+		w.Header().Set("FinalStatus", err.Error())
 		return
 	}
+	if n != r.ContentLength {
+		err := fmt.Errorf("Subnet health: short read: expected %d found %d", r.ContentLength, n)
 
-	ctx := newContext(r, w, "DrivePerfInfo")
-
-	info := getLocalDrivesPerf(globalEndpoints, size, r)
-
-	defer w.(http.Flusher).Flush()
-	logger.LogIf(ctx, gob.NewEncoder(w).Encode(info))
+		logger.LogIf(ctx, err)
+		w.Header().Set("FinalStatus", err.Error())
+		return
+	}
+	w.Header().Set("FinalStatus", "Success")
+	w.(http.Flusher).Flush()
 }
 
-// MemUsageInfoHandler - returns Memory Usage info.
-func (s *peerRESTServer) MemUsageInfoHandler(w http.ResponseWriter, r *http.Request) {
+func (s *peerRESTServer) DispatchNetInfoHandler(w http.ResponseWriter, r *http.Request) {
 	if !s.IsValid(w, r) {
 		s.writeErrorResponse(w, errors.New("Invalid request"))
 		return
 	}
-	ctx := newContext(r, w, "MemUsageInfo")
-	info := getLocalMemUsage(globalEndpoints, r)
+
+	done := keepHTTPResponseAlive(w)
+
+	ctx := newContext(r, w, "DispatchNetInfo")
+	info := globalNotificationSys.NetInfo(ctx)
+
+	done(nil)
+	logger.LogIf(ctx, gob.NewEncoder(w).Encode(info))
+	w.(http.Flusher).Flush()
+}
+
+// DriveInfoHandler - returns Drive info.
+func (s *peerRESTServer) DriveInfoHandler(w http.ResponseWriter, r *http.Request) {
+	if !s.IsValid(w, r) {
+		s.writeErrorResponse(w, errors.New("Invalid request"))
+		return
+	}
+
+	ctx, cancel := context.WithCancel(newContext(r, w, "DriveInfo"))
+	defer cancel()
+	infoSerial := getLocalDrives(ctx, false, globalEndpoints, r)
+	infoParallel := getLocalDrives(ctx, true, globalEndpoints, r)
+
+	errStr := ""
+	if infoSerial.Error != "" {
+		errStr = "serial: " + infoSerial.Error
+	}
+	if infoParallel.Error != "" {
+		errStr = errStr + " parallel: " + infoParallel.Error
+	}
+	info := madmin.ServerDrivesInfo{
+		Addr:     infoSerial.Addr,
+		Serial:   infoSerial.Serial,
+		Parallel: infoParallel.Parallel,
+		Error:    errStr,
+	}
+	defer w.(http.Flusher).Flush()
+	logger.LogIf(ctx, gob.NewEncoder(w).Encode(info))
+}
+
+// CPUInfoHandler - returns CPU info.
+func (s *peerRESTServer) CPUInfoHandler(w http.ResponseWriter, r *http.Request) {
+	if !s.IsValid(w, r) {
+		s.writeErrorResponse(w, errors.New("Invalid request"))
+		return
+	}
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	info := getLocalCPUInfo(ctx, r)
 
 	defer w.(http.Flusher).Flush()
 	logger.LogIf(ctx, gob.NewEncoder(w).Encode(info))
 }
 
-// DeleteBucketHandler - Delete notification and policies related to the bucket.
-func (s *peerRESTServer) DeleteBucketHandler(w http.ResponseWriter, r *http.Request) {
+// DiskHwInfoHandler - returns Disk HW info.
+func (s *peerRESTServer) DiskHwInfoHandler(w http.ResponseWriter, r *http.Request) {
+	if !s.IsValid(w, r) {
+		s.writeErrorResponse(w, errors.New("Invalid request"))
+		return
+	}
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	info := getLocalDiskHwInfo(ctx, r)
+
+	defer w.(http.Flusher).Flush()
+	logger.LogIf(ctx, gob.NewEncoder(w).Encode(info))
+}
+
+// OsInfoHandler - returns Os info.
+func (s *peerRESTServer) OsInfoHandler(w http.ResponseWriter, r *http.Request) {
+	if !s.IsValid(w, r) {
+		s.writeErrorResponse(w, errors.New("Invalid request"))
+		return
+	}
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	info := getLocalOsInfo(ctx, r)
+
+	defer w.(http.Flusher).Flush()
+	logger.LogIf(ctx, gob.NewEncoder(w).Encode(info))
+}
+
+// ProcInfoHandler - returns Proc info.
+func (s *peerRESTServer) ProcInfoHandler(w http.ResponseWriter, r *http.Request) {
+	if !s.IsValid(w, r) {
+		s.writeErrorResponse(w, errors.New("Invalid request"))
+		return
+	}
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	info := getLocalProcInfo(ctx, r)
+
+	defer w.(http.Flusher).Flush()
+	logger.LogIf(ctx, gob.NewEncoder(w).Encode(info))
+}
+
+// MemInfoHandler - returns Memory info.
+func (s *peerRESTServer) MemInfoHandler(w http.ResponseWriter, r *http.Request) {
+	if !s.IsValid(w, r) {
+		s.writeErrorResponse(w, errors.New("Invalid request"))
+		return
+	}
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	info := getLocalMemInfo(ctx, r)
+
+	defer w.(http.Flusher).Flush()
+	logger.LogIf(ctx, gob.NewEncoder(w).Encode(info))
+}
+
+// DeleteBucketMetadataHandler - Delete in memory bucket metadata
+func (s *peerRESTServer) DeleteBucketMetadataHandler(w http.ResponseWriter, r *http.Request) {
 	if !s.IsValid(w, r) {
 		s.writeErrorResponse(w, errors.New("Invalid request"))
 		return
@@ -545,228 +532,110 @@ func (s *peerRESTServer) DeleteBucketHandler(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	globalNotificationSys.RemoveNotification(bucketName)
-	globalPolicySys.Remove(bucketName)
-	globalBucketObjectLockConfig.Remove(bucketName)
-	globalLifecycleSys.Remove(bucketName)
-
-	w.(http.Flusher).Flush()
+	globalBucketMetadataSys.Remove(bucketName)
+	if localMetacacheMgr != nil {
+		localMetacacheMgr.deleteBucketCache(bucketName)
+	}
 }
 
-// ReloadFormatHandler - Reload Format.
-func (s *peerRESTServer) ReloadFormatHandler(w http.ResponseWriter, r *http.Request) {
+// LoadBucketMetadataHandler - reloads in memory bucket metadata
+func (s *peerRESTServer) LoadBucketMetadataHandler(w http.ResponseWriter, r *http.Request) {
 	if !s.IsValid(w, r) {
 		s.writeErrorResponse(w, errors.New("Invalid request"))
 		return
 	}
 
 	vars := mux.Vars(r)
-	dryRunString := vars[peerRESTDryRun]
-	if dryRunString == "" {
-		s.writeErrorResponse(w, errors.New("dry run parameter is missing"))
+	bucketName := vars[peerRESTBucket]
+	if bucketName == "" {
+		s.writeErrorResponse(w, errors.New("Bucket name is missing"))
 		return
 	}
 
-	var dryRun bool
-	switch strings.ToLower(dryRunString) {
-	case "true":
-		dryRun = true
-	case "false":
-		dryRun = false
-	default:
-		s.writeErrorResponse(w, errInvalidArgument)
-		return
-	}
-
-	objAPI := newObjectLayerWithoutSafeModeFn()
+	objAPI := newObjectLayerFn()
 	if objAPI == nil {
 		s.writeErrorResponse(w, errServerNotInitialized)
 		return
 	}
-	err := objAPI.ReloadFormat(context.Background(), dryRun)
-	if err != nil {
-		s.writeErrorResponse(w, err)
-		return
-	}
-	w.(http.Flusher).Flush()
-}
 
-// RemoveBucketPolicyHandler - Remove bucket policy.
-func (s *peerRESTServer) RemoveBucketPolicyHandler(w http.ResponseWriter, r *http.Request) {
-	if !s.IsValid(w, r) {
-		s.writeErrorResponse(w, errors.New("Invalid request"))
-		return
-	}
-
-	vars := mux.Vars(r)
-	bucketName := vars[peerRESTBucket]
-	if bucketName == "" {
-		s.writeErrorResponse(w, errors.New("Bucket name is missing"))
-		return
-	}
-
-	globalPolicySys.Remove(bucketName)
-	w.(http.Flusher).Flush()
-}
-
-// SetBucketPolicyHandler - Set bucket policy.
-func (s *peerRESTServer) SetBucketPolicyHandler(w http.ResponseWriter, r *http.Request) {
-	if !s.IsValid(w, r) {
-		s.writeErrorResponse(w, errors.New("Invalid request"))
-		return
-	}
-
-	vars := mux.Vars(r)
-	bucketName := vars[peerRESTBucket]
-	if bucketName == "" {
-		s.writeErrorResponse(w, errors.New("Bucket name is missing"))
-		return
-	}
-	var policyData policy.Policy
-	if r.ContentLength < 0 {
-		s.writeErrorResponse(w, errInvalidArgument)
-		return
-	}
-
-	err := gob.NewDecoder(r.Body).Decode(&policyData)
-	if err != nil {
-		s.writeErrorResponse(w, err)
-		return
-	}
-	globalPolicySys.Set(bucketName, policyData)
-	w.(http.Flusher).Flush()
-}
-
-// RemoveBucketLifecycleHandler - Remove bucket lifecycle.
-func (s *peerRESTServer) RemoveBucketLifecycleHandler(w http.ResponseWriter, r *http.Request) {
-	if !s.IsValid(w, r) {
-		s.writeErrorResponse(w, errors.New("Invalid request"))
-		return
-	}
-
-	vars := mux.Vars(r)
-	bucketName := vars[peerRESTBucket]
-	if bucketName == "" {
-		s.writeErrorResponse(w, errors.New("Bucket name is missing"))
-		return
-	}
-
-	globalLifecycleSys.Remove(bucketName)
-	w.(http.Flusher).Flush()
-}
-
-// SetBucketLifecycleHandler - Set bucket lifecycle.
-func (s *peerRESTServer) SetBucketLifecycleHandler(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	bucketName := vars[peerRESTBucket]
-	if bucketName == "" {
-		s.writeErrorResponse(w, errors.New("Bucket name is missing"))
-		return
-	}
-	var lifecycleData lifecycle.Lifecycle
-	if r.ContentLength < 0 {
-		s.writeErrorResponse(w, errInvalidArgument)
-		return
-	}
-
-	err := gob.NewDecoder(r.Body).Decode(&lifecycleData)
-	if err != nil {
-		s.writeErrorResponse(w, err)
-		return
-	}
-	globalLifecycleSys.Set(bucketName, lifecycleData)
-	w.(http.Flusher).Flush()
-}
-
-type remoteTargetExistsResp struct {
-	Exists bool
-}
-
-// TargetExistsHandler - Check if Target exists.
-func (s *peerRESTServer) TargetExistsHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "TargetExists")
-	if !s.IsValid(w, r) {
-		s.writeErrorResponse(w, errors.New("Invalid request"))
-		return
-	}
-
-	vars := mux.Vars(r)
-	bucketName := vars[peerRESTBucket]
-	if bucketName == "" {
-		s.writeErrorResponse(w, errors.New("Bucket name is missing"))
-		return
-	}
-	var targetID event.TargetID
-	if r.ContentLength <= 0 {
-		s.writeErrorResponse(w, errInvalidArgument)
-		return
-	}
-
-	err := gob.NewDecoder(r.Body).Decode(&targetID)
+	meta, err := loadBucketMetadata(r.Context(), objAPI, bucketName)
 	if err != nil {
 		s.writeErrorResponse(w, err)
 		return
 	}
 
-	var targetExists remoteTargetExistsResp
-	targetExists.Exists = globalNotificationSys.RemoteTargetExist(bucketName, targetID)
+	globalBucketMetadataSys.Set(bucketName, meta)
 
-	defer w.(http.Flusher).Flush()
-	logger.LogIf(ctx, gob.NewEncoder(w).Encode(&targetExists))
+	if meta.notificationConfig != nil {
+		globalNotificationSys.AddRulesMap(bucketName, meta.notificationConfig.ToRulesMap())
+	}
+
+	if meta.bucketTargetConfig != nil {
+		globalBucketTargetSys.UpdateAllTargets(bucketName, meta.bucketTargetConfig)
+	}
 }
 
-type sendEventRequest struct {
-	Event    event.Event
-	TargetID event.TargetID
-}
-
-type sendEventResp struct {
-	Success bool
-}
-
-// SendEventHandler - Send Event.
-func (s *peerRESTServer) SendEventHandler(w http.ResponseWriter, r *http.Request) {
+// CycleServerBloomFilterHandler cycles bloom filter on server.
+func (s *peerRESTServer) CycleServerBloomFilterHandler(w http.ResponseWriter, r *http.Request) {
 	if !s.IsValid(w, r) {
 		s.writeErrorResponse(w, errors.New("Invalid request"))
 		return
 	}
 
-	ctx := newContext(r, w, "SendEvent")
+	ctx := newContext(r, w, "CycleServerBloomFilter")
 
-	vars := mux.Vars(r)
-	bucketName := vars[peerRESTBucket]
-	if bucketName == "" {
-		s.writeErrorResponse(w, errors.New("Bucket name is missing"))
+	var req bloomFilterRequest
+	err := gob.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		s.writeErrorResponse(w, err)
 		return
 	}
-	var eventReq sendEventRequest
-	if r.ContentLength <= 0 {
-		s.writeErrorResponse(w, errInvalidArgument)
-		return
-	}
-
-	err := gob.NewDecoder(r.Body).Decode(&eventReq)
+	bf, err := intDataUpdateTracker.cycleFilter(ctx, req)
 	if err != nil {
 		s.writeErrorResponse(w, err)
 		return
 	}
 
-	var eventResp sendEventResp
-	eventResp.Success = true
-	errs := globalNotificationSys.send(bucketName, eventReq.Event, eventReq.TargetID)
+	logger.LogIf(ctx, gob.NewEncoder(w).Encode(bf))
+}
 
-	for i := range errs {
-		reqInfo := (&logger.ReqInfo{}).AppendTags("Event", eventReq.Event.EventName.String())
-		reqInfo.AppendTags("targetName", eventReq.TargetID.Name)
-		ctx := logger.SetReqInfo(context.Background(), reqInfo)
-		logger.LogIf(ctx, errs[i].Err)
-
-		eventResp.Success = false
-		s.writeErrorResponse(w, errs[i].Err)
+func (s *peerRESTServer) GetMetacacheListingHandler(w http.ResponseWriter, r *http.Request) {
+	if !s.IsValid(w, r) {
+		s.writeErrorResponse(w, errors.New("Invalid request"))
 		return
 	}
-	logger.LogIf(ctx, gob.NewEncoder(w).Encode(&eventResp))
-	w.(http.Flusher).Flush()
+	ctx := newContext(r, w, "GetMetacacheListing")
+
+	var opts listPathOptions
+	err := gob.NewDecoder(r.Body).Decode(&opts)
+	if err != nil && err != io.EOF {
+		s.writeErrorResponse(w, err)
+		return
+	}
+	resp := localMetacacheMgr.getBucket(ctx, opts.Bucket).findCache(opts)
+	logger.LogIf(ctx, msgp.Encode(w, &resp))
+}
+
+func (s *peerRESTServer) UpdateMetacacheListingHandler(w http.ResponseWriter, r *http.Request) {
+	if !s.IsValid(w, r) {
+		s.writeErrorResponse(w, errors.New("Invalid request"))
+		return
+	}
+	ctx := newContext(r, w, "UpdateMetacacheListing")
+
+	var req metacache
+	err := msgp.Decode(r.Body, &req)
+	if err != nil {
+		s.writeErrorResponse(w, err)
+		return
+	}
+	cache, err := localMetacacheMgr.updateCacheEntry(req)
+	if err != nil {
+		s.writeErrorResponse(w, err)
+		return
+	}
+	// Return updated metadata.
+	logger.LogIf(ctx, msgp.Encode(w, &cache))
 }
 
 // PutBucketNotificationHandler - Set bucket policy.
@@ -799,51 +668,64 @@ func (s *peerRESTServer) PutBucketNotificationHandler(w http.ResponseWriter, r *
 	w.(http.Flusher).Flush()
 }
 
-// RemoveBucketObjectLockConfigHandler - handles DELETE bucket object lock configuration.
-func (s *peerRESTServer) RemoveBucketObjectLockConfigHandler(w http.ResponseWriter, r *http.Request) {
-	if !s.IsValid(w, r) {
-		s.writeErrorResponse(w, errors.New("Invalid request"))
-		return
+// Return disk IDs of all the local disks.
+func getLocalDiskIDs(z *erasureServerPools) []string {
+	var ids []string
+
+	for poolIdx := range z.serverPools {
+		for _, set := range z.serverPools[poolIdx].sets {
+			disks := set.getDisks()
+			for _, disk := range disks {
+				if disk == nil {
+					continue
+				}
+				if disk.IsLocal() {
+					id, err := disk.GetDiskID()
+					if err != nil {
+						continue
+					}
+					if id == "" {
+						continue
+					}
+					ids = append(ids, id)
+				}
+			}
+		}
 	}
 
-	vars := mux.Vars(r)
-	bucketName := vars[peerRESTBucket]
-	if bucketName == "" {
-		s.writeErrorResponse(w, errors.New("Bucket name is missing"))
-		return
-	}
-
-	globalBucketObjectLockConfig.Remove(bucketName)
-	w.(http.Flusher).Flush()
+	return ids
 }
 
-// PutBucketObjectLockConfigHandler - handles PUT bucket object lock configuration.
-func (s *peerRESTServer) PutBucketObjectLockConfigHandler(w http.ResponseWriter, r *http.Request) {
+// HealthHandler - returns true of health
+func (s *peerRESTServer) HealthHandler(w http.ResponseWriter, r *http.Request) {
+	s.IsValid(w, r)
+}
+
+// GetLocalDiskIDs - Return disk IDs of all the local disks.
+func (s *peerRESTServer) GetLocalDiskIDs(w http.ResponseWriter, r *http.Request) {
 	if !s.IsValid(w, r) {
 		s.writeErrorResponse(w, errors.New("Invalid request"))
 		return
 	}
 
-	vars := mux.Vars(r)
-	bucketName := vars[peerRESTBucket]
-	if bucketName == "" {
-		s.writeErrorResponse(w, errors.New("Bucket name is missing"))
+	ctx := newContext(r, w, "GetLocalDiskIDs")
+
+	objLayer := newObjectLayerFn()
+
+	// Service not initialized yet
+	if objLayer == nil {
+		s.writeErrorResponse(w, errServerNotInitialized)
 		return
 	}
 
-	var retention Retention
-	if r.ContentLength < 0 {
-		s.writeErrorResponse(w, errInvalidArgument)
+	z, ok := objLayer.(*erasureServerPools)
+	if !ok {
+		s.writeErrorResponse(w, errServerNotInitialized)
 		return
 	}
 
-	err := gob.NewDecoder(r.Body).Decode(&retention)
-	if err != nil {
-		s.writeErrorResponse(w, err)
-		return
-	}
-
-	globalBucketObjectLockConfig.Set(bucketName, retention)
+	ids := getLocalDiskIDs(z)
+	logger.LogIf(ctx, gob.NewEncoder(w).Encode(ids))
 	w.(http.Flusher).Flush()
 }
 
@@ -854,25 +736,21 @@ func (s *peerRESTServer) ServerUpdateHandler(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	vars := mux.Vars(r)
-	updateURL := vars[peerRESTUpdateURL]
-	sha256Hex := vars[peerRESTSha256Hex]
-	var latestReleaseTime time.Time
-	var err error
-	if latestRelease := vars[peerRESTLatestRelease]; latestRelease != "" {
-		latestReleaseTime, err = time.Parse(latestRelease, time.RFC3339)
-		if err != nil {
-			s.writeErrorResponse(w, err)
-			return
-		}
+	if r.ContentLength < 0 {
+		s.writeErrorResponse(w, errInvalidArgument)
+		return
 	}
-	us, err := updateServer(updateURL, sha256Hex, latestReleaseTime)
+
+	var info serverUpdateInfo
+	err := gob.NewDecoder(r.Body).Decode(&info)
 	if err != nil {
 		s.writeErrorResponse(w, err)
 		return
 	}
-	if us.CurrentVersion != us.UpdatedVersion {
-		globalServiceSignalCh <- serviceRestart
+
+	if _, err = updateServer(info.URL, info.Sha256Sum, info.Time, getMinioMode()); err != nil {
+		s.writeErrorResponse(w, err)
+		return
 	}
 }
 
@@ -903,6 +781,21 @@ func (s *peerRESTServer) SignalServiceHandler(w http.ResponseWriter, r *http.Req
 		globalServiceSignalCh <- signal
 	case serviceStop:
 		globalServiceSignalCh <- signal
+	case serviceReloadDynamic:
+		objAPI := newObjectLayerFn()
+		if objAPI == nil {
+			s.writeErrorResponse(w, errServerNotInitialized)
+			return
+		}
+		srvCfg, err := getValidConfig(objAPI)
+		if err != nil {
+			s.writeErrorResponse(w, err)
+			return
+		}
+		if err = applyDynamicConfig(r.Context(), objAPI, srvCfg); err != nil {
+			s.writeErrorResponse(w, err)
+		}
+		return
 	default:
 		s.writeErrorResponse(w, errUnsupportedSignal)
 		return
@@ -912,7 +805,7 @@ func (s *peerRESTServer) SignalServiceHandler(w http.ResponseWriter, r *http.Req
 // ListenHandler sends http trace messages back to peer rest client
 func (s *peerRESTServer) ListenHandler(w http.ResponseWriter, r *http.Request) {
 	if !s.IsValid(w, r) {
-		s.writeErrorResponse(w, errors.New("Invalid request"))
+		s.writeErrorResponse(w, errors.New("invalid request"))
 		return
 	}
 
@@ -920,7 +813,7 @@ func (s *peerRESTServer) ListenHandler(w http.ResponseWriter, r *http.Request) {
 
 	var prefix string
 	if len(values[peerRESTListenPrefix]) > 1 {
-		s.writeErrorResponse(w, errors.New("Invalid request"))
+		s.writeErrorResponse(w, errors.New("invalid request"))
 		return
 	}
 
@@ -935,7 +828,7 @@ func (s *peerRESTServer) ListenHandler(w http.ResponseWriter, r *http.Request) {
 
 	var suffix string
 	if len(values[peerRESTListenSuffix]) > 1 {
-		s.writeErrorResponse(w, errors.New("Invalid request"))
+		s.writeErrorResponse(w, errors.New("invalid request"))
 		return
 	}
 
@@ -978,14 +871,12 @@ func (s *peerRESTServer) ListenHandler(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			return false
 		}
-		if ev.S3.Bucket.Name != values.Get(peerRESTListenBucket) {
-			return false
+		if ev.S3.Bucket.Name != "" && values.Get(peerRESTListenBucket) != "" {
+			if ev.S3.Bucket.Name != values.Get(peerRESTListenBucket) {
+				return false
+			}
 		}
-		objectName, uerr := url.QueryUnescape(ev.S3.Object.Key)
-		if uerr != nil {
-			objectName = ev.S3.Object.Key
-		}
-		return len(rulesMap.Match(ev.EventName, objectName).ToSlice()) != 0
+		return rulesMap.MatchSimple(ev.EventName, ev.S3.Object.Key)
 	})
 
 	keepAliveTicker := time.NewTicker(500 * time.Millisecond)
@@ -1008,14 +899,37 @@ func (s *peerRESTServer) ListenHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func extractTraceOptsFromPeerRequest(r *http.Request) (opts madmin.ServiceTraceOpts, err error) {
+
+	q := r.URL.Query()
+	opts.OnlyErrors = q.Get(peerRESTTraceErr) == "true"
+	opts.Storage = q.Get(peerRESTTraceStorage) == "true"
+	opts.Internal = q.Get(peerRESTTraceInternal) == "true"
+	opts.S3 = q.Get(peerRESTTraceS3) == "true"
+	opts.OS = q.Get(peerRESTTraceOS) == "true"
+
+	if t := q.Get(peerRESTTraceThreshold); t != "" {
+		d, err := time.ParseDuration(t)
+		if err != nil {
+			return opts, err
+		}
+		opts.Threshold = d
+	}
+	return
+}
+
 // TraceHandler sends http trace messages back to peer rest client
 func (s *peerRESTServer) TraceHandler(w http.ResponseWriter, r *http.Request) {
 	if !s.IsValid(w, r) {
 		s.writeErrorResponse(w, errors.New("Invalid request"))
 		return
 	}
-	trcAll := r.URL.Query().Get(peerRESTTraceAll) == "true"
-	trcErr := r.URL.Query().Get(peerRESTTraceErr) == "true"
+
+	traceOpts, err := extractTraceOptsFromPeerRequest(r)
+	if err != nil {
+		s.writeErrorResponse(w, errors.New("Invalid request"))
+		return
+	}
 
 	w.WriteHeader(http.StatusOK)
 	w.(http.Flusher).Flush()
@@ -1027,8 +941,8 @@ func (s *peerRESTServer) TraceHandler(w http.ResponseWriter, r *http.Request) {
 	// Use buffered channel to take care of burst sends or slow w.Write()
 	ch := make(chan interface{}, 2000)
 
-	globalHTTPTrace.Subscribe(ch, doneCh, func(entry interface{}) bool {
-		return mustTrace(entry, trcAll, trcErr)
+	globalTrace.Subscribe(ch, doneCh, func(entry interface{}) bool {
+		return mustTrace(entry, traceOpts)
 	})
 
 	keepAliveTicker := time.NewTicker(500 * time.Millisecond)
@@ -1056,25 +970,12 @@ func (s *peerRESTServer) BackgroundHealStatusHandler(w http.ResponseWriter, r *h
 		s.writeErrorResponse(w, errors.New("invalid request"))
 		return
 	}
-
 	ctx := newContext(r, w, "BackgroundHealStatus")
 
-	state := getLocalBackgroundHealStatus()
-
-	defer w.(http.Flusher).Flush()
-	logger.LogIf(ctx, gob.NewEncoder(w).Encode(state))
-}
-
-func (s *peerRESTServer) BackgroundOpsStatusHandler(w http.ResponseWriter, r *http.Request) {
-	if !s.IsValid(w, r) {
-		s.writeErrorResponse(w, errors.New("invalid request"))
+	state, ok := getBackgroundHealStatus(ctx, newObjectLayerFn())
+	if !ok {
+		s.writeErrorResponse(w, errServerNotInitialized)
 		return
-	}
-
-	ctx := newContext(r, w, "BackgroundOpsStatus")
-
-	state := BgOpsStatus{
-		LifecycleOps: getLocalBgLifecycleOpsStatus(),
 	}
 
 	defer w.(http.Flusher).Flush()
@@ -1126,50 +1027,91 @@ func (s *peerRESTServer) IsValid(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
+// GetBandwidth gets the bandwidth for the buckets requested.
+func (s *peerRESTServer) GetBandwidth(w http.ResponseWriter, r *http.Request) {
+	if !s.IsValid(w, r) {
+		s.writeErrorResponse(w, errors.New("invalid request"))
+		return
+	}
+	bucketsString := r.URL.Query().Get("buckets")
+	w.WriteHeader(http.StatusOK)
+	w.(http.Flusher).Flush()
+
+	doneCh := make(chan struct{})
+	defer close(doneCh)
+
+	selectBuckets := b.SelectBuckets(strings.Split(bucketsString, ",")...)
+	report := globalBucketMonitor.GetReport(selectBuckets)
+
+	enc := gob.NewEncoder(w)
+	if err := enc.Encode(report); err != nil {
+		s.writeErrorResponse(w, errors.New("Encoding report failed: "+err.Error()))
+		return
+	}
+	w.(http.Flusher).Flush()
+}
+
+// GetPeerMetrics gets the metrics to be federated across peers.
+func (s *peerRESTServer) GetPeerMetrics(w http.ResponseWriter, r *http.Request) {
+	if !s.IsValid(w, r) {
+		s.writeErrorResponse(w, errors.New("invalid request"))
+	}
+	w.WriteHeader(http.StatusOK)
+	w.(http.Flusher).Flush()
+
+	doneCh := make(chan struct{})
+	defer close(doneCh)
+
+	enc := gob.NewEncoder(w)
+
+	ch := ReportMetrics(r.Context(), GetGeneratorsForPeer)
+	for m := range ch {
+		if err := enc.Encode(m); err != nil {
+			s.writeErrorResponse(w, errors.New("Encoding metric failed: "+err.Error()))
+			return
+		}
+	}
+	w.(http.Flusher).Flush()
+}
+
 // registerPeerRESTHandlers - register peer rest router.
 func registerPeerRESTHandlers(router *mux.Router) {
 	server := &peerRESTServer{}
 	subrouter := router.PathPrefix(peerRESTPrefix).Subrouter()
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodNetReadPerfInfo).HandlerFunc(httpTraceHdrs(server.NetReadPerfInfoHandler)).Queries(restQueries(peerRESTNetPerfSize)...)
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodCollectNetPerfInfo).HandlerFunc(httpTraceHdrs(server.CollectNetPerfInfoHandler)).Queries(restQueries(peerRESTNetPerfSize)...)
+	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodHealth).HandlerFunc(httpTraceHdrs(server.HealthHandler))
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodGetLocks).HandlerFunc(httpTraceHdrs(server.GetLocksHandler))
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodServerInfo).HandlerFunc(httpTraceHdrs(server.ServerInfoHandler))
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodCPULoadInfo).HandlerFunc(httpTraceHdrs(server.CPULoadInfoHandler))
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodMemUsageInfo).HandlerFunc(httpTraceHdrs(server.MemUsageInfoHandler))
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodDrivePerfInfo).HandlerFunc(httpTraceHdrs(server.DrivePerfInfoHandler)).Queries(restQueries(peerRESTDrivePerfSize)...)
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodHardwareCPUInfo).HandlerFunc(httpTraceHdrs(server.CPUInfoHandler))
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodHardwareNetworkInfo).HandlerFunc(httpTraceHdrs(server.NetworkInfoHandler))
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodDeleteBucket).HandlerFunc(httpTraceHdrs(server.DeleteBucketHandler)).Queries(restQueries(peerRESTBucket)...)
+	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodProcInfo).HandlerFunc(httpTraceHdrs(server.ProcInfoHandler))
+	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodMemInfo).HandlerFunc(httpTraceHdrs(server.MemInfoHandler))
+	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodOsInfo).HandlerFunc(httpTraceHdrs(server.OsInfoHandler))
+	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodDiskHwInfo).HandlerFunc(httpTraceHdrs(server.DiskHwInfoHandler))
+	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodCPUInfo).HandlerFunc(httpTraceHdrs(server.CPUInfoHandler))
+	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodDriveInfo).HandlerFunc(httpTraceHdrs(server.DriveInfoHandler))
+	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodNetInfo).HandlerFunc(httpTraceHdrs(server.NetInfoHandler))
+	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodDispatchNetInfo).HandlerFunc(httpTraceHdrs(server.DispatchNetInfoHandler))
+	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodCycleBloom).HandlerFunc(httpTraceHdrs(server.CycleServerBloomFilterHandler))
+	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodDeleteBucketMetadata).HandlerFunc(httpTraceHdrs(server.DeleteBucketMetadataHandler)).Queries(restQueries(peerRESTBucket)...)
+	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodLoadBucketMetadata).HandlerFunc(httpTraceHdrs(server.LoadBucketMetadataHandler)).Queries(restQueries(peerRESTBucket)...)
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodSignalService).HandlerFunc(httpTraceHdrs(server.SignalServiceHandler)).Queries(restQueries(peerRESTSignal)...)
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodServerUpdate).HandlerFunc(httpTraceHdrs(server.ServerUpdateHandler)).Queries(restQueries(peerRESTUpdateURL, peerRESTSha256Hex, peerRESTLatestRelease)...)
-
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodBucketPolicyRemove).HandlerFunc(httpTraceAll(server.RemoveBucketPolicyHandler)).Queries(restQueries(peerRESTBucket)...)
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodBucketPolicySet).HandlerFunc(httpTraceHdrs(server.SetBucketPolicyHandler)).Queries(restQueries(peerRESTBucket)...)
-
+	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodServerUpdate).HandlerFunc(httpTraceHdrs(server.ServerUpdateHandler))
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodDeletePolicy).HandlerFunc(httpTraceAll(server.DeletePolicyHandler)).Queries(restQueries(peerRESTPolicy)...)
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodLoadPolicy).HandlerFunc(httpTraceAll(server.LoadPolicyHandler)).Queries(restQueries(peerRESTPolicy)...)
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodLoadPolicyMapping).HandlerFunc(httpTraceAll(server.LoadPolicyMappingHandler)).Queries(restQueries(peerRESTUserOrGroup)...)
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodDeleteUser).HandlerFunc(httpTraceAll(server.LoadUserHandler)).Queries(restQueries(peerRESTUser)...)
+	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodDeleteUser).HandlerFunc(httpTraceAll(server.DeleteUserHandler)).Queries(restQueries(peerRESTUser)...)
+	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodDeleteServiceAccount).HandlerFunc(httpTraceAll(server.DeleteServiceAccountHandler)).Queries(restQueries(peerRESTUser)...)
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodLoadUser).HandlerFunc(httpTraceAll(server.LoadUserHandler)).Queries(restQueries(peerRESTUser, peerRESTUserTemp)...)
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodLoadUsers).HandlerFunc(httpTraceAll(server.LoadUsersHandler))
+	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodLoadServiceAccount).HandlerFunc(httpTraceAll(server.LoadServiceAccountHandler)).Queries(restQueries(peerRESTUser)...)
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodLoadGroup).HandlerFunc(httpTraceAll(server.LoadGroupHandler)).Queries(restQueries(peerRESTGroup)...)
 
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodStartProfiling).HandlerFunc(httpTraceAll(server.StartProfilingHandler)).Queries(restQueries(peerRESTProfiler)...)
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodDownloadProfilingData).HandlerFunc(httpTraceHdrs(server.DownloadProflingDataHandler))
-
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodTargetExists).HandlerFunc(httpTraceHdrs(server.TargetExistsHandler)).Queries(restQueries(peerRESTBucket)...)
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodSendEvent).HandlerFunc(httpTraceHdrs(server.SendEventHandler)).Queries(restQueries(peerRESTBucket)...)
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodBucketNotificationPut).HandlerFunc(httpTraceHdrs(server.PutBucketNotificationHandler)).Queries(restQueries(peerRESTBucket)...)
-
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodReloadFormat).HandlerFunc(httpTraceHdrs(server.ReloadFormatHandler)).Queries(restQueries(peerRESTDryRun)...)
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodBucketLifecycleSet).HandlerFunc(httpTraceHdrs(server.SetBucketLifecycleHandler)).Queries(restQueries(peerRESTBucket)...)
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodBucketLifecycleRemove).HandlerFunc(httpTraceHdrs(server.RemoveBucketLifecycleHandler)).Queries(restQueries(peerRESTBucket)...)
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodBackgroundOpsStatus).HandlerFunc(server.BackgroundOpsStatusHandler)
-
+	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodDownloadProfilingData).HandlerFunc(httpTraceHdrs(server.DownloadProfilingDataHandler))
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodTrace).HandlerFunc(server.TraceHandler)
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodListen).HandlerFunc(httpTraceHdrs(server.ListenHandler))
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodBackgroundHealStatus).HandlerFunc(server.BackgroundHealStatusHandler)
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodLog).HandlerFunc(server.ConsoleLogHandler)
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodPutBucketObjectLockConfig).HandlerFunc(httpTraceHdrs(server.PutBucketObjectLockConfigHandler)).Queries(restQueries(peerRESTBucket)...)
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodBucketObjectLockConfigRemove).HandlerFunc(httpTraceHdrs(server.RemoveBucketObjectLockConfigHandler)).Queries(restQueries(peerRESTBucket)...)
+	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodGetLocalDiskIDs).HandlerFunc(httpTraceHdrs(server.GetLocalDiskIDs))
+	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodGetBandwidth).HandlerFunc(httpTraceHdrs(server.GetBandwidth))
+	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodGetMetacacheListing).HandlerFunc(httpTraceHdrs(server.GetMetacacheListingHandler))
+	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodUpdateMetacacheListing).HandlerFunc(httpTraceHdrs(server.UpdateMetacacheListingHandler))
+	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodGetPeerMetrics).HandlerFunc(httpTraceHdrs(server.GetPeerMetrics))
 }

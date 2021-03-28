@@ -17,38 +17,18 @@
 package cmd
 
 import (
-	"context"
+	"crypto/sha256"
 	"errors"
 	"hash"
 	"io"
 
 	"github.com/minio/highwayhash"
 	"github.com/minio/minio/cmd/logger"
-	sha256 "github.com/minio/sha256-simd"
 	"golang.org/x/crypto/blake2b"
 )
 
 // magic HH-256 key as HH-256 hash of the first 100 decimals of π as utf-8 string with a zero key.
 var magicHighwayHash256Key = []byte("\x4b\xe7\x34\xfa\x8e\x23\x8a\xcd\x26\x3e\x83\xe6\xbb\x96\x85\x52\x04\x0f\x93\x5d\xa3\x9f\x44\x14\x97\xe0\x9d\x13\x22\xde\x36\xa0")
-
-// BitrotAlgorithm specifies a algorithm used for bitrot protection.
-type BitrotAlgorithm uint
-
-const (
-	// SHA256 represents the SHA-256 hash function
-	SHA256 BitrotAlgorithm = 1 + iota
-	// HighwayHash256 represents the HighwayHash-256 hash function
-	HighwayHash256
-	// HighwayHash256S represents the Streaming HighwayHash-256 hash function
-	HighwayHash256S
-	// BLAKE2b512 represents the BLAKE2b-512 hash function
-	BLAKE2b512
-)
-
-// DefaultBitrotAlgorithm is the default algorithm used for bitrot protection.
-const (
-	DefaultBitrotAlgorithm = HighwayHash256S
-)
 
 var bitrotAlgorithms = map[BitrotAlgorithm]string{
 	SHA256:          "sha256",
@@ -72,7 +52,7 @@ func (a BitrotAlgorithm) New() hash.Hash {
 		hh, _ := highwayhash.New(magicHighwayHash256Key) // New will never return error since key is 256 bit
 		return hh
 	default:
-		logger.CriticalIf(context.Background(), errors.New("Unsupported bitrot algorithm"))
+		logger.CriticalIf(GlobalContext, errors.New("Unsupported bitrot algorithm"))
 		return nil
 	}
 }
@@ -88,7 +68,7 @@ func (a BitrotAlgorithm) Available() bool {
 func (a BitrotAlgorithm) String() string {
 	name, ok := bitrotAlgorithms[a]
 	if !ok {
-		logger.CriticalIf(context.Background(), errors.New("Unsupported bitrot algorithm"))
+		logger.CriticalIf(GlobalContext, errors.New("Unsupported bitrot algorithm"))
 	}
 	return name
 }
@@ -116,16 +96,16 @@ func BitrotAlgorithmFromString(s string) (a BitrotAlgorithm) {
 	return
 }
 
-func newBitrotWriter(disk StorageAPI, volume, filePath string, length int64, algo BitrotAlgorithm, shardSize int64) io.Writer {
+func newBitrotWriter(disk StorageAPI, volume, filePath string, length int64, algo BitrotAlgorithm, shardSize int64, heal bool) io.Writer {
 	if algo == HighwayHash256S {
-		return newStreamingBitrotWriter(disk, volume, filePath, length, algo, shardSize)
+		return newStreamingBitrotWriter(disk, volume, filePath, length, algo, shardSize, heal)
 	}
 	return newWholeBitrotWriter(disk, volume, filePath, algo, shardSize)
 }
 
-func newBitrotReader(disk StorageAPI, bucket string, filePath string, tillOffset int64, algo BitrotAlgorithm, sum []byte, shardSize int64) io.ReaderAt {
+func newBitrotReader(disk StorageAPI, data []byte, bucket string, filePath string, tillOffset int64, algo BitrotAlgorithm, sum []byte, shardSize int64) io.ReaderAt {
 	if algo == HighwayHash256S {
-		return newStreamingBitrotReader(disk, bucket, filePath, tillOffset, algo, shardSize)
+		return newStreamingBitrotReader(disk, data, bucket, filePath, tillOffset, algo, shardSize)
 	}
 	return newWholeBitrotReader(disk, bucket, filePath, algo, tillOffset, sum)
 }

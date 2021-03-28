@@ -42,9 +42,11 @@ Expansion of ellipses and choice of erasure sets based on this expansion is an a
 
 - We limited the number of drives to 16 for erasure set because, erasure code shards more than 16 can become chatty and do not have any performance advantages. Additionally since 16 drive erasure set gives you tolerance of 8 disks per object by default which is plenty in any practical scenario.
 
-- Choice of erasure set size is automatic based on the number of disks available, let's say for example if there are 32 servers and 32 disks which is a total of 1024 disks. In this scenario 16 becomes the erasure set size. This is decided based on the greatest common divisor (GCD) of acceptable erasure set sizes ranging from *4, 6, 8, 10, 12, 14, 16*.
+- Choice of erasure set size is automatic based on the number of disks available, let's say for example if there are 32 servers and 32 disks which is a total of 1024 disks. In this scenario 16 becomes the erasure set size. This is decided based on the greatest common divisor (GCD) of acceptable erasure set sizes ranging from *4 to 16*.
 
 - *If total disks has many common divisors the algorithm chooses the minimum amounts of erasure sets possible for a erasure set size of any N*.  In the example with 1024 disks - 4, 8, 16 are GCD factors. With 16 disks we get a total of 64 possible sets, with 8 disks we get a total of 128 possible sets, with 4 disks we get a total of 256 possible sets. So algorithm automatically chooses 64 sets, which is *16 * 64 = 1024* disks in total.
+
+- *If total number of nodes are of odd number then GCD algorithm provides affinity towards odd number erasure sets to provide for uniform distribution across nodes*. This is to ensure that same number of disks are pariticipating in any erasure set. For example if you have 2 nodes with 180 drives then GCD is 15 but this would lead to uneven distribution, one of the nodes would participate more drives. To avoid this the affinity is given towards nodes which leads to next best GCD factor of 12 which provides uniform distribution.
 
 - In this algorithm, we also make sure that we spread the disks out evenly. MinIO server expands ellipses passed as arguments. Here is a sample expansion to demonstrate the process.
 
@@ -77,9 +79,13 @@ Expected expansion
 - Choosing an erasure set for the object is decided during `PutObject()`, object names are used to find the right erasure set using the following pseudo code.
 ```go
 // hashes the key returning an integer.
-func crcHashMod(key string, cardinality int) int {
-        keyCrc := crc32.Checksum([]byte(key), crc32.IEEETable)
-        return int(keyCrc % uint32(cardinality))
+func sipHashMod(key string, cardinality int, id [16]byte) int {
+        if cardinality <= 0 {
+                return -1
+        }
+        sip := siphash.New(id[:])
+        sip.Write([]byte(key))
+        return int(sip.Sum64() % uint64(cardinality))
 }
 ```
 Input for the key is the object name specified in `PutObject()`, returns a unique index. This index is one of the erasure sets where the object will reside. This function is a consistent hash for a given object name i.e for a given object name the index returned is always the same.
@@ -88,37 +94,39 @@ Input for the key is the object name specified in `PutObject()`, returns a uniqu
 
 - MinIO does erasure coding at the object level not at the volume level, unlike other object storage vendors. This allows applications to choose different storage class by setting `x-amz-storage-class=STANDARD/REDUCED_REDUNDANCY` for each object uploads so effectively utilizing the capacity of the cluster. Additionally these can also be enforced using IAM policies to make sure the client uploads with correct HTTP headers.
 
-- MinIO also supports expansion of existing clusters in zones. Each zone is a self contained entity with same SLA's (read/write quorum) for each object as original cluster. By using the existing namespace for lookup validation MinIO ensures conflicting objects are not created. When no such object exists then MinIO simply uses the least used zone.
+- MinIO also supports expansion of existing clusters in server pools. Each pool is a self contained entity with same SLA's (read/write quorum) for each object as original cluster. By using the existing namespace for lookup validation MinIO ensures conflicting objects are not created. When no such object exists then MinIO simply uses the least used pool to place new objects.
 
-*There are no limits on how many zones can be combined*
+__There are no limits on how many server pools can be combined__
 
 ```
-minio server http://host{1...32}/export{1...32} http://host{5...6}/export{1...8}
+minio server http://host{1...32}/export{1...32} http://host{1...12}/export{1...12}
 ```
 
-In above example there are two zones
+In above example there are two server pools
 
-- 32 * 32 = 1024 drives zone1
-- 2 * 8 = 16 drives zone2
+- 32 * 32 = 1024 drives pool1
+- 12 * 12 = 144 drives pool2
 
-> Notice the requirement of common SLA here original cluster had 1024 drives with 16 drives per erasure set, second zone is expected to have a minimum of 16 drives to match the original cluster SLA or it should be in multiples of 16.
+> Notice the requirement of common SLA here original cluster had 1024 drives with 16 drives per erasure set with default parity of '4', second pool is expected to have a minimum of 8 drives per erasure set to match the original cluster SLA (parity count) of '4'. '12' drives stripe per erasure set in the second pool satisfies the original pool's parity count.
 
-Following pseudo code returns the correct least used zone index to upload an object.
+Refer to the sizing guide with details on the default parity count chosen for different erasure stripe sizes [here](https://github.com/minio/minio/blob/master/docs/distributed/SIZING.md)
+
+MinIO places new objects in server pools based on proportionate free space, per pool. Following pseudo code demonstrates this behavior.
 ```go
-func getAvailableZoneIdx(ctx context.Context) int {
-        zones := z.getZonesAvailableSpace(ctx)
-        total := zones.TotalAvailable()
+func getAvailablePoolIdx(ctx context.Context) int {
+        serverPools := z.getServerPoolsAvailableSpace(ctx)
+        total := serverPools.TotalAvailable()
         // choose when we reach this many
         choose := rand.Uint64() % total
         atTotal := uint64(0)
-        for _, zone := range zones {
-                atTotal += zone.Available
-                if atTotal > choose && zone.Available > 0 {
-                        return zone.Index
+        for _, pool := range serverPools {
+                atTotal += pool.Available
+                if atTotal > choose && pool.Available > 0 {
+                        return pool.Index
                 }
         }
         // Should not happen, but print values just in case.
-        panic(fmt.Errorf("reached end of zones (total: %v, atTotal: %v, choose: %v)", total, atTotal, choose))
+        panic(fmt.Errorf("reached end of serverPools (total: %v, atTotal: %v, choose: %v)", total, atTotal, choose))
 }
 ```
 

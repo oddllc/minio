@@ -23,9 +23,8 @@ import (
 	"net/url"
 	"sort"
 	"strings"
-	"syscall"
 
-	"github.com/minio/minio-go/v6/pkg/set"
+	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/cmd/config"
 	"github.com/minio/minio/cmd/logger"
 	xnet "github.com/minio/minio/pkg/net"
@@ -33,9 +32,6 @@ import (
 
 // IPv4 addresses of local host.
 var localIP4 = mustGetLocalIP4()
-
-// IPv6 address of local host.
-var localIP6 = mustGetLocalIP6()
 
 // mustSplitHostPort is a wrapper to net.SplitHostPort() where error is assumed to be a fatal.
 func mustSplitHostPort(hostPort string) (host, port string) {
@@ -169,7 +165,7 @@ func getAPIEndpoints() (apiEndpoints []string) {
 	}
 
 	for _, ip := range ipList {
-		endpoint := fmt.Sprintf("%s://%s", getURLScheme(globalIsSSL), net.JoinHostPort(ip, globalMinioPort))
+		endpoint := fmt.Sprintf("%s://%s", getURLScheme(globalIsTLS), net.JoinHostPort(ip, globalMinioPort))
 		apiEndpoints = append(apiEndpoints, endpoint)
 	}
 
@@ -193,23 +189,13 @@ func isHostIP(ipAddress string) bool {
 // Note: The check method tries to listen on given port and closes it.
 // It is possible to have a disconnected client in this tiny window of time.
 func checkPortAvailability(host, port string) (err error) {
-	network := []string{"tcp", "tcp4", "tcp6"}
-	for _, n := range network {
-		l, err := net.Listen(n, net.JoinHostPort(host, port))
-		if err == nil {
-			// As we are able to listen on this network, the port is not in use.
-			// Close the listener and continue check other networks.
-			if err = l.Close(); err != nil {
-				return err
-			}
-		} else if errors.Is(err, syscall.EADDRINUSE) {
-			// As we got EADDRINUSE error, the port is in use by other process.
-			// Return the error.
-			return err
-		}
+	l, err := net.Listen("tcp", net.JoinHostPort(host, port))
+	if err != nil {
+		return err
 	}
-
-	return nil
+	// As we are able to listen on this network, the port is not in use.
+	// Close the listener and continue check other networks.
+	return l.Close()
 }
 
 // extractHostPort - extracts host/port from many address formats
@@ -277,9 +263,23 @@ func isLocalHost(host string, port string, localPort string) (bool, error) {
 		return false, err
 	}
 
+	nonInterIPV4s := mustGetLocalIP4().Intersection(hostIPs)
+	if nonInterIPV4s.IsEmpty() {
+		hostIPs = hostIPs.ApplyFunc(func(ip string) string {
+			if net.ParseIP(ip).IsLoopback() {
+				// Any loopback IP which is not 127.0.0.1
+				// convert it to check for intersections.
+				return "127.0.0.1"
+			}
+			return ip
+		})
+		nonInterIPV4s = mustGetLocalIP4().Intersection(hostIPs)
+	}
+	nonInterIPV6s := mustGetLocalIP6().Intersection(hostIPs)
+
 	// If intersection of two IP sets is not empty, then the host is localhost.
-	isLocalv4 := !mustGetLocalIP4().Intersection(hostIPs).IsEmpty()
-	isLocalv6 := !mustGetLocalIP6().Intersection(hostIPs).IsEmpty()
+	isLocalv4 := !nonInterIPV4s.IsEmpty()
+	isLocalv6 := !nonInterIPV6s.IsEmpty()
 	if port != "" {
 		return (isLocalv4 || isLocalv6) && (port == localPort), nil
 	}

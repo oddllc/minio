@@ -25,14 +25,16 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
-	etcd "github.com/coreos/etcd/clientv3"
-	"github.com/coreos/etcd/mvcc/mvccpb"
-	"github.com/minio/minio-go/v6/pkg/set"
+	jwtgo "github.com/dgrijalva/jwt-go"
+	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/auth"
 	iampolicy "github.com/minio/minio/pkg/iam/policy"
 	"github.com/minio/minio/pkg/madmin"
+	etcd "go.etcd.io/etcd/clientv3"
+	"go.etcd.io/etcd/mvcc/mvccpb"
 )
 
 var defaultContextTimeout = 30 * time.Second
@@ -40,40 +42,25 @@ var defaultContextTimeout = 30 * time.Second
 func etcdKvsToSet(prefix string, kvs []*mvccpb.KeyValue) set.StringSet {
 	users := set.NewStringSet()
 	for _, kv := range kvs {
-		// Extract user by stripping off the `prefix` value as suffix,
-		// then strip off the remaining basename to obtain the prefix
-		// value, usually in the following form.
-		//
-		//  key := "config/iam/users/newuser/identity.json"
-		//  prefix := "config/iam/users/"
-		//  v := trim(trim(key, prefix), base(key)) == "newuser"
-		//
-		user := path.Clean(strings.TrimSuffix(strings.TrimPrefix(string(kv.Key), prefix), path.Base(string(kv.Key))))
+		user := extractPathPrefixAndSuffix(string(kv.Key), prefix, path.Base(string(kv.Key)))
 		users.Add(user)
 	}
 	return users
 }
 
-func etcdKvsToSetPolicyDB(prefix string, kvs []*mvccpb.KeyValue) set.StringSet {
-	items := set.NewStringSet()
-	for _, kv := range kvs {
-		// Extract user item by stripping off prefix and then
-		// stripping of ".json" suffix.
-		//
-		// key := "config/iam/policydb/users/myuser1.json"
-		// prefix := "config/iam/policydb/users/"
-		// v := trimSuffix(trimPrefix(key, prefix), ".json")
-		key := string(kv.Key)
-		item := path.Clean(strings.TrimSuffix(strings.TrimPrefix(key, prefix), ".json"))
-		items.Add(item)
-	}
-	return items
+// Extract path string by stripping off the `prefix` value and the suffix,
+// value, usually in the following form.
+//  s := "config/iam/users/foo/config.json"
+//  prefix := "config/iam/users/"
+//  suffix := "config.json"
+//  result is foo
+func extractPathPrefixAndSuffix(s string, prefix string, suffix string) string {
+	return path.Clean(strings.TrimSuffix(strings.TrimPrefix(string(s), prefix), suffix))
 }
 
 // IAMEtcdStore implements IAMStorageAPI
 type IAMEtcdStore struct {
 	sync.RWMutex
-	ctx context.Context
 
 	client *etcd.Client
 }
@@ -82,31 +69,23 @@ func newIAMEtcdStore() *IAMEtcdStore {
 	return &IAMEtcdStore{client: globalEtcdClient}
 }
 
-func (ies *IAMEtcdStore) getContext() context.Context {
+func (ies *IAMEtcdStore) lock() {
+	ies.Lock()
+}
+
+func (ies *IAMEtcdStore) unlock() {
+	ies.Unlock()
+}
+
+func (ies *IAMEtcdStore) rlock() {
 	ies.RLock()
-	defer ies.RUnlock()
-
-	if ies.ctx == nil {
-		return context.Background()
-	}
-	return ies.ctx
 }
 
-func (ies *IAMEtcdStore) setContext(ctx context.Context) {
-	ies.Lock()
-	defer ies.Unlock()
-
-	ies.ctx = ctx
+func (ies *IAMEtcdStore) runlock() {
+	ies.RUnlock()
 }
 
-func (ies *IAMEtcdStore) clearContext() {
-	ies.Lock()
-	defer ies.Unlock()
-
-	ies.ctx = nil
-}
-
-func (ies *IAMEtcdStore) saveIAMConfig(item interface{}, path string) error {
+func (ies *IAMEtcdStore) saveIAMConfig(ctx context.Context, item interface{}, path string, opts ...options) error {
 	data, err := json.Marshal(item)
 	if err != nil {
 		return err
@@ -117,39 +96,41 @@ func (ies *IAMEtcdStore) saveIAMConfig(item interface{}, path string) error {
 			return err
 		}
 	}
-	return saveKeyEtcd(ies.getContext(), ies.client, path, data)
+	return saveKeyEtcd(ctx, ies.client, path, data, opts...)
 }
 
-func (ies *IAMEtcdStore) loadIAMConfig(item interface{}, path string) error {
-	pdata, err := readKeyEtcd(ies.getContext(), ies.client, path)
-	if err != nil {
-		return err
-	}
-
-	if globalConfigEncrypted {
-		pdata, err = madmin.DecryptData(globalActiveCred.String(), bytes.NewReader(pdata))
+func getIAMConfig(item interface{}, value []byte) error {
+	conf := value
+	var err error
+	if globalConfigEncrypted && !utf8.Valid(value) {
+		conf, err = madmin.DecryptData(globalActiveCred.String(), bytes.NewReader(conf))
 		if err != nil {
 			return err
 		}
 	}
-
-	return json.Unmarshal(pdata, item)
+	return json.Unmarshal(conf, item)
 }
 
-func (ies *IAMEtcdStore) deleteIAMConfig(path string) error {
-	return deleteKeyEtcd(ies.getContext(), ies.client, path)
+func (ies *IAMEtcdStore) loadIAMConfig(ctx context.Context, item interface{}, path string) error {
+	pdata, err := readKeyEtcd(ctx, ies.client, path)
+	if err != nil {
+		return err
+	}
+	return getIAMConfig(item, pdata)
 }
 
-func (ies *IAMEtcdStore) migrateUsersConfigToV1(isSTS bool) error {
+func (ies *IAMEtcdStore) deleteIAMConfig(ctx context.Context, path string) error {
+	return deleteKeyEtcd(ctx, ies.client, path)
+}
+
+func (ies *IAMEtcdStore) migrateUsersConfigToV1(ctx context.Context, isSTS bool) error {
 	basePrefix := iamConfigUsersPrefix
 	if isSTS {
 		basePrefix = iamConfigSTSPrefix
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), defaultContextTimeout)
+	ctx, cancel := context.WithTimeout(ctx, defaultContextTimeout)
 	defer cancel()
-	ies.setContext(ctx)
-	defer ies.clearContext()
 	r, err := ies.client.Get(ctx, basePrefix, etcd.WithPrefix(), etcd.WithKeysOnly())
 	if err != nil {
 		return err
@@ -161,7 +142,7 @@ func (ies *IAMEtcdStore) migrateUsersConfigToV1(isSTS bool) error {
 			// 1. check if there is a policy file in the old loc.
 			oldPolicyPath := pathJoin(basePrefix, user, iamPolicyFile)
 			var policyName string
-			err := ies.loadIAMConfig(&policyName, oldPolicyPath)
+			err := ies.loadIAMConfig(ctx, &policyName, oldPolicyPath)
 			if err != nil {
 				switch err {
 				case errConfigNotFound:
@@ -174,8 +155,12 @@ func (ies *IAMEtcdStore) migrateUsersConfigToV1(isSTS bool) error {
 
 			// 2. copy policy to new loc.
 			mp := newMappedPolicy(policyName)
-			path := getMappedPolicyPath(user, isSTS, false)
-			if err := ies.saveIAMConfig(mp, path); err != nil {
+			userType := regularUser
+			if isSTS {
+				userType = stsUser
+			}
+			path := getMappedPolicyPath(user, userType, false)
+			if err := ies.saveIAMConfig(ctx, mp, path); err != nil {
 				return err
 			}
 
@@ -187,7 +172,7 @@ func (ies *IAMEtcdStore) migrateUsersConfigToV1(isSTS bool) error {
 		// 4. check if user identity has old format.
 		identityPath := pathJoin(basePrefix, user, iamIdentityFile)
 		var cred auth.Credentials
-		if err := ies.loadIAMConfig(&cred, identityPath); err != nil {
+		if err := ies.loadIAMConfig(ctx, &cred, identityPath); err != nil {
 			switch err {
 			case errConfigNotFound:
 				// This case should not happen.
@@ -201,7 +186,7 @@ func (ies *IAMEtcdStore) migrateUsersConfigToV1(isSTS bool) error {
 		// then the parsed auth.Credentials will have
 		// the zero value for the struct.
 		var zeroCred auth.Credentials
-		if cred == zeroCred {
+		if cred.Equal(zeroCred) {
 			// nothing to do
 			continue
 		}
@@ -210,8 +195,8 @@ func (ies *IAMEtcdStore) migrateUsersConfigToV1(isSTS bool) error {
 		// into new format and save it.
 		cred.AccessKey = user
 		u := newUserIdentity(cred)
-		if err := ies.saveIAMConfig(u, identityPath); err != nil {
-			logger.LogIf(context.Background(), err)
+		if err := ies.saveIAMConfig(ctx, u, identityPath); err != nil {
+			logger.LogIf(ctx, err)
 			return err
 		}
 
@@ -221,10 +206,10 @@ func (ies *IAMEtcdStore) migrateUsersConfigToV1(isSTS bool) error {
 	return nil
 }
 
-func (ies *IAMEtcdStore) migrateToV1() error {
+func (ies *IAMEtcdStore) migrateToV1(ctx context.Context) error {
 	var iamFmt iamFormat
 	path := getIAMFormatFilePath()
-	if err := ies.loadIAMConfig(&iamFmt, path); err != nil {
+	if err := ies.loadIAMConfig(ctx, &iamFmt, path); err != nil {
 		switch err {
 		case errConfigNotFound:
 			// Need to migrate to V1.
@@ -243,79 +228,113 @@ func (ies *IAMEtcdStore) migrateToV1() error {
 	}
 
 	// Migrate long-term users
-	if err := ies.migrateUsersConfigToV1(false); err != nil {
-		logger.LogIf(context.Background(), err)
+	if err := ies.migrateUsersConfigToV1(ctx, false); err != nil {
+		logger.LogIf(ctx, err)
 		return err
 	}
 	// Migrate STS users
-	if err := ies.migrateUsersConfigToV1(true); err != nil {
-		logger.LogIf(context.Background(), err)
+	if err := ies.migrateUsersConfigToV1(ctx, true); err != nil {
+		logger.LogIf(ctx, err)
 		return err
 	}
 	// Save iam version file.
-	if err := ies.saveIAMConfig(newIAMFormatVersion1(), path); err != nil {
-		logger.LogIf(context.Background(), err)
+	if err := ies.saveIAMConfig(ctx, newIAMFormatVersion1(), path); err != nil {
+		logger.LogIf(ctx, err)
 		return err
 	}
 	return nil
 }
 
 // Should be called under config migration lock
-func (ies *IAMEtcdStore) migrateBackendFormat(objAPI ObjectLayer) error {
-	if err := ies.migrateToV1(); err != nil {
-		return err
-	}
-	return nil
+func (ies *IAMEtcdStore) migrateBackendFormat(ctx context.Context) error {
+	return ies.migrateToV1(ctx)
 }
 
-func (ies *IAMEtcdStore) loadPolicyDoc(policy string, m map[string]iampolicy.Policy) error {
+func (ies *IAMEtcdStore) loadPolicyDoc(ctx context.Context, policy string, m map[string]iampolicy.Policy) error {
 	var p iampolicy.Policy
-	err := ies.loadIAMConfig(&p, getPolicyDocPath(policy))
+	err := ies.loadIAMConfig(ctx, &p, getPolicyDocPath(policy))
 	if err != nil {
+		if err == errConfigNotFound {
+			return errNoSuchPolicy
+		}
 		return err
 	}
 	m[policy] = p
 	return nil
 }
 
-func (ies *IAMEtcdStore) loadPolicyDocs(m map[string]iampolicy.Policy) error {
-	ctx, cancel := context.WithTimeout(context.Background(), defaultContextTimeout)
+func (ies *IAMEtcdStore) getPolicyDoc(ctx context.Context, kvs *mvccpb.KeyValue, m map[string]iampolicy.Policy) error {
+	var p iampolicy.Policy
+	err := getIAMConfig(&p, kvs.Value)
+	if err != nil {
+		if err == errConfigNotFound {
+			return errNoSuchPolicy
+		}
+		return err
+	}
+	policy := extractPathPrefixAndSuffix(string(kvs.Key), iamConfigPoliciesPrefix, path.Base(string(kvs.Key)))
+	m[policy] = p
+	return nil
+}
+
+func (ies *IAMEtcdStore) loadPolicyDocs(ctx context.Context, m map[string]iampolicy.Policy) error {
+	ctx, cancel := context.WithTimeout(ctx, defaultContextTimeout)
 	defer cancel()
-	ies.setContext(ctx)
-	defer ies.clearContext()
-	r, err := ies.client.Get(ctx, iamConfigPoliciesPrefix, etcd.WithPrefix(), etcd.WithKeysOnly())
+	//  Retrieve all keys and values to avoid too many calls to etcd in case of
+	//  a large number of policies
+	r, err := ies.client.Get(ctx, iamConfigPoliciesPrefix, etcd.WithPrefix())
 	if err != nil {
 		return err
 	}
 
-	policies := etcdKvsToSet(iamConfigPoliciesPrefix, r.Kvs)
-
-	// Reload config and policies for all policys.
-	for _, policyName := range policies.ToSlice() {
-		err = ies.loadPolicyDoc(policyName, m)
-		if err != nil {
+	// Parse all values to construct the policies data model.
+	for _, kvs := range r.Kvs {
+		if err = ies.getPolicyDoc(ctx, kvs, m); err != nil && err != errNoSuchPolicy {
 			return err
 		}
 	}
 	return nil
 }
 
-func (ies *IAMEtcdStore) loadUser(user string, isSTS bool, m map[string]auth.Credentials) error {
+func (ies *IAMEtcdStore) getUser(ctx context.Context, userkv *mvccpb.KeyValue, userType IAMUserType, m map[string]auth.Credentials, basePrefix string) error {
 	var u UserIdentity
-	err := ies.loadIAMConfig(&u, getUserIdentityPath(user, isSTS))
+	err := getIAMConfig(&u, userkv.Value)
 	if err != nil {
 		if err == errConfigNotFound {
 			return errNoSuchUser
 		}
 		return err
 	}
+	user := extractPathPrefixAndSuffix(string(userkv.Key), basePrefix, path.Base(string(userkv.Key)))
+	return ies.addUser(ctx, user, userType, u, m)
+}
 
+func (ies *IAMEtcdStore) addUser(ctx context.Context, user string, userType IAMUserType, u UserIdentity, m map[string]auth.Credentials) error {
 	if u.Credentials.IsExpired() {
 		// Delete expired identity.
-		ctx := ies.getContext()
-		deleteKeyEtcd(ctx, ies.client, getUserIdentityPath(user, isSTS))
-		deleteKeyEtcd(ctx, ies.client, getMappedPolicyPath(user, isSTS, false))
+		deleteKeyEtcd(ctx, ies.client, getUserIdentityPath(user, userType))
+		deleteKeyEtcd(ctx, ies.client, getMappedPolicyPath(user, userType, false))
 		return nil
+	}
+
+	// If this is a service account, rotate the session key if we are changing the server creds
+	if globalOldCred.IsValid() && u.Credentials.IsServiceAccount() {
+		if !globalOldCred.Equal(globalActiveCred) {
+			m := jwtgo.MapClaims{}
+			stsTokenCallback := func(t *jwtgo.Token) (interface{}, error) {
+				return []byte(globalOldCred.SecretKey), nil
+			}
+			if _, err := jwtgo.ParseWithClaims(u.Credentials.SessionToken, m, stsTokenCallback); err == nil {
+				jwt := jwtgo.NewWithClaims(jwtgo.SigningMethodHS512, jwtgo.MapClaims(m))
+				if token, err := jwt.SignedString([]byte(globalActiveCred.SecretKey)); err == nil {
+					u.Credentials.SessionToken = token
+					err := ies.saveIAMConfig(ctx, &u, getUserIdentityPath(user, userType))
+					if err != nil {
+						return err
+					}
+				}
+			}
+		}
 	}
 
 	if u.Credentials.AccessKey == "" {
@@ -323,38 +342,53 @@ func (ies *IAMEtcdStore) loadUser(user string, isSTS bool, m map[string]auth.Cre
 	}
 	m[user] = u.Credentials
 	return nil
-
 }
 
-func (ies *IAMEtcdStore) loadUsers(isSTS bool, m map[string]auth.Credentials) error {
-	basePrefix := iamConfigUsersPrefix
-	if isSTS {
+func (ies *IAMEtcdStore) loadUser(ctx context.Context, user string, userType IAMUserType, m map[string]auth.Credentials) error {
+	var u UserIdentity
+	err := ies.loadIAMConfig(ctx, &u, getUserIdentityPath(user, userType))
+	if err != nil {
+		if err == errConfigNotFound {
+			return errNoSuchUser
+		}
+		return err
+	}
+	return ies.addUser(ctx, user, userType, u, m)
+}
+
+func (ies *IAMEtcdStore) loadUsers(ctx context.Context, userType IAMUserType, m map[string]auth.Credentials) error {
+	var basePrefix string
+	switch userType {
+	case srvAccUser:
+		basePrefix = iamConfigServiceAccountsPrefix
+	case stsUser:
 		basePrefix = iamConfigSTSPrefix
+	default:
+		basePrefix = iamConfigUsersPrefix
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), defaultContextTimeout)
+	cctx, cancel := context.WithTimeout(ctx, defaultContextTimeout)
 	defer cancel()
-	ies.setContext(ctx)
-	defer ies.clearContext()
-	r, err := ies.client.Get(ctx, basePrefix, etcd.WithPrefix(), etcd.WithKeysOnly())
+
+	// Retrieve all keys and values to avoid too many calls to etcd in case of
+	// a large number of users
+	r, err := ies.client.Get(cctx, basePrefix, etcd.WithPrefix())
 	if err != nil {
 		return err
 	}
 
-	users := etcdKvsToSet(basePrefix, r.Kvs)
-
-	// Reload config for all users.
-	for _, user := range users.ToSlice() {
-		if err = ies.loadUser(user, isSTS, m); err != nil {
+	// Parse all users values to create the proper data model
+	for _, userKv := range r.Kvs {
+		if err = ies.getUser(ctx, userKv, userType, m, basePrefix); err != nil && err != errNoSuchUser {
 			return err
 		}
 	}
 	return nil
 }
 
-func (ies *IAMEtcdStore) loadGroup(group string, m map[string]GroupInfo) error {
+func (ies *IAMEtcdStore) loadGroup(ctx context.Context, group string, m map[string]GroupInfo) error {
 	var gi GroupInfo
-	err := ies.loadIAMConfig(&gi, getGroupInfoPath(group))
+	err := ies.loadIAMConfig(ctx, &gi, getGroupInfoPath(group))
 	if err != nil {
 		if err == errConfigNotFound {
 			return errNoSuchGroup
@@ -366,12 +400,11 @@ func (ies *IAMEtcdStore) loadGroup(group string, m map[string]GroupInfo) error {
 
 }
 
-func (ies *IAMEtcdStore) loadGroups(m map[string]GroupInfo) error {
-	ctx, cancel := context.WithTimeout(context.Background(), defaultContextTimeout)
+func (ies *IAMEtcdStore) loadGroups(ctx context.Context, m map[string]GroupInfo) error {
+	cctx, cancel := context.WithTimeout(ctx, defaultContextTimeout)
 	defer cancel()
-	ies.setContext(ctx)
-	defer ies.clearContext()
-	r, err := ies.client.Get(ctx, iamConfigGroupsPrefix, etcd.WithPrefix(), etcd.WithKeysOnly())
+
+	r, err := ies.client.Get(cctx, iamConfigGroupsPrefix, etcd.WithPrefix(), etcd.WithKeysOnly())
 	if err != nil {
 		return err
 	}
@@ -380,7 +413,7 @@ func (ies *IAMEtcdStore) loadGroups(m map[string]GroupInfo) error {
 
 	// Reload config for all groups.
 	for _, group := range groups.ToSlice() {
-		if err = ies.loadGroup(group, m); err != nil {
+		if err = ies.loadGroup(ctx, group, m); err != nil && err != errNoSuchGroup {
 			return err
 		}
 	}
@@ -388,9 +421,9 @@ func (ies *IAMEtcdStore) loadGroups(m map[string]GroupInfo) error {
 
 }
 
-func (ies *IAMEtcdStore) loadMappedPolicy(name string, isSTS, isGroup bool, m map[string]MappedPolicy) error {
+func (ies *IAMEtcdStore) loadMappedPolicy(ctx context.Context, name string, userType IAMUserType, isGroup bool, m map[string]MappedPolicy) error {
 	var p MappedPolicy
-	err := ies.loadIAMConfig(&p, getMappedPolicyPath(name, isSTS, isGroup))
+	err := ies.loadIAMConfig(ctx, &p, getMappedPolicyPath(name, userType, isGroup))
 	if err != nil {
 		if err == errConfigNotFound {
 			return errNoSuchPolicy
@@ -399,33 +432,48 @@ func (ies *IAMEtcdStore) loadMappedPolicy(name string, isSTS, isGroup bool, m ma
 	}
 	m[name] = p
 	return nil
-
 }
 
-func (ies *IAMEtcdStore) loadMappedPolicies(isSTS, isGroup bool, m map[string]MappedPolicy) error {
-	ctx, cancel := context.WithTimeout(context.Background(), defaultContextTimeout)
-	defer cancel()
-	ies.setContext(ctx)
-	defer ies.clearContext()
-	var basePrefix string
-	switch {
-	case isSTS:
-		basePrefix = iamConfigPolicyDBSTSUsersPrefix
-	case isGroup:
-		basePrefix = iamConfigPolicyDBGroupsPrefix
-	default:
-		basePrefix = iamConfigPolicyDBUsersPrefix
+func getMappedPolicy(ctx context.Context, kv *mvccpb.KeyValue, userType IAMUserType, isGroup bool, m map[string]MappedPolicy, basePrefix string) error {
+	var p MappedPolicy
+	err := getIAMConfig(&p, kv.Value)
+	if err != nil {
+		if err == errConfigNotFound {
+			return errNoSuchPolicy
+		}
+		return err
 	}
-	r, err := ies.client.Get(ctx, basePrefix, etcd.WithPrefix(), etcd.WithKeysOnly())
+	name := extractPathPrefixAndSuffix(string(kv.Key), basePrefix, ".json")
+	m[name] = p
+	return nil
+}
+
+func (ies *IAMEtcdStore) loadMappedPolicies(ctx context.Context, userType IAMUserType, isGroup bool, m map[string]MappedPolicy) error {
+	cctx, cancel := context.WithTimeout(ctx, defaultContextTimeout)
+	defer cancel()
+	var basePrefix string
+	if isGroup {
+		basePrefix = iamConfigPolicyDBGroupsPrefix
+	} else {
+		switch userType {
+		case srvAccUser:
+			basePrefix = iamConfigPolicyDBServiceAccountsPrefix
+		case stsUser:
+			basePrefix = iamConfigPolicyDBSTSUsersPrefix
+		default:
+			basePrefix = iamConfigPolicyDBUsersPrefix
+		}
+	}
+	// Retrieve all keys and values to avoid too many calls to etcd in case of
+	// a large number of policy mappings
+	r, err := ies.client.Get(cctx, basePrefix, etcd.WithPrefix())
 	if err != nil {
 		return err
 	}
 
-	users := etcdKvsToSetPolicyDB(basePrefix, r.Kvs)
-
-	// Reload config and policies for all users.
-	for _, user := range users.ToSlice() {
-		if err = ies.loadMappedPolicy(user, isSTS, isGroup, m); err != nil {
+	// Parse all policies mapping to create the proper data model
+	for _, kv := range r.Kvs {
+		if err = getMappedPolicy(ctx, kv, userType, isGroup, m, basePrefix); err != nil && err != errNoSuchPolicy {
 			return err
 		}
 	}
@@ -433,152 +481,92 @@ func (ies *IAMEtcdStore) loadMappedPolicies(isSTS, isGroup bool, m map[string]Ma
 
 }
 
-func (ies *IAMEtcdStore) loadAll(sys *IAMSys, objectAPI ObjectLayer) error {
-	iamUsersMap := make(map[string]auth.Credentials)
-	iamGroupsMap := make(map[string]GroupInfo)
-	iamPolicyDocsMap := make(map[string]iampolicy.Policy)
-	iamUserPolicyMap := make(map[string]MappedPolicy)
-	iamGroupPolicyMap := make(map[string]MappedPolicy)
-
-	isMinIOUsersSys := false
-	sys.RLock()
-	if sys.usersSysType == MinIOUsersSysType {
-		isMinIOUsersSys = true
-	}
-	sys.RUnlock()
-
-	if err := ies.loadPolicyDocs(iamPolicyDocsMap); err != nil {
-		return err
-	}
-
-	// load STS temp users
-	if err := ies.loadUsers(true, iamUsersMap); err != nil {
-		return err
-	}
-
-	if isMinIOUsersSys {
-		// load long term users
-		if err := ies.loadUsers(false, iamUsersMap); err != nil {
-			return err
-		}
-		if err := ies.loadGroups(iamGroupsMap); err != nil {
-			return err
-		}
-		if err := ies.loadMappedPolicies(false, false, iamUserPolicyMap); err != nil {
-			return err
-		}
-	}
-
-	// load STS policy mappings into the same map
-	if err := ies.loadMappedPolicies(true, false, iamUserPolicyMap); err != nil {
-		return err
-	}
-	// load policies mapped to groups
-	if err := ies.loadMappedPolicies(false, true, iamGroupPolicyMap); err != nil {
-		return err
-	}
-
-	// Sets default canned policies, if none are set.
-	setDefaultCannedPolicies(iamPolicyDocsMap)
-
-	sys.Lock()
-	defer sys.Unlock()
-
-	sys.iamUsersMap = iamUsersMap
-	sys.iamGroupsMap = iamGroupsMap
-	sys.iamUserPolicyMap = iamUserPolicyMap
-	sys.iamPolicyDocsMap = iamPolicyDocsMap
-	sys.iamGroupPolicyMap = iamGroupPolicyMap
-	sys.buildUserGroupMemberships()
-
-	return nil
+func (ies *IAMEtcdStore) loadAll(ctx context.Context, sys *IAMSys) error {
+	return sys.Load(ctx, ies)
 }
 
-func (ies *IAMEtcdStore) savePolicyDoc(policyName string, p iampolicy.Policy) error {
-	return ies.saveIAMConfig(&p, getPolicyDocPath(policyName))
+func (ies *IAMEtcdStore) savePolicyDoc(ctx context.Context, policyName string, p iampolicy.Policy) error {
+	return ies.saveIAMConfig(ctx, &p, getPolicyDocPath(policyName))
 }
 
-func (ies *IAMEtcdStore) saveMappedPolicy(name string, isSTS, isGroup bool, mp MappedPolicy) error {
-	return ies.saveIAMConfig(mp, getMappedPolicyPath(name, isSTS, isGroup))
+func (ies *IAMEtcdStore) saveMappedPolicy(ctx context.Context, name string, userType IAMUserType, isGroup bool, mp MappedPolicy, opts ...options) error {
+	return ies.saveIAMConfig(ctx, mp, getMappedPolicyPath(name, userType, isGroup), opts...)
 }
 
-func (ies *IAMEtcdStore) saveUserIdentity(name string, isSTS bool, u UserIdentity) error {
-	return ies.saveIAMConfig(u, getUserIdentityPath(name, isSTS))
+func (ies *IAMEtcdStore) saveUserIdentity(ctx context.Context, name string, userType IAMUserType, u UserIdentity, opts ...options) error {
+	return ies.saveIAMConfig(ctx, u, getUserIdentityPath(name, userType), opts...)
 }
 
-func (ies *IAMEtcdStore) saveGroupInfo(name string, gi GroupInfo) error {
-	return ies.saveIAMConfig(gi, getGroupInfoPath(name))
+func (ies *IAMEtcdStore) saveGroupInfo(ctx context.Context, name string, gi GroupInfo) error {
+	return ies.saveIAMConfig(ctx, gi, getGroupInfoPath(name))
 }
 
-func (ies *IAMEtcdStore) deletePolicyDoc(name string) error {
-	err := ies.deleteIAMConfig(getPolicyDocPath(name))
+func (ies *IAMEtcdStore) deletePolicyDoc(ctx context.Context, name string) error {
+	err := ies.deleteIAMConfig(ctx, getPolicyDocPath(name))
 	if err == errConfigNotFound {
 		err = errNoSuchPolicy
 	}
 	return err
 }
 
-func (ies *IAMEtcdStore) deleteMappedPolicy(name string, isSTS, isGroup bool) error {
-	err := ies.deleteIAMConfig(getMappedPolicyPath(name, isSTS, isGroup))
+func (ies *IAMEtcdStore) deleteMappedPolicy(ctx context.Context, name string, userType IAMUserType, isGroup bool) error {
+	err := ies.deleteIAMConfig(ctx, getMappedPolicyPath(name, userType, isGroup))
 	if err == errConfigNotFound {
 		err = errNoSuchPolicy
 	}
 	return err
 }
 
-func (ies *IAMEtcdStore) deleteUserIdentity(name string, isSTS bool) error {
-	err := ies.deleteIAMConfig(getUserIdentityPath(name, isSTS))
+func (ies *IAMEtcdStore) deleteUserIdentity(ctx context.Context, name string, userType IAMUserType) error {
+	err := ies.deleteIAMConfig(ctx, getUserIdentityPath(name, userType))
 	if err == errConfigNotFound {
 		err = errNoSuchUser
 	}
 	return err
 }
 
-func (ies *IAMEtcdStore) deleteGroupInfo(name string) error {
-	err := ies.deleteIAMConfig(getGroupInfoPath(name))
+func (ies *IAMEtcdStore) deleteGroupInfo(ctx context.Context, name string) error {
+	err := ies.deleteIAMConfig(ctx, getGroupInfoPath(name))
 	if err == errConfigNotFound {
 		err = errNoSuchGroup
 	}
 	return err
 }
 
-func (ies *IAMEtcdStore) watch(sys *IAMSys) {
-	watchEtcd := func() {
-		for {
-		outerLoop:
-			// Refresh IAMSys with etcd watch.
-			watchCh := ies.client.Watch(context.Background(),
-				iamConfigPrefix, etcd.WithPrefix(), etcd.WithKeysOnly())
+func (ies *IAMEtcdStore) watch(ctx context.Context, sys *IAMSys) {
+	for {
+	outerLoop:
+		// Refresh IAMSys with etcd watch.
+		watchCh := ies.client.Watch(ctx,
+			iamConfigPrefix, etcd.WithPrefix(), etcd.WithKeysOnly())
 
-			for {
-				select {
-				case <-GlobalServiceDoneCh:
-					return
-				case watchResp, ok := <-watchCh:
-					if !ok {
-						time.Sleep(1 * time.Second)
-						// Upon an error on watch channel
-						// re-init the watch channel.
-						goto outerLoop
-					}
-					if err := watchResp.Err(); err != nil {
-						logger.LogIf(context.Background(), err)
-						// log and retry.
-						time.Sleep(1 * time.Second)
-						// Upon an error on watch channel
-						// re-init the watch channel.
-						goto outerLoop
-					}
-					for _, event := range watchResp.Events {
-						sys.Lock()
-						ies.reloadFromEvent(sys, event)
-						sys.Unlock()
-					}
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case watchResp, ok := <-watchCh:
+				if !ok {
+					time.Sleep(1 * time.Second)
+					// Upon an error on watch channel
+					// re-init the watch channel.
+					goto outerLoop
+				}
+				if err := watchResp.Err(); err != nil {
+					logger.LogIf(ctx, err)
+					// log and retry.
+					time.Sleep(1 * time.Second)
+					// Upon an error on watch channel
+					// re-init the watch channel.
+					goto outerLoop
+				}
+				for _, event := range watchResp.Events {
+					ies.lock()
+					ies.reloadFromEvent(sys, event)
+					ies.unlock()
 				}
 			}
 		}
 	}
-	go watchEtcd()
 }
 
 // sys.RLock is held by caller.
@@ -588,10 +576,14 @@ func (ies *IAMEtcdStore) reloadFromEvent(sys *IAMSys, event *etcd.Event) {
 	usersPrefix := strings.HasPrefix(string(event.Kv.Key), iamConfigUsersPrefix)
 	groupsPrefix := strings.HasPrefix(string(event.Kv.Key), iamConfigGroupsPrefix)
 	stsPrefix := strings.HasPrefix(string(event.Kv.Key), iamConfigSTSPrefix)
+	svcPrefix := strings.HasPrefix(string(event.Kv.Key), iamConfigServiceAccountsPrefix)
 	policyPrefix := strings.HasPrefix(string(event.Kv.Key), iamConfigPoliciesPrefix)
 	policyDBUsersPrefix := strings.HasPrefix(string(event.Kv.Key), iamConfigPolicyDBUsersPrefix)
 	policyDBSTSUsersPrefix := strings.HasPrefix(string(event.Kv.Key), iamConfigPolicyDBSTSUsersPrefix)
 	policyDBGroupsPrefix := strings.HasPrefix(string(event.Kv.Key), iamConfigPolicyDBGroupsPrefix)
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultContextTimeout)
+	defer cancel()
 
 	switch {
 	case eventCreate:
@@ -599,37 +591,41 @@ func (ies *IAMEtcdStore) reloadFromEvent(sys *IAMSys, event *etcd.Event) {
 		case usersPrefix:
 			accessKey := path.Dir(strings.TrimPrefix(string(event.Kv.Key),
 				iamConfigUsersPrefix))
-			ies.loadUser(accessKey, false, sys.iamUsersMap)
+			ies.loadUser(ctx, accessKey, regularUser, sys.iamUsersMap)
 		case stsPrefix:
 			accessKey := path.Dir(strings.TrimPrefix(string(event.Kv.Key),
 				iamConfigSTSPrefix))
-			ies.loadUser(accessKey, true, sys.iamUsersMap)
+			ies.loadUser(ctx, accessKey, stsUser, sys.iamUsersMap)
+		case svcPrefix:
+			accessKey := path.Dir(strings.TrimPrefix(string(event.Kv.Key),
+				iamConfigServiceAccountsPrefix))
+			ies.loadUser(ctx, accessKey, srvAccUser, sys.iamUsersMap)
 		case groupsPrefix:
 			group := path.Dir(strings.TrimPrefix(string(event.Kv.Key),
 				iamConfigGroupsPrefix))
-			ies.loadGroup(group, sys.iamGroupsMap)
+			ies.loadGroup(ctx, group, sys.iamGroupsMap)
 			gi := sys.iamGroupsMap[group]
 			sys.removeGroupFromMembershipsMap(group)
 			sys.updateGroupMembershipsMap(group, &gi)
 		case policyPrefix:
 			policyName := path.Dir(strings.TrimPrefix(string(event.Kv.Key),
 				iamConfigPoliciesPrefix))
-			ies.loadPolicyDoc(policyName, sys.iamPolicyDocsMap)
+			ies.loadPolicyDoc(ctx, policyName, sys.iamPolicyDocsMap)
 		case policyDBUsersPrefix:
 			policyMapFile := strings.TrimPrefix(string(event.Kv.Key),
 				iamConfigPolicyDBUsersPrefix)
 			user := strings.TrimSuffix(policyMapFile, ".json")
-			ies.loadMappedPolicy(user, false, false, sys.iamUserPolicyMap)
+			ies.loadMappedPolicy(ctx, user, regularUser, false, sys.iamUserPolicyMap)
 		case policyDBSTSUsersPrefix:
 			policyMapFile := strings.TrimPrefix(string(event.Kv.Key),
 				iamConfigPolicyDBSTSUsersPrefix)
 			user := strings.TrimSuffix(policyMapFile, ".json")
-			ies.loadMappedPolicy(user, true, false, sys.iamUserPolicyMap)
+			ies.loadMappedPolicy(ctx, user, stsUser, false, sys.iamUserPolicyMap)
 		case policyDBGroupsPrefix:
 			policyMapFile := strings.TrimPrefix(string(event.Kv.Key),
 				iamConfigPolicyDBGroupsPrefix)
 			user := strings.TrimSuffix(policyMapFile, ".json")
-			ies.loadMappedPolicy(user, false, true, sys.iamGroupPolicyMap)
+			ies.loadMappedPolicy(ctx, user, regularUser, true, sys.iamGroupPolicyMap)
 		}
 	case eventDelete:
 		switch {

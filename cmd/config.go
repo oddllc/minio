@@ -20,14 +20,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"path"
 	"sort"
 	"strings"
-	"time"
+	"unicode/utf8"
 
+	jsoniter "github.com/json-iterator/go"
 	"github.com/minio/minio/cmd/config"
-	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/madmin"
 )
 
@@ -41,9 +40,6 @@ const (
 
 	// MinIO configuration file.
 	minioConfigFile = "config.json"
-
-	// MinIO configuration backup file
-	minioConfigBackupFile = minioConfigFile + ".backup"
 )
 
 func listServerConfigHistory(ctx context.Context, objAPI ObjectLayer, withData bool, count int) (
@@ -68,7 +64,7 @@ func listServerConfigHistory(ctx context.Context, objAPI ObjectLayer, withData b
 				if err != nil {
 					return nil, err
 				}
-				if globalConfigEncrypted {
+				if globalConfigEncrypted && !utf8.Valid(data) {
 					data, err = madmin.DecryptData(globalActiveCred.String(), bytes.NewReader(data))
 					if err != nil {
 						return nil, err
@@ -96,7 +92,8 @@ func listServerConfigHistory(ctx context.Context, objAPI ObjectLayer, withData b
 
 func delServerConfigHistory(ctx context.Context, objAPI ObjectLayer, uuidKV string) error {
 	historyFile := pathJoin(minioConfigHistoryPrefix, uuidKV+kvPrefix)
-	return objAPI.DeleteObject(ctx, minioMetaBucket, historyFile)
+	_, err := objAPI.DeleteObject(ctx, minioMetaBucket, historyFile, ObjectOptions{})
+	return err
 }
 
 func readServerConfigHistory(ctx context.Context, objAPI ObjectLayer, uuidKV string) ([]byte, error) {
@@ -106,7 +103,7 @@ func readServerConfigHistory(ctx context.Context, objAPI ObjectLayer, uuidKV str
 		return nil, err
 	}
 
-	if globalConfigEncrypted {
+	if globalConfigEncrypted && !utf8.Valid(data) {
 		data, err = madmin.DecryptData(globalActiveCred.String(), bytes.NewReader(data))
 	}
 
@@ -153,13 +150,13 @@ func readServerConfig(ctx context.Context, objAPI ObjectLayer) (config.Config, e
 	if err != nil {
 		// Config not found for some reason, allow things to continue
 		// by initializing a new fresh config in safe mode.
-		if err == errConfigNotFound && globalSafeMode {
+		if err == errConfigNotFound && newObjectLayerFn() == nil {
 			return newServerConfig(), nil
 		}
 		return nil, err
 	}
 
-	if globalConfigEncrypted {
+	if globalConfigEncrypted && !utf8.Valid(configData) {
 		configData, err = madmin.DecryptData(globalActiveCred.String(), bytes.NewReader(configData))
 		if err != nil {
 			if err == madmin.ErrMaliciousData {
@@ -169,12 +166,14 @@ func readServerConfig(ctx context.Context, objAPI ObjectLayer) (config.Config, e
 		}
 	}
 
-	var config = config.New()
-	if err = json.Unmarshal(configData, &config); err != nil {
+	var srvCfg = config.New()
+	var json = jsoniter.ConfigCompatibleWithStandardLibrary
+	if err = json.Unmarshal(configData, &srvCfg); err != nil {
 		return nil, err
 	}
 
-	return config, nil
+	// Add any missing entries
+	return srvCfg.Merge(), nil
 }
 
 // ConfigSys - config system.
@@ -185,58 +184,13 @@ func (sys *ConfigSys) Load(objAPI ObjectLayer) error {
 	return sys.Init(objAPI)
 }
 
-// WatchConfigNASDisk - watches nas disk on periodic basis.
-func (sys *ConfigSys) WatchConfigNASDisk(objAPI ObjectLayer) {
-	configInterval := globalRefreshIAMInterval
-	watchDisk := func() {
-		ticker := time.NewTicker(configInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-GlobalServiceDoneCh:
-				return
-			case <-ticker.C:
-				loadConfig(objAPI)
-			}
-		}
-	}
-	// Refresh configSys in background for NAS gateway.
-	go watchDisk()
-}
-
 // Init - initializes config system from config.json.
 func (sys *ConfigSys) Init(objAPI ObjectLayer) error {
 	if objAPI == nil {
 		return errInvalidArgument
 	}
 
-	doneCh := make(chan struct{})
-	defer close(doneCh)
-
-	// Initializing configuration needs a retry mechanism for
-	// the following reasons:
-	//  - Read quorum is lost just after the initialization
-	//    of the object layer.
-	//  - Write quorum not met when upgrading configuration
-	//    version is needed.
-	retryTimerCh := newRetryTimerSimple(doneCh)
-	for {
-		select {
-		case <-retryTimerCh:
-			if err := initConfig(objAPI); err != nil {
-				if err == errDiskNotFound ||
-					strings.Contains(err.Error(), InsufficientReadQuorum{}.Error()) ||
-					strings.Contains(err.Error(), InsufficientWriteQuorum{}.Error()) {
-					logger.Info("Waiting for configuration to be initialized..")
-					continue
-				}
-				return err
-			}
-			return nil
-		case <-globalOSSignalCh:
-			return fmt.Errorf("Initializing config sub-system gracefully stopped")
-		}
-	}
+	return initConfig(objAPI)
 }
 
 // NewConfigSys - creates new config system object.

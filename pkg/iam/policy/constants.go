@@ -17,7 +17,8 @@
 package iampolicy
 
 import (
-	"github.com/minio/minio/pkg/policy"
+	"github.com/minio/minio/pkg/bucket/policy"
+	"github.com/minio/minio/pkg/bucket/policy/condition"
 )
 
 // Policy claim constants
@@ -61,6 +62,43 @@ var WriteOnly = Policy{
 			Effect:    policy.Allow,
 			Actions:   NewActionSet(PutObjectAction),
 			Resources: NewResourceSet(NewResource("*", "")),
+		},
+	},
+}
+
+// AdminDiagnostics - provides admin diagnostics access.
+var AdminDiagnostics = Policy{
+	Version: DefaultVersion,
+	Statements: []Statement{
+		{
+			SID:    policy.ID(""),
+			Effect: policy.Allow,
+			Actions: NewActionSet(ProfilingAdminAction,
+				TraceAdminAction, ConsoleLogAdminAction,
+				ServerInfoAdminAction, TopLocksAdminAction,
+				HealthInfoAdminAction, BandwidthMonitorAction),
+			Resources: NewResourceSet(NewResource("*", "")),
+		},
+	},
+}
+
+// Admin - provides admin all-access canned policy
+var Admin = Policy{
+	Version: DefaultVersion,
+	Statements: []Statement{
+		{
+			SID:        policy.ID(""),
+			Effect:     policy.Allow,
+			Actions:    NewActionSet(AllAdminActions),
+			Resources:  NewResourceSet(),
+			Conditions: condition.NewFunctions(),
+		},
+		{
+			SID:        policy.ID(""),
+			Effect:     policy.Allow,
+			Actions:    NewActionSet(AllActions),
+			Resources:  NewResourceSet(NewResource("*", "")),
+			Conditions: condition.NewFunctions(),
 		},
 	},
 }

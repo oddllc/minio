@@ -20,122 +20,75 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"time"
+	"net/http"
 
+	jsoniter "github.com/json-iterator/go"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/hash"
 )
 
 const (
-	dataUsageObjName       = "data-usage"
-	dataUsageCrawlInterval = 12 * time.Hour
+	envDataUsageScannerDebug = "MINIO_DISK_USAGE_SCANNER_DEBUG"
+
+	dataUsageRoot   = SlashSeparator
+	dataUsageBucket = minioMetaBucket + SlashSeparator + bucketMetaPrefix
+
+	dataUsageObjName   = ".usage.json"
+	dataUsageCacheName = ".usage-cache.bin"
+	dataUsageBloomName = ".bloomcycle.bin"
 )
 
-func initDataUsageStats() {
-	go runDataUsageInfoUpdateRoutine()
-}
-
-func runDataUsageInfoUpdateRoutine() {
-	// Wait until the object layer is ready
-	var objAPI ObjectLayer
-	for {
-		objAPI = newObjectLayerWithoutSafeModeFn()
-		if objAPI == nil {
-			time.Sleep(time.Second)
-			continue
-		}
-		break
-	}
-
-	ctx := context.Background()
-
-	switch v := objAPI.(type) {
-	case *xlZones:
-		runDataUsageInfoForXLZones(ctx, v, GlobalServiceDoneCh)
-	case *FSObjects:
-		runDataUsageInfoForFS(ctx, v, GlobalServiceDoneCh)
-	default:
-		return
-	}
-}
-
-func runDataUsageInfoForFS(ctx context.Context, fsObj *FSObjects, endCh <-chan struct{}) {
-	t := time.NewTicker(dataUsageCrawlInterval)
-	defer t.Stop()
-	for {
-		// Get data usage info of the FS Object
-		usageInfo := fsObj.crawlAndGetDataUsageInfo(ctx, endCh)
-		// Save the data usage in the disk
-		err := storeDataUsageInBackend(ctx, fsObj, usageInfo)
+// storeDataUsageInBackend will store all objects sent on the gui channel until closed.
+func storeDataUsageInBackend(ctx context.Context, objAPI ObjectLayer, dui <-chan DataUsageInfo) {
+	for dataUsageInfo := range dui {
+		dataUsageJSON, err := json.Marshal(dataUsageInfo)
 		if err != nil {
 			logger.LogIf(ctx, err)
-		}
-		select {
-		case <-endCh:
-			return
-		// Wait until the next crawl interval
-		case <-t.C:
-		}
-	}
-}
-
-func runDataUsageInfoForXLZones(ctx context.Context, z *xlZones, endCh <-chan struct{}) {
-	locker := z.NewNSLock(ctx, minioMetaBucket, "leader-data-usage-info")
-	for {
-		err := locker.GetLock(newDynamicTimeout(time.Millisecond, time.Millisecond))
-		if err != nil {
-			time.Sleep(5 * time.Minute)
 			continue
 		}
-		// Break without locking
-		break
-	}
-
-	t := time.NewTicker(dataUsageCrawlInterval)
-	defer t.Stop()
-	for {
-		usageInfo := z.crawlAndGetDataUsage(ctx, endCh)
-		err := storeDataUsageInBackend(ctx, z, usageInfo)
+		size := int64(len(dataUsageJSON))
+		r, err := hash.NewReader(bytes.NewReader(dataUsageJSON), size, "", "", size)
 		if err != nil {
 			logger.LogIf(ctx, err)
+			continue
 		}
-		select {
-		case <-endCh:
-			locker.Unlock()
-			return
-		case <-t.C:
+		_, err = objAPI.PutObject(ctx, dataUsageBucket, dataUsageObjName, NewPutObjReader(r), ObjectOptions{})
+		if !isErrBucketNotFound(err) {
+			logger.LogIf(ctx, err)
 		}
 	}
-}
-
-func storeDataUsageInBackend(ctx context.Context, objAPI ObjectLayer, dataUsageInfo DataUsageInfo) error {
-	dataUsageJSON, err := json.Marshal(dataUsageInfo)
-	if err != nil {
-		return err
-	}
-
-	size := int64(len(dataUsageJSON))
-	r, err := hash.NewReader(bytes.NewReader(dataUsageJSON), size, "", "", size, false)
-	if err != nil {
-		return err
-	}
-
-	_, err = objAPI.PutObject(ctx, minioMetaBackgroundOpsBucket, dataUsageObjName, NewPutObjReader(r, nil, nil), ObjectOptions{})
-	return err
 }
 
 func loadDataUsageFromBackend(ctx context.Context, objAPI ObjectLayer) (DataUsageInfo, error) {
-	var dataUsageInfoJSON bytes.Buffer
-
-	err := objAPI.GetObject(ctx, minioMetaBackgroundOpsBucket, dataUsageObjName, 0, -1, &dataUsageInfoJSON, "", ObjectOptions{})
+	r, err := objAPI.GetObjectNInfo(ctx, dataUsageBucket, dataUsageObjName, nil, http.Header{}, readLock, ObjectOptions{})
 	if err != nil {
-		return DataUsageInfo{}, nil
+		if isErrObjectNotFound(err) || isErrBucketNotFound(err) {
+			return DataUsageInfo{}, nil
+		}
+		return DataUsageInfo{}, toObjectErr(err, dataUsageBucket, dataUsageObjName)
 	}
+	defer r.Close()
 
 	var dataUsageInfo DataUsageInfo
-	err = json.Unmarshal(dataUsageInfoJSON.Bytes(), &dataUsageInfo)
-	if err != nil {
+	var json = jsoniter.ConfigCompatibleWithStandardLibrary
+	if err = json.NewDecoder(r).Decode(&dataUsageInfo); err != nil {
 		return DataUsageInfo{}, err
+	}
+
+	// For forward compatibility reasons, we need to add this code.
+	if len(dataUsageInfo.BucketsUsage) == 0 {
+		dataUsageInfo.BucketsUsage = make(map[string]BucketUsageInfo, len(dataUsageInfo.BucketSizes))
+		for bucket, size := range dataUsageInfo.BucketSizes {
+			dataUsageInfo.BucketsUsage[bucket] = BucketUsageInfo{Size: size}
+		}
+	}
+
+	// For backward compatibility reasons, we need to add this code.
+	if len(dataUsageInfo.BucketSizes) == 0 {
+		dataUsageInfo.BucketSizes = make(map[string]uint64, len(dataUsageInfo.BucketsUsage))
+		for bucket, bui := range dataUsageInfo.BucketsUsage {
+			dataUsageInfo.BucketSizes[bucket] = bui.Size
+		}
 	}
 
 	return dataUsageInfo, nil

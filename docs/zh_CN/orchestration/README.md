@@ -1,4 +1,4 @@
-# MinIO部署快速入门 [![Slack](https://slack.min.io/slack?type=svg)](https://slack.min.io) [![Go Report Card](https://goreportcard.com/badge/minio/minio)](https://goreportcard.com/report/minio/minio) [![Docker Pulls](https://img.shields.io/docker/pulls/minio/minio.svg?maxAge=604800)](https://hub.docker.com/r/minio/minio/)
+# MinIO部署快速入门 [![Slack](https://slack.min.io/slack?type=svg)](https://slack.min.io)  [![Docker Pulls](https://img.shields.io/docker/pulls/minio/minio.svg?maxAge=604800)](https://hub.docker.com/r/minio/minio/)
 
 MinIO是一个[云原生](https://baike.baidu.com/item/Cloud%20Native/19865304?fr=aladdin)的应用程序，旨在在多租户环境中以可持续的方式进行扩展。编排（orchestration）平台为MinIO的扩展提供了非常好的支撑。以下是各种编排平台的MinIO部署文档:
 
@@ -20,4 +20,4 @@ MinIO是建立在云原生的基础上，有纠删码、分布式和共享存储
 
 现在的应用、数据库，key-store这些，很多都已经部署在容器中，并且通过编排平台进行管理。MinIO提供了一个健壮的、可伸缩、AWS S3兼容的对象存储，这是MinIO的立身之本，凭此在云原生应用中占据一席之地。
 
-![Cloud-native](https://github.com/minio/minio/blob/master/docs/screenshots/MinIO_Cloud_Native_Arch.jpg?raw=true)
+![Cloud-native](https://github.com/minio/minio/blob/master/docs/screenshots/Minio_Cloud_Native_Arch.jpg?raw=true)

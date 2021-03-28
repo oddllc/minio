@@ -1,5 +1,5 @@
 /*
- * MinIO Cloud Storage, (C) 2019 MinIO, Inc.
+ * MinIO Cloud Storage, (C) 2019-2020 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,11 +18,9 @@
 package madmin
 
 import (
+	"context"
 	"math/rand"
-	"net"
 	"net/http"
-	"net/url"
-	"strings"
 	"sync"
 	"time"
 )
@@ -68,7 +66,7 @@ func (r *lockedRandSource) Seed(seed int64) {
 
 // newRetryTimer creates a timer with exponentially increasing
 // delays until the maximum retry attempts are reached.
-func (adm AdminClient) newRetryTimer(maxRetry int, unit time.Duration, cap time.Duration, jitter float64, doneCh chan struct{}) <-chan int {
+func (adm AdminClient) newRetryTimer(ctx context.Context, maxRetry int, unit time.Duration, cap time.Duration, jitter float64) <-chan int {
 	attemptCh := make(chan int)
 
 	// computes the exponential backoff duration according to
@@ -83,11 +81,11 @@ func (adm AdminClient) newRetryTimer(maxRetry int, unit time.Duration, cap time.
 		}
 
 		//sleep = random_between(0, min(cap, base * 2 ** attempt))
-		sleep := unit * time.Duration(1<<uint(attempt))
+		sleep := unit * 1 << uint(attempt)
 		if sleep > cap {
 			sleep = cap
 		}
-		if jitter != NoJitter {
+		if jitter > NoJitter {
 			sleep -= time.Duration(adm.random.Float64() * float64(sleep) * jitter)
 		}
 		return sleep
@@ -96,48 +94,23 @@ func (adm AdminClient) newRetryTimer(maxRetry int, unit time.Duration, cap time.
 	go func() {
 		defer close(attemptCh)
 		for i := 0; i < maxRetry; i++ {
-			select {
 			// Attempts start from 1.
+			select {
 			case attemptCh <- i + 1:
-			case <-doneCh:
+			case <-ctx.Done():
 				// Stop the routine.
 				return
 			}
-			time.Sleep(exponentialBackoffWait(i))
+
+			select {
+			case <-time.After(exponentialBackoffWait(i)):
+			case <-ctx.Done():
+				// Stop the routine.
+				return
+			}
 		}
 	}()
 	return attemptCh
-}
-
-// isHTTPReqErrorRetryable - is http requests error retryable, such
-// as i/o timeout, connection broken etc..
-func isHTTPReqErrorRetryable(err error) bool {
-	if err == nil {
-		return false
-	}
-	switch e := err.(type) {
-	case *url.Error:
-		switch e.Err.(type) {
-		case *net.DNSError, *net.OpError, net.UnknownNetworkError:
-			return true
-		}
-		if strings.Contains(err.Error(), "Connection closed by foreign host") {
-			return true
-		} else if strings.Contains(err.Error(), "net/http: TLS handshake timeout") {
-			// If error is - tlsHandshakeTimeoutError, retry.
-			return true
-		} else if strings.Contains(err.Error(), "i/o timeout") {
-			// If error is - tcp timeoutError, retry.
-			return true
-		} else if strings.Contains(err.Error(), "connection timed out") {
-			// If err is a net.Dial timeout, retry.
-			return true
-		} else if strings.Contains(err.Error(), "net/http: HTTP/1.x transport connection broken") {
-			// If error is transport connection broken, retry.
-			return true
-		}
-	}
-	return false
 }
 
 // List of AWS S3 error codes which are retryable.
@@ -161,6 +134,7 @@ func isS3CodeRetryable(s3Code string) (ok bool) {
 
 // List of HTTP status codes which are retryable.
 var retryableHTTPStatusCodes = map[int]struct{}{
+	http.StatusRequestTimeout:      {},
 	http.StatusTooManyRequests:     {},
 	http.StatusInternalServerError: {},
 	http.StatusBadGateway:          {},

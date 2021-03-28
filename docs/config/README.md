@@ -32,11 +32,11 @@ $ mc tree --files ~/.minio
 You can provide a custom certs directory using `--certs-dir` command line option.
 
 #### Credentials
-On MinIO admin credentials or root credentials are only allowed to be changed using ENVs namely `MINIO_ACCESS_KEY` and `MINIO_SECRET_KEY`. Using the combination of these two values MinIO encrypts the config stored at the backend.
+On MinIO admin credentials or root credentials are only allowed to be changed using ENVs namely `MINIO_ROOT_USER` and `MINIO_ROOT_PASSWORD`. Using the combination of these two values MinIO encrypts the config stored at the backend.
 
-```
-export MINIO_ACCESS_KEY=minio
-export MINIO_SECRET_KEY=minio13
+```sh
+export MINIO_ROOT_USER=minio
+export MINIO_ROOT_PASSWORD=minio13
 minio server /data
 ```
 
@@ -46,17 +46,17 @@ Additionally if you wish to change the admin credentials, then MinIO will automa
 
 > Old ENVs are never remembered in memory and are destroyed right after they are used to migrate your existing content with new credentials. You are safe to remove them after the server as successfully started, by restarting the services once again.
 
-```
-export MINIO_ACCESS_KEY=newminio
-export MINIO_SECRET_KEY=newminio123
-export MINIO_ACCESS_KEY_OLD=minio
-export MINIO_SECRET_KEY_OLD=minio123
+```sh
+export MINIO_ROOT_USER=newminio
+export MINIO_ROOT_PASSWORD=newminio123
+export MINIO_ROOT_USER_OLD=minio
+export MINIO_ROOT_PASSWORD_OLD=minio123
 minio server /data
 ```
 
-Once the migration is complete, server will automatically unset the `MINIO_ACCESS_KEY_OLD` and `MINIO_SECRET_KEY_OLD` with in the process namespace.
+Once the migration is complete, server will automatically unset the `MINIO_ROOT_USER_OLD` and `MINIO_ROOT_PASSWORD_OLD` with in the process namespace.
 
-> **NOTE: Make sure to remove `MINIO_ACCESS_KEY_OLD` and `MINIO_SECRET_KEY_OLD` in scripts or service files before next service restarts of the server to avoid double encryption of your existing contents.**
+> **NOTE: Make sure to remove `MINIO_ROOT_USER_OLD` and `MINIO_ROOT_PASSWORD_OLD` in scripts or service files before next service restarts of the server to avoid double encryption of your existing contents.**
 
 #### Region
 ```
@@ -121,6 +121,7 @@ drives*  (csv)       comma separated mountpoints e.g. "/optane1,/optane2"
 expiry   (number)    cache expiry duration in days e.g. "90"
 quota    (number)    limit cache drive usage in percentage e.g. "90"
 exclude  (csv)       comma separated wildcard exclusion patterns e.g. "bucket/*.tmp,*.exe"
+after    (number)    minimum number of access before caching an object
 comment  (sentence)  optionally add a comment to this setting
 ```
 
@@ -134,6 +135,7 @@ MINIO_CACHE_DRIVES*  (csv)       comma separated mountpoints e.g. "/optane1,/opt
 MINIO_CACHE_EXPIRY   (number)    cache expiry duration in days e.g. "90"
 MINIO_CACHE_QUOTA    (number)    limit cache drive usage in percentage e.g. "90"
 MINIO_CACHE_EXCLUDE  (csv)       comma separated wildcard exclusion patterns e.g. "bucket/*.tmp,*.exe"
+MINIO_CACHE_AFTER    (number)    minimum number of access before caching an object
 MINIO_CACHE_COMMENT  (sentence)  optionally add a comment to this setting
 ```
 
@@ -169,6 +171,29 @@ MINIO_ETCD_CLIENT_CERT_KEY  (path)      client cert key for mTLS authentication
 MINIO_ETCD_COMMENT          (sentence)  optionally add a comment to this setting
 ```
 
+### API
+By default, there is no limitation on the number of concurrent requests that a server/cluster processes at the same time. However, it is possible to impose such limitation using the API subsystem. Read more about throttling limitation in MinIO server [here](https://github.com/minio/minio/blob/master/docs/throttle/README.md).
+
+```
+KEY:
+api  manage global HTTP API call specific features, such as throttling, authentication types, etc.
+
+ARGS:
+requests_max               (number)    set the maximum number of concurrent requests, e.g. "1600"
+requests_deadline          (duration)  set the deadline for API requests waiting to be processed e.g. "1m"
+cors_allow_origin          (csv)       set comma separated list of origins allowed for CORS requests e.g. "https://example1.com,https://example2.com"
+remote_transport_deadline  (duration)  set the deadline for API requests on remote transports while proxying between federated instances e.g. "2h"
+```
+
+or environment variables
+
+```
+MINIO_API_REQUESTS_MAX               (number)    set the maximum number of concurrent requests, e.g. "1600"
+MINIO_API_REQUESTS_DEADLINE          (duration)  set the deadline for API requests waiting to be processed e.g. "1m"
+MINIO_API_CORS_ALLOW_ORIGIN          (csv)       set comma separated list of origins allowed for CORS requests e.g. "https://example1.com,https://example2.com"
+MINIO_API_REMOTE_TRANSPORT_DEADLINE  (duration)  set the deadline for API requests on remote transports while proxying between federated instances e.g. "2h"
+```
+
 #### Notifications
 Notification targets supported by MinIO are in the following list. To configure individual targets please refer to more detailed documentation [here](https://docs.min.io/docs/minio-bucket-notification-guide.html)
 
@@ -185,20 +210,119 @@ notify_elasticsearch  publish bucket notifications to Elasticsearch endpoints
 notify_redis          publish bucket notifications to Redis datastores
 ```
 
-### Accessing configuration file
-All configuration changes can be made using [`mc admin config` get/set commands](https://github.com/minio/mc/blob/master/docs/minio-admin-complete-guide.md). Following sections provide brief explanation of fields and how to customize them. A complete example of `config.json` is available [here](https://raw.githubusercontent.com/minio/minio/master/docs/config/config.sample.json)
+### Accessing configuration
+All configuration changes can be made using [`mc admin config` get/set/reset/export/import commands](https://github.com/minio/mc/blob/master/docs/minio-admin-complete-guide.md).
 
-## Environment only settings
+#### List all config keys available
+```
+~ mc admin config set myminio/
+```
 
-#### Worm
-Enable this to turn on Write-Once-Read-Many. By default it is set to `off`. Set ``MINIO_WORM=on`` environment variable to enable WORM mode.
+#### Obtain help for each key
+```
+~ mc admin config set myminio/ <key>
+```
 
-Example:
+e.g: `mc admin config set myminio/ etcd` returns available `etcd` config args
+
+```
+~ mc admin config set play/ etcd
+KEY:
+etcd  federate multiple clusters for IAM and Bucket DNS
+
+ARGS:
+endpoints*       (csv)       comma separated list of etcd endpoints e.g. "http://localhost:2379"
+path_prefix      (path)      namespace prefix to isolate tenants e.g. "customer1/"
+coredns_path     (path)      shared bucket DNS records, default is "/skydns"
+client_cert      (path)      client cert for mTLS authentication
+client_cert_key  (path)      client cert key for mTLS authentication
+comment          (sentence)  optionally add a comment to this setting
+```
+
+To get ENV equivalent for each config args use `--env` flag
+```
+~ mc admin config set play/ etcd --env
+KEY:
+etcd  federate multiple clusters for IAM and Bucket DNS
+
+ARGS:
+MINIO_ETCD_ENDPOINTS*       (csv)       comma separated list of etcd endpoints e.g. "http://localhost:2379"
+MINIO_ETCD_PATH_PREFIX      (path)      namespace prefix to isolate tenants e.g. "customer1/"
+MINIO_ETCD_COREDNS_PATH     (path)      shared bucket DNS records, default is "/skydns"
+MINIO_ETCD_CLIENT_CERT      (path)      client cert for mTLS authentication
+MINIO_ETCD_CLIENT_CERT_KEY  (path)      client cert key for mTLS authentication
+MINIO_ETCD_COMMENT          (sentence)  optionally add a comment to this setting
+```
+
+This behavior is consistent across all keys, each key self documents itself with valid examples.
+
+## Dynamic systems without restarting server
+
+The following sub-systems are dynamic i.e., configuration parameters for each sub-systems can be changed while the server is running without any restarts.
+
+```
+api                   manage global HTTP API call specific features, such as throttling, authentication types, etc.
+heal                  manage object healing frequency and bitrot verification checks
+scanner               manage namespace scanning for usage calculation, lifecycle, healing and more
+```
+
+> NOTE: if you set any of the following sub-system configuration using ENVs, dynamic behavior is not supported.
+
+### Usage scanner
+
+Data usage scanner is enabled by default. The following configuration settings allow for more staggered delay in terms of usage calculation. The scanner adapts to the system speed and completely pauses when the system is under load. It is possible to adjust the speed of the scanner and thereby the latency of updates being reflected. The delays between each operation of the scanner can be adjusted by the `mc admin config set alias/ delay=15.0`. By default the value is `10.0`. This means the scanner will sleep *10x* the time each operation takes.
+
+In most setups this will keep the scanner slow enough to not impact overall system performance. Setting the `delay` key to a *lower* value will make the scanner faster and setting it to 0 will make the scanner run at full speed (not recommended in production). Setting it to a higher value will make the scanner slower, consuming less resources with the trade off of not collecting metrics for operations like healing and disk usage as fast.
+
+```
+~ mc admin config set alias/ scanner
+KEY:
+scanner  manage namespace scanning for usage calculation, lifecycle, healing and more
+
+ARGS:
+delay     (float)     scanner delay multiplier, defaults to '10.0'
+max_wait  (duration)  maximum wait time between operations, defaults to '15s'
+```
+
+Example: Following setting will decrease the scanner speed by a factor of 3, reducing the system resource use, but increasing the latency of updates being reflected.
 
 ```sh
-export MINIO_WORM=on
-minio server /data
+~ mc admin config set alias/ scanner delay=30.0
 ```
+
+Once set the scanner settings are automatically applied without the need for server restarts.
+
+> NOTE: Data usage scanner is not supported under Gateway deployments.
+
+### Healing
+
+Healing is enabled by default. The following configuration settings allow for more staggered delay in terms of healing. The healing system by default adapts to the system speed and pauses up to '1sec' per object when the system has `max_io` number of concurrent requests. It is possible to adjust the `max_delay` and `max_io` values thereby increasing the healing speed. The delays between each operation of the healer can be adjusted by the `mc admin config set alias/ max_delay=1s` and maximum concurrent requests allowed before we start slowing things down can be configured with `mc admin config set alias/ max_io=30` . By default the wait delay is `1sec` beyond 10 concurrent operations. This means the healer will sleep *1 second* at max for each heal operation if there are more than *10* concurrent client requests.
+
+In most setups this is sufficient to heal the content after drive replacements. Setting `max_delay` to a *lower* value and setting `max_io` to a *higher* value would make heal go faster.
+
+```
+~ mc admin config set alias/ heal
+KEY:
+heal  manage object healing frequency and bitrot verification checks
+
+ARGS:
+bitrotscan  (on|off)    perform bitrot scan on disks when checking objects during scanner
+max_sleep   (duration)  maximum sleep duration between objects to slow down heal operation. eg. 2s
+max_io      (int)       maximum IO requests allowed between objects to slow down heal operation. eg. 3
+```
+
+Example: The following settings will increase the heal operation speed by allowing healing operation to run without delay up to `100` concurrent requests, and the maximum delay between each heal operation is set to `300ms`.
+
+```sh
+~ mc admin config set alias/ heal max_delay=300ms max_io=100
+```
+
+Once set the healer settings are automatically applied without the need for server restarts.
+
+> NOTE: Healing is not supported under Gateway deployments.
+
+
+## Environment only settings (not in config)
 
 ### Browser
 

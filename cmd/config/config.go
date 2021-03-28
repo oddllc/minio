@@ -24,7 +24,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/minio/minio-go/v6/pkg/set"
+	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/pkg/auth"
 	"github.com/minio/minio/pkg/env"
 	"github.com/minio/minio/pkg/madmin"
@@ -70,11 +70,15 @@ const (
 	RegionSubSys         = "region"
 	EtcdSubSys           = "etcd"
 	StorageClassSubSys   = "storage_class"
+	APISubSys            = "api"
 	CompressionSubSys    = "compression"
 	KmsVaultSubSys       = "kms_vault"
 	KmsKesSubSys         = "kms_kes"
 	LoggerWebhookSubSys  = "logger_webhook"
 	AuditWebhookSubSys   = "audit_webhook"
+	HealSubSys           = "heal"
+	ScannerSubSys        = "scanner"
+	CrawlerSubSys        = "crawler"
 
 	// Add new constants here if you add new fields to config.
 )
@@ -96,11 +100,12 @@ const (
 )
 
 // SubSystems - all supported sub-systems
-var SubSystems = set.CreateStringSet([]string{
+var SubSystems = set.CreateStringSet(
 	CredentialsSubSys,
 	RegionSubSys,
 	EtcdSubSys,
 	CacheSubSys,
+	APISubSys,
 	StorageClassSubSys,
 	CompressionSubSys,
 	KmsVaultSubSys,
@@ -110,6 +115,8 @@ var SubSystems = set.CreateStringSet([]string{
 	PolicyOPASubSys,
 	IdentityLDAPSubSys,
 	IdentityOpenIDSubSys,
+	ScannerSubSys,
+	HealSubSys,
 	NotifyAMQPSubSys,
 	NotifyESSubSys,
 	NotifyKafkaSubSys,
@@ -120,7 +127,15 @@ var SubSystems = set.CreateStringSet([]string{
 	NotifyPostgresSubSys,
 	NotifyRedisSubSys,
 	NotifyWebhookSubSys,
-}...)
+)
+
+// SubSystemsDynamic - all sub-systems that have dynamic config.
+var SubSystemsDynamic = set.CreateStringSet(
+	APISubSys,
+	CompressionSubSys,
+	ScannerSubSys,
+	HealSubSys,
+)
 
 // SubSystemsSingleTargets - subsystems which only support single target.
 var SubSystemsSingleTargets = set.CreateStringSet([]string{
@@ -128,6 +143,7 @@ var SubSystemsSingleTargets = set.CreateStringSet([]string{
 	RegionSubSys,
 	EtcdSubSys,
 	CacheSubSys,
+	APISubSys,
 	StorageClassSubSys,
 	CompressionSubSys,
 	KmsVaultSubSys,
@@ -135,6 +151,8 @@ var SubSystemsSingleTargets = set.CreateStringSet([]string{
 	PolicyOPASubSys,
 	IdentityLDAPSubSys,
 	IdentityOpenIDSubSys,
+	HealSubSys,
+	ScannerSubSys,
 }...)
 
 // Constant separators
@@ -196,6 +214,23 @@ func (kvs KVS) Empty() bool {
 	return len(kvs) == 0
 }
 
+// Keys returns the list of keys for the current KVS
+func (kvs KVS) Keys() []string {
+	var keys = make([]string, len(kvs))
+	var foundComment bool
+	for i := range kvs {
+		if kvs[i].Key == madmin.CommentKey {
+			foundComment = true
+		}
+		keys[i] = kvs[i].Key
+	}
+	// Comment KV not found, add it explicitly.
+	if !foundComment {
+		keys = append(keys, madmin.CommentKey)
+	}
+	return keys
+}
+
 func (kvs KVS) String() string {
 	var s strings.Builder
 	for _, kv := range kvs {
@@ -244,6 +279,16 @@ func (kvs KVS) Get(key string) string {
 	return ""
 }
 
+// Delete - deletes the key if present from the KV list.
+func (kvs *KVS) Delete(key string) {
+	for i, kv := range *kvs {
+		if kv.Key == key {
+			*kvs = append((*kvs)[:i], (*kvs)[i+1:]...)
+			return
+		}
+	}
+}
+
 // Lookup - lookup a key in a list of KVS
 func (kvs KVS) Lookup(key string) (string, bool) {
 	for _, kv := range kvs {
@@ -276,25 +321,29 @@ func (c Config) DelFrom(r io.Reader) error {
 	return nil
 }
 
-// ReadFrom - implements io.ReaderFrom interface
-func (c Config) ReadFrom(r io.Reader) (int64, error) {
+// ReadConfig - read content from input and write into c.
+// Returns whether all parameters were dynamic.
+func (c Config) ReadConfig(r io.Reader) (dynOnly bool, err error) {
 	var n int
 	scanner := bufio.NewScanner(r)
+	dynOnly = true
 	for scanner.Scan() {
 		// Skip any empty lines, or comment like characters
 		text := scanner.Text()
 		if text == "" || strings.HasPrefix(text, KvComment) {
 			continue
 		}
-		if err := c.SetKVS(text, DefaultKVS); err != nil {
-			return 0, err
+		dynamic, err := c.SetKVS(text, DefaultKVS)
+		if err != nil {
+			return false, err
 		}
+		dynOnly = dynOnly && dynamic
 		n += len(text)
 	}
 	if err := scanner.Err(); err != nil {
-		return 0, err
+		return false, err
 	}
-	return int64(n), nil
+	return dynOnly, nil
 }
 
 type configWriteTo struct {
@@ -412,6 +461,50 @@ func CheckValidKeys(subSys string, kv KVS, validKVS KVS) error {
 // LookupWorm - check if worm is enabled
 func LookupWorm() (bool, error) {
 	return ParseBool(env.Get(EnvWorm, EnableOff))
+}
+
+// Carries all the renamed sub-systems from their
+// previously known names
+var renamedSubsys = map[string]string{
+	CrawlerSubSys: ScannerSubSys,
+	// Add future sub-system renames
+}
+
+// Merge - merges a new config with all the
+// missing values for default configs,
+// returns a config.
+func (c Config) Merge() Config {
+	cp := New()
+	for subSys, tgtKV := range c {
+		for tgt := range tgtKV {
+			ckvs := c[subSys][tgt]
+			for _, kv := range cp[subSys][Default] {
+				_, ok := c[subSys][tgt].Lookup(kv.Key)
+				if !ok {
+					ckvs.Set(kv.Key, kv.Value)
+				}
+			}
+			if _, ok := cp[subSys]; !ok {
+				rnSubSys, ok := renamedSubsys[subSys]
+				if !ok {
+					// A config subsystem was removed or server was downgraded.
+					Logger.Info("config: ignoring unknown subsystem config %q\n", subSys)
+					continue
+				}
+				// Copy over settings from previous sub-system
+				// to newly renamed sub-system
+				for _, kv := range cp[rnSubSys][Default] {
+					_, ok := c[subSys][tgt].Lookup(kv.Key)
+					if !ok {
+						ckvs.Set(kv.Key, kv.Value)
+					}
+				}
+				subSys = rnSubSys
+			}
+			cp[subSys][tgt] = ckvs
+		}
+	}
+	return cp
 }
 
 // New - initialize a new server config.
@@ -560,30 +653,42 @@ func (c Config) Clone() Config {
 }
 
 // SetKVS - set specific key values per sub-system.
-func (c Config) SetKVS(s string, defaultKVS map[string]KVS) error {
+func (c Config) SetKVS(s string, defaultKVS map[string]KVS) (dynamic bool, err error) {
 	if len(s) == 0 {
-		return Errorf("input arguments cannot be empty")
+		return false, Errorf("input arguments cannot be empty")
 	}
 	inputs := strings.SplitN(s, KvSpaceSeparator, 2)
 	if len(inputs) <= 1 {
-		return Errorf("invalid number of arguments '%s'", s)
+		return false, Errorf("invalid number of arguments '%s'", s)
 	}
 	subSystemValue := strings.SplitN(inputs[0], SubSystemSeparator, 2)
 	if len(subSystemValue) == 0 {
-		return Errorf("invalid number of arguments %s", s)
+		return false, Errorf("invalid number of arguments %s", s)
 	}
 
 	if !SubSystems.Contains(subSystemValue[0]) {
-		return Errorf("unknown sub-system %s", s)
+		return false, Errorf("unknown sub-system %s", s)
 	}
 
 	if SubSystemsSingleTargets.Contains(subSystemValue[0]) && len(subSystemValue) == 2 {
-		return Errorf("sub-system '%s' only supports single target", subSystemValue[0])
+		return false, Errorf("sub-system '%s' only supports single target", subSystemValue[0])
+	}
+	dynamic = SubSystemsDynamic.Contains(subSystemValue[0])
+
+	tgt := Default
+	subSys := subSystemValue[0]
+	if len(subSystemValue) == 2 {
+		tgt = subSystemValue[1]
+	}
+
+	fields := madmin.KvFields(inputs[1], defaultKVS[subSys].Keys())
+	if len(fields) == 0 {
+		return false, Errorf("sub-system '%s' cannot have empty keys", subSys)
 	}
 
 	var kvs = KVS{}
 	var prevK string
-	for _, v := range strings.Fields(inputs[1]) {
+	for _, v := range fields {
 		kv := strings.SplitN(v, KvSeparator, 2)
 		if len(kv) == 0 {
 			continue
@@ -601,13 +706,7 @@ func (c Config) SetKVS(s string, defaultKVS map[string]KVS) error {
 			kvs.Set(prevK, madmin.SanitizeValue(kv[1]))
 			continue
 		}
-		return Errorf("key '%s', cannot have empty value", kv[0])
-	}
-
-	tgt := Default
-	subSys := subSystemValue[0]
-	if len(subSystemValue) == 2 {
-		tgt = subSystemValue[1]
+		return false, Errorf("key '%s', cannot have empty value", kv[0])
 	}
 
 	_, ok := kvs.Lookup(Enable)
@@ -621,6 +720,12 @@ func (c Config) SetKVS(s string, defaultKVS map[string]KVS) error {
 	currKVS, ok := c[subSys][tgt]
 	if !ok {
 		currKVS = defaultKVS[subSys]
+	} else {
+		for _, kv := range defaultKVS[subSys] {
+			if _, ok = currKVS.Lookup(kv.Key); !ok {
+				currKVS.Set(kv.Key, kv.Value)
+			}
+		}
 	}
 
 	for _, kv := range kvs {
@@ -651,11 +756,11 @@ func (c Config) SetKVS(s string, defaultKVS map[string]KVS) error {
 			// Return error only if the
 			// key is enabled, for state=off
 			// let it be empty.
-			return Errorf(
+			return false, Errorf(
 				"'%s' is not optional for '%s' sub-system, please check '%s' documentation",
 				hkv.Key, subSys, subSys)
 		}
 	}
 	c[subSys][tgt] = currKVS
-	return nil
+	return dynamic, nil
 }

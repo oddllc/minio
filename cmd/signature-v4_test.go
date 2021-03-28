@@ -46,7 +46,7 @@ func TestDoesPolicySignatureMatch(t *testing.T) {
 		// (0) It should fail if 'X-Amz-Credential' is missing.
 		{
 			form:     http.Header{},
-			expected: ErrMissingFields,
+			expected: ErrCredMalformed,
 		},
 		// (1) It should fail if the access key is incorrect.
 		{
@@ -84,7 +84,7 @@ func TestDoesPolicySignatureMatch(t *testing.T) {
 
 	// Run each test case individually.
 	for i, testCase := range testCases {
-		code := doesPolicySignatureMatch(testCase.form)
+		_, code := doesPolicySignatureMatch(testCase.form)
 		if code != testCase.expected {
 			t.Errorf("(%d) expected to get %s, instead got %s", i, niceError(testCase.expected), niceError(code))
 		}

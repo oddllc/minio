@@ -24,7 +24,7 @@ import (
 const (
 	formatComment     = `'namespace' reflects current bucket/object list and 'access' reflects a journal of object operations, defaults to 'namespace'`
 	queueDirComment   = `staging dir for undelivered messages e.g. '/home/events'`
-	queueLimitComment = `maximum limit for undelivered messages, defaults to '10000'`
+	queueLimitComment = `maximum limit for undelivered messages, defaults to '100000'`
 )
 
 // Help template inputs for all notification targets
@@ -58,6 +58,18 @@ var (
 			Description: config.DefaultComment,
 			Optional:    true,
 			Type:        "sentence",
+		},
+		config.HelpKV{
+			Key:         target.WebhookClientCert,
+			Description: "client cert for Webhook mTLS auth",
+			Optional:    true,
+			Type:        "string",
+		},
+		config.HelpKV{
+			Key:         target.WebhookClientKey,
+			Description: "client cert key for Webhook mTLS auth",
+			Optional:    true,
+			Type:        "string",
 		},
 	}
 
@@ -166,6 +178,12 @@ var (
 			Type:        "string",
 		},
 		config.HelpKV{
+			Key:         target.KafkaSASLMechanism,
+			Description: "sasl authentication mechanism, default 'plain'",
+			Optional:    true,
+			Type:        "string",
+		},
+		config.HelpKV{
 			Key:         target.KafkaTLSClientAuth,
 			Description: "clientAuth determines the Kafka server's policy for TLS client auth",
 			Optional:    true,
@@ -212,6 +230,12 @@ var (
 			Description: queueLimitComment,
 			Optional:    true,
 			Type:        "number",
+		},
+		config.HelpKV{
+			Key:         target.KafkaVersion,
+			Description: "specify the version of the Kafka cluster",
+			Optional:    true,
+			Type:        "string",
 		},
 		config.HelpKV{
 			Key:         config.Comment,
@@ -285,7 +309,7 @@ var (
 	HelpPostgres = config.HelpKVS{
 		config.HelpKV{
 			Key:         target.PostgresConnectionString,
-			Description: "Postgres server connection-string",
+			Description: `Postgres server connection-string e.g. "host=localhost port=5432 dbname=minio_events user=postgres password=password sslmode=disable"`,
 			Type:        "string",
 		},
 		config.HelpKV{
@@ -297,36 +321,6 @@ var (
 			Key:         target.PostgresFormat,
 			Description: formatComment,
 			Type:        "namespace*|access",
-		},
-		config.HelpKV{
-			Key:         target.PostgresHost,
-			Description: "Postgres server hostname (used only if `connection_string` is empty)",
-			Optional:    true,
-			Type:        "hostname",
-		},
-		config.HelpKV{
-			Key:         target.PostgresPort,
-			Description: "Postgres server port, defaults to `5432` (used only if `connection_string` is empty)",
-			Optional:    true,
-			Type:        "port",
-		},
-		config.HelpKV{
-			Key:         target.PostgresUsername,
-			Description: "database username (used only if `connection_string` is empty)",
-			Optional:    true,
-			Type:        "string",
-		},
-		config.HelpKV{
-			Key:         target.PostgresPassword,
-			Description: "database password (used only if `connection_string` is empty)",
-			Optional:    true,
-			Type:        "string",
-		},
-		config.HelpKV{
-			Key:         target.PostgresDatabase,
-			Description: "database name (used only if `connection_string` is empty)",
-			Optional:    true,
-			Type:        "string",
 		},
 		config.HelpKV{
 			Key:         target.PostgresQueueDir,
@@ -346,12 +340,19 @@ var (
 			Optional:    true,
 			Type:        "sentence",
 		},
+		config.HelpKV{
+			Key:         target.PostgresMaxOpenConnections,
+			Description: "To set the maximum number of open connections to the database. The value is set to `2` by default.",
+			Optional:    true,
+			Type:        "number",
+		},
 	}
 
 	HelpMySQL = config.HelpKVS{
 		config.HelpKV{
 			Key:         target.MySQLDSNString,
-			Description: "MySQL data-source-name connection string",
+			Description: `MySQL data-source-name connection string e.g. "<user>:<password>@tcp(<host>:<port>)/<database>"`,
+			Optional:    true,
 			Type:        "string",
 		},
 		config.HelpKV{
@@ -363,36 +364,6 @@ var (
 			Key:         target.MySQLFormat,
 			Description: formatComment,
 			Type:        "namespace*|access",
-		},
-		config.HelpKV{
-			Key:         target.MySQLHost,
-			Description: "MySQL server hostname (used only if `dsn_string` is empty)",
-			Optional:    true,
-			Type:        "hostname",
-		},
-		config.HelpKV{
-			Key:         target.MySQLPort,
-			Description: "MySQL server port (used only if `dsn_string` is empty)",
-			Optional:    true,
-			Type:        "port",
-		},
-		config.HelpKV{
-			Key:         target.MySQLUsername,
-			Description: "database username (used only if `dsn_string` is empty)",
-			Optional:    true,
-			Type:        "string",
-		},
-		config.HelpKV{
-			Key:         target.MySQLPassword,
-			Description: "database password (used only if `dsn_string` is empty)",
-			Optional:    true,
-			Type:        "string",
-		},
-		config.HelpKV{
-			Key:         target.MySQLDatabase,
-			Description: "database name (used only if `dsn_string` is empty)",
-			Optional:    true,
-			Type:        "string",
 		},
 		config.HelpKV{
 			Key:         target.MySQLQueueDir,
@@ -411,6 +382,12 @@ var (
 			Description: config.DefaultComment,
 			Optional:    true,
 			Type:        "sentence",
+		},
+		config.HelpKV{
+			Key:         target.MySQLMaxOpenConnections,
+			Description: "To set the maximum number of open connections to the database. The value is set to `2` by default.",
+			Optional:    true,
+			Type:        "number",
 		},
 	}
 
@@ -593,6 +570,18 @@ var (
 			Description: queueLimitComment,
 			Optional:    true,
 			Type:        "number",
+		},
+		config.HelpKV{
+			Key:         target.ElasticUsername,
+			Description: "username for Elasticsearch basic-auth",
+			Optional:    true,
+			Type:        "string",
+		},
+		config.HelpKV{
+			Key:         target.ElasticPassword,
+			Description: "password for Elasticsearch basic-auth",
+			Optional:    true,
+			Type:        "string",
 		},
 		config.HelpKV{
 			Key:         config.Comment,

@@ -17,7 +17,6 @@
 package azure
 
 import (
-	"context"
 	"encoding/base64"
 	"fmt"
 	"net/http"
@@ -84,7 +83,7 @@ func TestS3MetaToAzureProperties(t *testing.T) {
 		"X_Amz_Matdesc":    "{}",
 		"X_Amz_Iv":         "eWmyryl8kq+EVnnsE7jpOg==",
 	}
-	meta, _, err := s3MetaToAzureProperties(context.Background(), headers)
+	meta, _, err := s3MetaToAzureProperties(minio.GlobalContext, headers)
 	if err != nil {
 		t.Fatalf("Test failed, with %s", err)
 	}
@@ -94,7 +93,7 @@ func TestS3MetaToAzureProperties(t *testing.T) {
 	headers = map[string]string{
 		"invalid--meta": "value",
 	}
-	_, _, err = s3MetaToAzureProperties(context.Background(), headers)
+	_, _, err = s3MetaToAzureProperties(minio.GlobalContext, headers)
 	if err != nil {
 		if _, ok := err.(minio.UnsupportedMetadata); !ok {
 			t.Fatalf("Test failed with unexpected error %s, expected UnsupportedMetadata", err)
@@ -104,7 +103,7 @@ func TestS3MetaToAzureProperties(t *testing.T) {
 	headers = map[string]string{
 		"content-md5": "Dce7bmCX61zvxzP5QmfelQ==",
 	}
-	_, props, err := s3MetaToAzureProperties(context.Background(), headers)
+	_, props, err := s3MetaToAzureProperties(minio.GlobalContext, headers)
 	if err != nil {
 		t.Fatalf("Test failed, with %s", err)
 	}
@@ -240,43 +239,6 @@ func TestAzureCodesToObjectError(t *testing.T) {
 	}
 }
 
-func TestAnonErrToObjectErr(t *testing.T) {
-	testCases := []struct {
-		name       string
-		statusCode int
-		params     []string
-		wantErr    error
-	}{
-		{"ObjectNotFound",
-			http.StatusNotFound,
-			[]string{"testBucket", "testObject"},
-			minio.ObjectNotFound{Bucket: "testBucket", Object: "testObject"},
-		},
-		{"BucketNotFound",
-			http.StatusNotFound,
-			[]string{"testBucket", ""},
-			minio.BucketNotFound{Bucket: "testBucket"},
-		},
-		{"ObjectNameInvalid",
-			http.StatusBadRequest,
-			[]string{"testBucket", "testObject"},
-			minio.ObjectNameInvalid{Bucket: "testBucket", Object: "testObject"},
-		},
-		{"BucketNameInvalid",
-			http.StatusBadRequest,
-			[]string{"testBucket", ""},
-			minio.BucketNameInvalid{Bucket: "testBucket"},
-		},
-	}
-	for _, test := range testCases {
-		t.Run(test.name, func(t *testing.T) {
-			if err := minio.AnonErrToObjectErr(test.statusCode, test.params...); !reflect.DeepEqual(err, test.wantErr) {
-				t.Errorf("anonErrToObjectErr() error = %v, wantErr %v", err, test.wantErr)
-			}
-		})
-	}
-}
-
 func TestCheckAzureUploadID(t *testing.T) {
 	invalidUploadIDs := []string{
 		"123456789abcdefg",
@@ -286,7 +248,7 @@ func TestCheckAzureUploadID(t *testing.T) {
 	}
 
 	for _, uploadID := range invalidUploadIDs {
-		if err := checkAzureUploadID(context.Background(), uploadID); err == nil {
+		if err := checkAzureUploadID(minio.GlobalContext, uploadID); err == nil {
 			t.Fatalf("%s: expected: <error>, got: <nil>", uploadID)
 		}
 	}
@@ -297,7 +259,7 @@ func TestCheckAzureUploadID(t *testing.T) {
 	}
 
 	for _, uploadID := range validUploadIDs {
-		if err := checkAzureUploadID(context.Background(), uploadID); err != nil {
+		if err := checkAzureUploadID(minio.GlobalContext, uploadID); err != nil {
 			t.Fatalf("%s: expected: <nil>, got: %s", uploadID, err)
 		}
 	}

@@ -160,9 +160,6 @@ func TestValue_Equals(t *testing.T) {
 }
 
 func TestValue_CSVString(t *testing.T) {
-	type fields struct {
-		value interface{}
-	}
 	type test struct {
 		name    string
 		want    string
@@ -562,7 +559,8 @@ func TestValue_bytesToFloat(t *testing.T) {
 				value: tt.fields.value,
 			}
 			got, got1 := v.bytesToFloat()
-			if got != tt.want {
+			diff := math.Abs(got - tt.want)
+			if diff > floatCmpTolerance {
 				t.Errorf("bytesToFloat() got = %v, want %v", got, tt.want)
 			}
 			if got1 != tt.wantOK {

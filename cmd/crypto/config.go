@@ -16,12 +16,15 @@ package crypto
 
 import (
 	"errors"
-	"fmt"
+	"math/rand"
 	"net/http"
+	"os"
 	"reflect"
 	"strconv"
+	"strings"
 
 	"github.com/minio/minio/cmd/config"
+	"github.com/minio/minio/pkg/ellipses"
 	"github.com/minio/minio/pkg/env"
 	xnet "github.com/minio/minio/pkg/net"
 )
@@ -168,7 +171,8 @@ const (
 
 const (
 	// EnvKMSKesEndpoint is the environment variable used to specify
-	// the kes server HTTPS endpoint.
+	// one or multiple KES server HTTPS endpoints. The individual
+	// endpoints should be separated by ','.
 	EnvKMSKesEndpoint = "MINIO_KMS_KES_ENDPOINT"
 
 	// EnvKMSKesKeyFile is the environment variable used to specify
@@ -217,16 +221,36 @@ func LookupKesConfig(kvs config.KVS) (KesConfig, error) {
 	kesCfg := KesConfig{}
 
 	endpointStr := env.Get(EnvKMSKesEndpoint, kvs.Get(KMSKesEndpoint))
-	if endpointStr != "" {
-		// Lookup kes configuration & overwrite config entry if ENV var is present
-		endpoint, err := xnet.ParseHTTPURL(endpointStr)
+	var endpoints []string
+	for _, endpoint := range strings.Split(endpointStr, ",") {
+		if strings.TrimSpace(endpoint) == "" {
+			continue
+		}
+		if !ellipses.HasEllipses(endpoint) {
+			endpoints = append(endpoints, endpoint)
+			continue
+		}
+		pattern, err := ellipses.FindEllipsesPatterns(endpoint)
 		if err != nil {
 			return kesCfg, err
 		}
-		endpointStr = endpoint.String()
+		for _, p := range pattern {
+			endpoints = append(endpoints, p.Expand()...)
+		}
+	}
+	if len(endpoints) == 0 {
+		return kesCfg, nil
 	}
 
-	kesCfg.Endpoint = endpointStr
+	randNum := rand.Intn(len(endpoints) + 1) // We add 1 b/c len(endpoints) may be 0: See: rand.Intn docs
+	kesCfg.Endpoint = make([]string, len(endpoints))
+	for i, endpoint := range endpoints {
+		endpoint, err := xnet.ParseHTTPURL(endpoint)
+		if err != nil {
+			return kesCfg, err
+		}
+		kesCfg.Endpoint[(randNum+i)%len(endpoints)] = endpoint.String()
+	}
 	kesCfg.KeyFile = env.Get(EnvKMSKesKeyFile, kvs.Get(KMSKesKeyFile))
 	kesCfg.CertFile = env.Get(EnvKMSKesCertFile, kvs.Get(KMSKesCertFile))
 	kesCfg.CAPath = env.Get(EnvKMSKesCAPath, kvs.Get(KMSKesCAPath))
@@ -342,7 +366,7 @@ func LookupVaultConfig(kvs config.KVS) (VaultConfig, error) {
 	if keyVersion := env.Get(EnvKMSVaultKeyVersion, kvs.Get(KMSVaultKeyVersion)); keyVersion != "" {
 		vcfg.Key.Version, err = strconv.Atoi(keyVersion)
 		if err != nil {
-			return vcfg, fmt.Errorf("Unable to parse VaultKeyVersion value (`%s`)", keyVersion)
+			return vcfg, Errorf("Unable to parse VaultKeyVersion value (`%s`)", keyVersion)
 		}
 	}
 
@@ -387,6 +411,9 @@ func NewKMS(cfg KMSConfig) (kms KMS, err error) {
 	} else if cfg.Vault.Enabled && cfg.Kes.Enabled {
 		return kms, errors.New("Ambiguous KMS configuration: vault configuration and kes configuration are provided at the same time")
 	} else if cfg.Vault.Enabled {
+		if v, ok := os.LookupEnv("MINIO_KMS_VAULT_DEPRECATION"); !ok || v != "off" { // TODO(aead): Remove once Vault support has been removed
+			return kms, errors.New("Hashicorp Vault is deprecated and will be removed Oct. 2021. To temporarily enable Hashicorp Vault support, set MINIO_KMS_VAULT_DEPRECATION=off")
+		}
 		kms, err = NewVault(cfg.Vault)
 		if err != nil {
 			return kms, err

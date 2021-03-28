@@ -17,77 +17,31 @@
 package cmd
 
 import (
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"fmt"
 	"os"
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/minio/minio/pkg/color"
 	"github.com/minio/minio/pkg/madmin"
 )
 
 // Tests if we generate storage info.
 func TestStorageInfoMsg(t *testing.T) {
 	infoStorage := StorageInfo{}
-	infoStorage.Backend.Type = BackendErasure
-	infoStorage.Backend.OnlineDisks = madmin.BackendDisks{"127.0.0.1:9000": 4, "127.0.0.1:9001": 3}
-	infoStorage.Backend.OfflineDisks = madmin.BackendDisks{"127.0.0.1:9000": 0, "127.0.0.1:9001": 1}
+	infoStorage.Disks = []madmin.Disk{
+		{Endpoint: "http://127.0.0.1:9000/data/1/", State: madmin.DriveStateOk},
+		{Endpoint: "http://127.0.0.1:9000/data/2/", State: madmin.DriveStateOk},
+		{Endpoint: "http://127.0.0.1:9000/data/3/", State: madmin.DriveStateOk},
+		{Endpoint: "http://127.0.0.1:9000/data/4/", State: madmin.DriveStateOk},
+		{Endpoint: "http://127.0.0.1:9001/data/1/", State: madmin.DriveStateOk},
+		{Endpoint: "http://127.0.0.1:9001/data/2/", State: madmin.DriveStateOk},
+		{Endpoint: "http://127.0.0.1:9001/data/3/", State: madmin.DriveStateOk},
+		{Endpoint: "http://127.0.0.1:9001/data/4/", State: madmin.DriveStateOffline},
+	}
+	infoStorage.Backend.Type = madmin.Erasure
 
 	if msg := getStorageInfoMsg(infoStorage); !strings.Contains(msg, "7 Online, 1 Offline") {
 		t.Fatal("Unexpected storage info message, found:", msg)
-	}
-}
-
-// Tests if certificate expiry warning will be printed
-func TestCertificateExpiryInfo(t *testing.T) {
-	// given
-	var expiredDate = time.Now().Add(time.Hour * 24 * (30 - 1)) // 29 days.
-
-	var fakeCerts = []*x509.Certificate{
-		{
-			NotAfter: expiredDate,
-			Subject: pkix.Name{
-				CommonName: "Test cert",
-			},
-		},
-	}
-
-	expectedMsg := color.Blue("\nCertificate expiry info:\n") +
-		color.Bold(fmt.Sprintf("#1 Test cert will expire on %s\n", expiredDate))
-
-	// When
-	msg := getCertificateChainMsg(fakeCerts)
-
-	// Then
-	if msg != expectedMsg {
-		t.Fatalf("Expected message was: %s, got: %s", expectedMsg, msg)
-	}
-}
-
-// Tests if certificate expiry warning will not be printed if certificate not expired
-func TestCertificateNotExpired(t *testing.T) {
-	// given
-	var expiredDate = time.Now().Add(time.Hour * 24 * (30 + 1)) // 31 days.
-
-	var fakeCerts = []*x509.Certificate{
-		{
-			NotAfter: expiredDate,
-			Subject: pkix.Name{
-				CommonName: "Test cert",
-			},
-		},
-	}
-
-	// when
-	msg := getCertificateChainMsg(fakeCerts)
-
-	// then
-	if msg != "" {
-		t.Fatalf("Expected empty message was: %s", msg)
 	}
 }
 
@@ -156,5 +110,5 @@ func TestPrintStartupMessage(t *testing.T) {
 	}
 
 	apiEndpoints := []string{"http://127.0.0.1:9000"}
-	printStartupMessage(apiEndpoints)
+	printStartupMessage(apiEndpoints, nil)
 }

@@ -40,9 +40,39 @@ var (
 		},
 		config.HelpKV{
 			Key:         Exclude,
-			Description: `comma separated wildcard exclusion patterns e.g. "bucket/*.tmp,*.exe"`,
+			Description: `exclude cache for following patterns e.g. "bucket/*.tmp,*.exe"`,
 			Optional:    true,
 			Type:        "csv",
+		},
+		config.HelpKV{
+			Key:         After,
+			Description: `minimum number of access before caching an object`,
+			Optional:    true,
+			Type:        "number",
+		},
+		config.HelpKV{
+			Key:         WatermarkLow,
+			Description: `% of cache use at which to stop cache eviction`,
+			Optional:    true,
+			Type:        "number",
+		},
+		config.HelpKV{
+			Key:         WatermarkHigh,
+			Description: `% of cache use at which to start cache eviction`,
+			Optional:    true,
+			Type:        "number",
+		},
+		config.HelpKV{
+			Key:         Range,
+			Description: `set to "on" or "off" caching of independent range requests per object, defaults to "on"`,
+			Optional:    true,
+			Type:        "string",
+		},
+		config.HelpKV{
+			Key:         Commit,
+			Description: `set to control cache commit behavior, defaults to "writethrough"`,
+			Optional:    true,
+			Type:        "string",
 		},
 		config.HelpKV{
 			Key:         config.Comment,

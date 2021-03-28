@@ -21,28 +21,37 @@ import (
 )
 
 const (
-	lockRESTVersion       = "v2"
-	lockRESTVersionPrefix = SlashSeparator + "v2"
+	lockRESTVersion       = "v6" // Add Refresh API
+	lockRESTVersionPrefix = SlashSeparator + lockRESTVersion
 	lockRESTPrefix        = minioReservedBucketPath + "/lock"
 )
 
 const (
-	lockRESTMethodLock    = "/lock"
-	lockRESTMethodRLock   = "/rlock"
-	lockRESTMethodUnlock  = "/unlock"
-	lockRESTMethodRUnlock = "/runlock"
-	lockRESTMethodExpired = "/expired"
+	lockRESTMethodHealth      = "/health"
+	lockRESTMethodRefresh     = "/refresh"
+	lockRESTMethodLock        = "/lock"
+	lockRESTMethodRLock       = "/rlock"
+	lockRESTMethodUnlock      = "/unlock"
+	lockRESTMethodRUnlock     = "/runlock"
+	lockRESTMethodForceUnlock = "/force-unlock"
+
+	// lockRESTOwner represents owner UUID
+	lockRESTOwner = "owner"
 
 	// Unique ID of lock/unlock request.
 	lockRESTUID = "uid"
+
 	// Source contains the line number, function and file name of the code
 	// on the client node that requested the lock.
 	lockRESTSource = "source"
-	// Resource contains a entity to be locked/unlocked.
-	lockRESTResource = "resource"
+
+	// Quroum value to be saved along lock requester info, useful
+	// in verifying stale locks
+	lockRESTQuorum = "quorum"
 )
 
 var (
-	errLockConflict   = errors.New("lock conflict")
-	errLockNotExpired = errors.New("lock not expired")
+	errLockConflict       = errors.New("lock conflict")
+	errLockNotInitialized = errors.New("lock not initialized")
+	errLockNotFound       = errors.New("lock not found")
 )

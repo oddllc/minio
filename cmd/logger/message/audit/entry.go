@@ -49,29 +49,34 @@ type Entry struct {
 	ReqQuery   map[string]string      `json:"requestQuery,omitempty"`
 	ReqHeader  map[string]string      `json:"requestHeader,omitempty"`
 	RespHeader map[string]string      `json:"responseHeader,omitempty"`
+	Tags       map[string]interface{} `json:"tags,omitempty"`
 }
 
 // ToEntry - constructs an audit entry object.
 func ToEntry(w http.ResponseWriter, r *http.Request, reqClaims map[string]interface{}, deploymentID string) Entry {
-	reqQuery := make(map[string]string)
-	for k, v := range r.URL.Query() {
+	q := r.URL.Query()
+	reqQuery := make(map[string]string, len(q))
+	for k, v := range q {
 		reqQuery[k] = strings.Join(v, ",")
 	}
-	reqHeader := make(map[string]string)
+	reqHeader := make(map[string]string, len(r.Header))
 	for k, v := range r.Header {
 		reqHeader[k] = strings.Join(v, ",")
 	}
-	respHeader := make(map[string]string)
-	for k, v := range w.Header() {
+	wh := w.Header()
+	respHeader := make(map[string]string, len(wh))
+	for k, v := range wh {
 		respHeader[k] = strings.Join(v, ",")
 	}
-	respHeader[xhttp.ETag] = strings.Trim(respHeader[xhttp.ETag], `"`)
+	if etag := respHeader[xhttp.ETag]; etag != "" {
+		respHeader[xhttp.ETag] = strings.Trim(etag, `"`)
+	}
 
 	entry := Entry{
 		Version:      Version,
 		DeploymentID: deploymentID,
 		RemoteHost:   handlers.GetSourceIP(r),
-		RequestID:    w.Header().Get(xhttp.AmzRequestID),
+		RequestID:    wh.Get(xhttp.AmzRequestID),
 		UserAgent:    r.UserAgent(),
 		Time:         time.Now().UTC().Format(time.RFC3339Nano),
 		ReqQuery:     reqQuery,

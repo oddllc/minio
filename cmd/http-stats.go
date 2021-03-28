@@ -17,73 +17,72 @@
 package cmd
 
 import (
-	"fmt"
 	"net/http"
 	"strings"
 	"sync"
-	"time"
+	"sync/atomic"
 
+	"github.com/minio/minio/cmd/logger"
 	"github.com/prometheus/client_golang/prometheus"
-	"go.uber.org/atomic"
 )
 
 // ConnStats - Network statistics
 // Count total input/output transferred bytes during
 // the server's life.
 type ConnStats struct {
-	totalInputBytes  atomic.Uint64
-	totalOutputBytes atomic.Uint64
-	s3InputBytes     atomic.Uint64
-	s3OutputBytes    atomic.Uint64
+	totalInputBytes  uint64
+	totalOutputBytes uint64
+	s3InputBytes     uint64
+	s3OutputBytes    uint64
 }
 
 // Increase total input bytes
 func (s *ConnStats) incInputBytes(n int) {
-	s.totalInputBytes.Add(uint64(n))
+	atomic.AddUint64(&s.totalInputBytes, uint64(n))
 }
 
 // Increase total output bytes
 func (s *ConnStats) incOutputBytes(n int) {
-	s.totalOutputBytes.Add(uint64(n))
+	atomic.AddUint64(&s.totalOutputBytes, uint64(n))
 }
 
 // Return total input bytes
 func (s *ConnStats) getTotalInputBytes() uint64 {
-	return s.totalInputBytes.Load()
+	return atomic.LoadUint64(&s.totalInputBytes)
 }
 
 // Return total output bytes
 func (s *ConnStats) getTotalOutputBytes() uint64 {
-	return s.totalOutputBytes.Load()
+	return atomic.LoadUint64(&s.totalOutputBytes)
 }
 
 // Increase outbound input bytes
 func (s *ConnStats) incS3InputBytes(n int) {
-	s.s3InputBytes.Add(uint64(n))
+	atomic.AddUint64(&s.s3InputBytes, uint64(n))
 }
 
 // Increase outbound output bytes
 func (s *ConnStats) incS3OutputBytes(n int) {
-	s.s3OutputBytes.Add(uint64(n))
+	atomic.AddUint64(&s.s3OutputBytes, uint64(n))
 }
 
 // Return outbound input bytes
 func (s *ConnStats) getS3InputBytes() uint64 {
-	return s.s3InputBytes.Load()
+	return atomic.LoadUint64(&s.s3InputBytes)
 }
 
 // Return outbound output bytes
 func (s *ConnStats) getS3OutputBytes() uint64 {
-	return s.s3OutputBytes.Load()
+	return atomic.LoadUint64(&s.s3OutputBytes)
 }
 
 // Return connection stats (total input/output bytes and total s3 input/output bytes)
 func (s *ConnStats) toServerConnStats() ServerConnStats {
 	return ServerConnStats{
-		TotalInputBytes:  s.getTotalInputBytes(),
-		TotalOutputBytes: s.getTotalOutputBytes(),
-		S3InputBytes:     s.getS3InputBytes(),
-		S3OutputBytes:    s.getS3OutputBytes(),
+		TotalInputBytes:  s.getTotalInputBytes(),  // Traffic including reserved bucket
+		TotalOutputBytes: s.getTotalOutputBytes(), // Traffic including reserved bucket
+		S3InputBytes:     s.getS3InputBytes(),     // Traffic for client buckets
+		S3OutputBytes:    s.getS3OutputBytes(),    // Traffic for client buckets
 	}
 }
 
@@ -95,36 +94,32 @@ func newConnStats() *ConnStats {
 // HTTPAPIStats holds statistics information about
 // a given API in the requests.
 type HTTPAPIStats struct {
-	APIStats map[string]int
+	apiStats map[string]int
 	sync.RWMutex
 }
 
 // Inc increments the api stats counter.
 func (stats *HTTPAPIStats) Inc(api string) {
-	stats.Lock()
-	defer stats.Unlock()
 	if stats == nil {
 		return
 	}
-	if stats.APIStats == nil {
-		stats.APIStats = make(map[string]int)
+	stats.Lock()
+	defer stats.Unlock()
+	if stats.apiStats == nil {
+		stats.apiStats = make(map[string]int)
 	}
-	if _, ok := stats.APIStats[api]; ok {
-		stats.APIStats[api]++
-		return
-	}
-	stats.APIStats[api] = 1
+	stats.apiStats[api]++
 }
 
 // Dec increments the api stats counter.
 func (stats *HTTPAPIStats) Dec(api string) {
-	stats.Lock()
-	defer stats.Unlock()
 	if stats == nil {
 		return
 	}
-	if val, ok := stats.APIStats[api]; ok && val > 0 {
-		stats.APIStats[api]--
+	stats.Lock()
+	defer stats.Unlock()
+	if val, ok := stats.apiStats[api]; ok && val > 0 {
+		stats.apiStats[api]--
 	}
 }
 
@@ -132,55 +127,69 @@ func (stats *HTTPAPIStats) Dec(api string) {
 func (stats *HTTPAPIStats) Load() map[string]int {
 	stats.Lock()
 	defer stats.Unlock()
-	return stats.APIStats
+	var apiStats = make(map[string]int, len(stats.apiStats))
+	for k, v := range stats.apiStats {
+		apiStats[k] = v
+	}
+	return apiStats
 }
 
 // HTTPStats holds statistics information about
 // HTTP requests made by all clients
 type HTTPStats struct {
+	s3RequestsInQueue int32
 	currentS3Requests HTTPAPIStats
 	totalS3Requests   HTTPAPIStats
 	totalS3Errors     HTTPAPIStats
+	totalS3Canceled   HTTPAPIStats
 }
 
-func durationStr(totalDuration, totalCount float64) string {
-	return fmt.Sprint(time.Duration(totalDuration/totalCount) * time.Second)
+func (st *HTTPStats) addRequestsInQueue(i int32) {
+	atomic.AddInt32(&st.s3RequestsInQueue, i)
 }
 
 // Converts http stats into struct to be sent back to the client.
 func (st *HTTPStats) toServerHTTPStats() ServerHTTPStats {
 	serverStats := ServerHTTPStats{}
-
+	serverStats.S3RequestsInQueue = atomic.LoadInt32(&st.s3RequestsInQueue)
 	serverStats.CurrentS3Requests = ServerHTTPAPIStats{
 		APIStats: st.currentS3Requests.Load(),
 	}
-
 	serverStats.TotalS3Requests = ServerHTTPAPIStats{
 		APIStats: st.totalS3Requests.Load(),
 	}
-
 	serverStats.TotalS3Errors = ServerHTTPAPIStats{
 		APIStats: st.totalS3Errors.Load(),
+	}
+	serverStats.TotalS3Canceled = ServerHTTPAPIStats{
+		APIStats: st.totalS3Canceled.Load(),
 	}
 	return serverStats
 }
 
 // Update statistics from http request and response data
-func (st *HTTPStats) updateStats(api string, r *http.Request, w *recordAPIStats, durationSecs float64) {
+func (st *HTTPStats) updateStats(api string, r *http.Request, w *logger.ResponseWriter) {
 	// A successful request has a 2xx response code
-	successReq := (w.respStatusCode >= 200 && w.respStatusCode < 300)
+	successReq := w.StatusCode >= 200 && w.StatusCode < 300
 
-	if w.isS3Request && !strings.HasSuffix(r.URL.Path, prometheusMetricsPath) {
+	if !strings.HasSuffix(r.URL.Path, prometheusMetricsPathLegacy) ||
+		!strings.HasSuffix(r.URL.Path, prometheusMetricsV2ClusterPath) ||
+		!strings.HasSuffix(r.URL.Path, prometheusMetricsV2NodePath) {
 		st.totalS3Requests.Inc(api)
-		if !successReq && w.respStatusCode != 0 {
-			st.totalS3Errors.Inc(api)
+		if !successReq {
+			switch w.StatusCode {
+			case 0:
+			case 499:
+				// 499 is a good error, shall be counted at canceled.
+				st.totalS3Canceled.Inc(api)
+			default:
+				st.totalS3Errors.Inc(api)
+			}
 		}
 	}
 
-	if w.isS3Request && r.Method == "GET" {
-		// Increment the prometheus http request response histogram with appropriate label
-		httpRequestsDuration.With(prometheus.Labels{"api": api}).Observe(durationSecs)
-	}
+	// Increment the prometheus http request response histogram with appropriate label
+	httpRequestsDuration.With(prometheus.Labels{"api": api}).Observe(w.TimeToFirstByte.Seconds())
 }
 
 // Prepare new HTTPStats structure

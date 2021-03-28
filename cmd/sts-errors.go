@@ -19,7 +19,6 @@ package cmd
 import (
 	"context"
 	"encoding/xml"
-	"fmt"
 	"net/http"
 
 	xhttp "github.com/minio/minio/cmd/http"
@@ -27,22 +26,33 @@ import (
 )
 
 // writeSTSErrorRespone writes error headers
-func writeSTSErrorResponse(ctx context.Context, w http.ResponseWriter, errCode STSErrorCode, errCtxt error) {
-	err := stsErrCodes.ToSTSErr(errCode)
+func writeSTSErrorResponse(ctx context.Context, w http.ResponseWriter, isErrCodeSTS bool, errCode STSErrorCode, errCtxt error) {
+	var err STSError
+	if isErrCodeSTS {
+		err = stsErrCodes.ToSTSErr(errCode)
+	}
+	if err.Code == "InternalError" || !isErrCodeSTS {
+		aerr := getAPIError(APIErrorCode(errCode))
+		if aerr.Code != "InternalError" {
+			err.Code = aerr.Code
+			err.Description = aerr.Description
+			err.HTTPStatusCode = aerr.HTTPStatusCode
+		}
+	}
 	// Generate error response.
 	stsErrorResponse := STSErrorResponse{}
 	stsErrorResponse.Error.Code = err.Code
 	stsErrorResponse.RequestID = w.Header().Get(xhttp.AmzRequestID)
 	stsErrorResponse.Error.Message = err.Description
 	if errCtxt != nil {
-		stsErrorResponse.Error.Message = fmt.Sprintf("%v", errCtxt)
+		stsErrorResponse.Error.Message = errCtxt.Error()
 	}
-	logKind := logger.All
+	var logKind logger.Kind
 	switch errCode {
 	case ErrSTSInternalError, ErrSTSNotInitialized:
 		logKind = logger.Minio
 	default:
-		logKind = logger.Application
+		logKind = logger.All
 	}
 	logger.LogIf(ctx, errCtxt, logKind)
 	encodedErrorResponse := encodeResponse(stsErrorResponse)

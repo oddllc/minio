@@ -57,7 +57,7 @@ func reliableRemoveAll(dirPath string) (err error) {
 	i := 0
 	for {
 		// Removes all the directories and files.
-		if err = os.RemoveAll(dirPath); err != nil {
+		if err = RemoveAll(dirPath); err != nil {
 			// Retry only for the first retryable error.
 			if isSysErrNotEmpty(err) && i == 0 {
 				i++
@@ -101,9 +101,9 @@ func reliableMkdirAll(dirPath string, mode os.FileMode) (err error) {
 	i := 0
 	for {
 		// Creates all the parent directories, with mode 0777 mkdir honors system umask.
-		if err = os.MkdirAll(dirPath, mode); err != nil {
+		if err = MkdirAll(dirPath, mode); err != nil {
 			// Retry only for the first retryable error.
-			if os.IsNotExist(err) && i == 0 {
+			if osIsNotExist(err) && i == 0 {
 				i++
 				continue
 			}
@@ -131,7 +131,11 @@ func renameAll(srcFilePath, dstFilePath string) (err error) {
 
 	if err = reliableRename(srcFilePath, dstFilePath); err != nil {
 		switch {
-		case isSysErrNotDir(err):
+		case isSysErrNotDir(err) && !osIsNotExist(err):
+			// Windows can have both isSysErrNotDir(err) and osIsNotExist(err) returning
+			// true if the source file path contains an inexistant directory. In that case,
+			// we want to return errFileNotFound instead, which will honored in subsequent
+			// switch cases
 			return errFileAccessDenied
 		case isSysErrPathNotFound(err):
 			// This is a special case should be handled only for
@@ -140,9 +144,9 @@ func renameAll(srcFilePath, dstFilePath string) (err error) {
 			return errFileAccessDenied
 		case isSysErrCrossDevice(err):
 			return fmt.Errorf("%w (%s)->(%s)", errCrossDeviceLink, srcFilePath, dstFilePath)
-		case os.IsNotExist(err):
+		case osIsNotExist(err):
 			return errFileNotFound
-		case os.IsExist(err):
+		case osIsExist(err):
 			// This is returned only when destination is a directory and we
 			// are attempting a rename from file to directory.
 			return errIsNotRegular
@@ -162,9 +166,9 @@ func reliableRename(srcFilePath, dstFilePath string) (err error) {
 	i := 0
 	for {
 		// After a successful parent directory create attempt a renameAll.
-		if err = os.Rename(srcFilePath, dstFilePath); err != nil {
+		if err = Rename(srcFilePath, dstFilePath); err != nil {
 			// Retry only for the first retryable error.
-			if os.IsNotExist(err) && i == 0 {
+			if osIsNotExist(err) && i == 0 {
 				i++
 				continue
 			}

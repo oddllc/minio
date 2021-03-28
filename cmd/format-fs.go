@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math/rand"
 	"os"
 	"path"
 	"time"
@@ -74,7 +75,7 @@ func newFormatFSV1() (format *formatFSV1) {
 }
 
 // Returns the field formatMetaV1.Format i.e the string "fs" which is never likely to change.
-// We do not use this function in XL to get the format as the file is not fcntl-locked on XL.
+// We do not use this function in Erasure to get the format as the file is not fcntl-locked on Erasure.
 func formatMetaGetFormatBackendFS(r io.ReadSeeker) (string, error) {
 	format := &formatMetaV1{}
 	if err := jsonLoad(r, format); err != nil {
@@ -190,7 +191,7 @@ func initFormatFS(ctx context.Context, fsPath string) (rlk *lock.RLockedFile, er
 	fsFormatPath := pathJoin(fsPath, minioMetaBucket, formatConfigFile)
 
 	// Add a deployment ID, if it does not exist.
-	if err := formatFSFixDeploymentID(fsFormatPath); err != nil {
+	if err := formatFSFixDeploymentID(ctx, fsFormatPath); err != nil {
 		return nil, err
 	}
 
@@ -210,7 +211,7 @@ func initFormatFS(ctx context.Context, fsPath string) (rlk *lock.RLockedFile, er
 			}
 			isEmpty = fi.Size() == 0
 		}
-		if os.IsNotExist(err) || isEmpty {
+		if osIsNotExist(err) || isEmpty {
 			if err == nil {
 				rlk.Close()
 			}
@@ -288,7 +289,7 @@ func formatFSGetDeploymentID(rlk *lock.RLockedFile) (id string, err error) {
 }
 
 // Generate a deployment ID if one does not exist already.
-func formatFSFixDeploymentID(fsFormatPath string) error {
+func formatFSFixDeploymentID(ctx context.Context, fsFormatPath string) error {
 	rlk, err := lock.RLockedOpenFile(fsFormatPath)
 	if err == nil {
 		// format.json can be empty in a rare condition when another
@@ -305,7 +306,7 @@ func formatFSFixDeploymentID(fsFormatPath string) error {
 			return nil
 		}
 	}
-	if os.IsNotExist(err) {
+	if osIsNotExist(err) {
 		return nil
 	}
 	if err != nil {
@@ -339,30 +340,28 @@ func formatFSFixDeploymentID(fsFormatPath string) error {
 		return time.Now().Round(time.Second).Sub(formatStartTime).String()
 	}
 
-	doneCh := make(chan struct{})
-	defer close(doneCh)
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	var wlk *lock.LockedFile
-	retryCh := newRetryTimerSimple(doneCh)
 	var stop bool
 	for !stop {
 		select {
-		case <-retryCh:
+		case <-ctx.Done():
+			return fmt.Errorf("Initializing FS format stopped gracefully")
+		default:
 			wlk, err = lock.TryLockedOpenFile(fsFormatPath, os.O_RDWR, 0)
 			if err == lock.ErrAlreadyLocked {
 				// Lock already present, sleep and attempt again
 				logger.Info("Another minio process(es) might be holding a lock to the file %s. Please kill that minio process(es) (elapsed %s)\n", fsFormatPath, getElapsedTime())
+				time.Sleep(time.Duration(r.Float64() * float64(5*time.Second)))
 				continue
 			}
 			if err != nil {
 				return err
 			}
-			stop = true
-		case <-globalOSSignalCh:
-			return fmt.Errorf("Initializing FS format stopped gracefully")
 		}
+		stop = true
 	}
-
 	defer wlk.Close()
 
 	if err = jsonLoad(wlk, format); err != nil {

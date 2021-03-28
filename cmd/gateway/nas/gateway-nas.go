@@ -22,10 +22,7 @@ import (
 	"github.com/minio/cli"
 	minio "github.com/minio/minio/cmd"
 	"github.com/minio/minio/pkg/auth"
-)
-
-const (
-	nasBackend = "nas"
+	"github.com/minio/minio/pkg/madmin"
 )
 
 func init() {
@@ -43,22 +40,24 @@ PATH:
 
 EXAMPLES:
   1. Start minio gateway server for NAS backend
-     {{.Prompt}} {{.EnvVarSetCommand}} MINIO_ACCESS_KEY{{.AssignmentOperator}}accesskey
-     {{.Prompt}} {{.EnvVarSetCommand}} MINIO_SECRET_KEY{{.AssignmentOperator}}secretkey
+     {{.Prompt}} {{.EnvVarSetCommand}} MINIO_ROOT_USER{{.AssignmentOperator}}accesskey
+     {{.Prompt}} {{.EnvVarSetCommand}} MINIO_ROOT_PASSWORD{{.AssignmentOperator}}secretkey
      {{.Prompt}} {{.HelpName}} /shared/nasvol
 
   2. Start minio gateway server for NAS with edge caching enabled
-     {{.Prompt}} {{.EnvVarSetCommand}} MINIO_ACCESS_KEY{{.AssignmentOperator}}accesskey
-     {{.Prompt}} {{.EnvVarSetCommand}} MINIO_SECRET_KEY{{.AssignmentOperator}}secretkey
+     {{.Prompt}} {{.EnvVarSetCommand}} MINIO_ROOT_USER{{.AssignmentOperator}}accesskey
+     {{.Prompt}} {{.EnvVarSetCommand}} MINIO_ROOT_PASSWORD{{.AssignmentOperator}}secretkey
      {{.Prompt}} {{.EnvVarSetCommand}} MINIO_CACHE_DRIVES{{.AssignmentOperator}}"/mnt/drive1,/mnt/drive2,/mnt/drive3,/mnt/drive4"
      {{.Prompt}} {{.EnvVarSetCommand}} MINIO_CACHE_EXCLUDE{{.AssignmentOperator}}"bucket1/*,*.png"
-     {{.Prompt}} {{.EnvVarSetCommand}} MINIO_CACHE_EXPIRY{{.AssignmentOperator}}40
-     {{.Prompt}} {{.EnvVarSetCommand}} MINIO_CACHE_QUOTA{{.AssignmentOperator}}80
+     {{.Prompt}} {{.EnvVarSetCommand}} MINIO_CACHE_QUOTA{{.AssignmentOperator}}90
+     {{.Prompt}} {{.EnvVarSetCommand}} MINIO_CACHE_AFTER{{.AssignmentOperator}}3
+     {{.Prompt}} {{.EnvVarSetCommand}} MINIO_CACHE_WATERMARK_LOW{{.AssignmentOperator}}75
+     {{.Prompt}} {{.EnvVarSetCommand}} MINIO_CACHE_WATERMARK_HIGH{{.AssignmentOperator}}85
      {{.Prompt}} {{.HelpName}} /shared/nasvol
 `
 
 	minio.RegisterGatewayCommand(cli.Command{
-		Name:               nasBackend,
+		Name:               minio.NASBackendGateway,
 		Usage:              "Network-attached storage (NAS)",
 		Action:             nasGatewayMain,
 		CustomHelpTemplate: nasGatewayTemplate,
@@ -70,7 +69,7 @@ EXAMPLES:
 func nasGatewayMain(ctx *cli.Context) {
 	// Validate gateway arguments.
 	if !ctx.Args().Present() || ctx.Args().First() == "help" {
-		cli.ShowCommandHelpAndExit(ctx, nasBackend, 1)
+		cli.ShowCommandHelpAndExit(ctx, minio.NASBackendGateway, 1)
 	}
 
 	minio.StartGateway(ctx, &NAS{ctx.Args().First()})
@@ -83,7 +82,7 @@ type NAS struct {
 
 // Name implements Gateway interface.
 func (g *NAS) Name() string {
-	return nasBackend
+	return minio.NASBackendGateway
 }
 
 // NewGatewayLayer returns nas gatewaylayer.
@@ -101,16 +100,16 @@ func (g *NAS) Production() bool {
 	return true
 }
 
-// IsListenBucketSupported returns whether listen bucket notification is applicable for this gateway.
-func (n *nasObjects) IsListenBucketSupported() bool {
+// IsListenSupported returns whether listen bucket notification is applicable for this gateway.
+func (n *nasObjects) IsListenSupported() bool {
 	return false
 }
 
-func (n *nasObjects) StorageInfo(ctx context.Context) minio.StorageInfo {
-	sinfo := n.ObjectLayer.StorageInfo(ctx)
-	sinfo.Backend.GatewayOnline = sinfo.Backend.Type == minio.BackendFS
-	sinfo.Backend.Type = minio.BackendGateway
-	return sinfo
+func (n *nasObjects) StorageInfo(ctx context.Context) (si minio.StorageInfo, _ []error) {
+	si, errs := n.ObjectLayer.StorageInfo(ctx)
+	si.Backend.GatewayOnline = si.Backend.Type == madmin.FS
+	si.Backend.Type = madmin.Gateway
+	return si, errs
 }
 
 // nasObjects implements gateway for MinIO and S3 compatible object storage servers.
@@ -118,8 +117,6 @@ type nasObjects struct {
 	minio.ObjectLayer
 }
 
-// IsReady returns whether the layer is ready to take requests.
-func (n *nasObjects) IsReady(ctx context.Context) bool {
-	sinfo := n.ObjectLayer.StorageInfo(ctx)
-	return sinfo.Backend.Type == minio.BackendFS
+func (n *nasObjects) IsTaggingSupported() bool {
+	return true
 }

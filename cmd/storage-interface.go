@@ -17,6 +17,7 @@
 package cmd
 
 import (
+	"context"
 	"io"
 )
 
@@ -27,41 +28,57 @@ type StorageAPI interface {
 
 	// Storage operations.
 	IsOnline() bool // Returns true if disk is online.
-	LastError() error
-	Close() error
-	SetDiskID(id string)
+	IsLocal() bool
 
-	DiskInfo() (info DiskInfo, err error)
-	CrawlAndGetDataUsage(endCh <-chan struct{}) (DataUsageInfo, error)
+	Hostname() string   // Returns host name if remote host.
+	Endpoint() Endpoint // Returns endpoint.
+
+	Close() error
+	GetDiskID() (string, error)
+	SetDiskID(id string)
+	Healing() *healingTracker // Returns nil if disk is not healing.
+
+	DiskInfo(ctx context.Context) (info DiskInfo, err error)
+	NSScanner(ctx context.Context, cache dataUsageCache) (dataUsageCache, error)
 
 	// Volume operations.
-	MakeVol(volume string) (err error)
-	MakeVolBulk(volumes ...string) (err error)
-	ListVols() (vols []VolInfo, err error)
-	StatVol(volume string) (vol VolInfo, err error)
-	DeleteVol(volume string) (err error)
+	MakeVol(ctx context.Context, volume string) (err error)
+	MakeVolBulk(ctx context.Context, volumes ...string) (err error)
+	ListVols(ctx context.Context) (vols []VolInfo, err error)
+	StatVol(ctx context.Context, volume string) (vol VolInfo, err error)
+	DeleteVol(ctx context.Context, volume string, forceDelete bool) (err error)
 
-	// Walk in sorted order directly on disk.
-	Walk(volume, dirPath string, marker string, recursive bool, leafFile string,
-		readMetadataFn readMetadataFunc, endWalkCh chan struct{}) (chan FileInfo, error)
+	// WalkDir will walk a directory on disk and return a metacache stream on wr.
+	WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Writer) error
+
+	// Metadata operations
+	DeleteVersion(ctx context.Context, volume, path string, fi FileInfo, forceDelMarker bool) error
+	DeleteVersions(ctx context.Context, volume string, versions []FileInfo) []error
+	WriteMetadata(ctx context.Context, volume, path string, fi FileInfo) error
+	ReadVersion(ctx context.Context, volume, path, versionID string, readData bool) (FileInfo, error)
+	RenameData(ctx context.Context, srcVolume, srcPath, dataDir, dstVolume, dstPath string) error
 
 	// File operations.
-	ListDir(volume, dirPath string, count int, leafFile string) ([]string, error)
-	ReadFile(volume string, path string, offset int64, buf []byte, verifier *BitrotVerifier) (n int64, err error)
-	AppendFile(volume string, path string, buf []byte) (err error)
-	CreateFile(volume, path string, size int64, reader io.Reader) error
-	ReadFileStream(volume, path string, offset, length int64) (io.ReadCloser, error)
-	RenameFile(srcVolume, srcPath, dstVolume, dstPath string) error
-	StatFile(volume string, path string) (file FileInfo, err error)
-	DeleteFile(volume string, path string) (err error)
-	DeleteFileBulk(volume string, paths []string) (errs []error, err error)
-	VerifyFile(volume, path string, size int64, algo BitrotAlgorithm, sum []byte, shardSize int64) error
+	ListDir(ctx context.Context, volume, dirPath string, count int) ([]string, error)
+	ReadFile(ctx context.Context, volume string, path string, offset int64, buf []byte, verifier *BitrotVerifier) (n int64, err error)
+	AppendFile(ctx context.Context, volume string, path string, buf []byte) (err error)
+	CreateFile(ctx context.Context, volume, path string, size int64, reader io.Reader) error
+	ReadFileStream(ctx context.Context, volume, path string, offset, length int64) (io.ReadCloser, error)
+	RenameFile(ctx context.Context, srcVolume, srcPath, dstVolume, dstPath string) error
+	CheckParts(ctx context.Context, volume string, path string, fi FileInfo) error
+	CheckFile(ctx context.Context, volume string, path string) (err error)
+	Delete(ctx context.Context, volume string, path string, recursive bool) (err error)
+	VerifyFile(ctx context.Context, volume, path string, fi FileInfo) error
 
 	// Write all data, syncs the data to disk.
-	WriteAll(volume string, path string, reader io.Reader) (err error)
+	// Should be used for smaller payloads.
+	WriteAll(ctx context.Context, volume string, path string, b []byte) (err error)
 
 	// Read all.
-	ReadAll(volume string, path string) (buf []byte, err error)
+	ReadAll(ctx context.Context, volume string, path string) (buf []byte, err error)
+
+	GetDiskLoc() (poolIdx, setIdx, diskIdx int) // Retrieve location indexes.
+	SetDiskLoc(poolIdx, setIdx, diskIdx int)    // Set location indexes.
 }
 
 // storageReader is an io.Reader view of a disk
@@ -72,7 +89,7 @@ type storageReader struct {
 }
 
 func (r *storageReader) Read(p []byte) (n int, err error) {
-	nn, err := r.storage.ReadFile(r.volume, r.path, r.offset, p, nil)
+	nn, err := r.storage.ReadFile(context.TODO(), r.volume, r.path, r.offset, p, nil)
 	r.offset += nn
 	n = int(nn)
 
@@ -89,7 +106,7 @@ type storageWriter struct {
 }
 
 func (w *storageWriter) Write(p []byte) (n int, err error) {
-	err = w.storage.AppendFile(w.volume, w.path, p)
+	err = w.storage.AppendFile(context.TODO(), w.volume, w.path, p)
 	if err == nil {
 		n = len(p)
 	}

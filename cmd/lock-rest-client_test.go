@@ -17,6 +17,7 @@
 package cmd
 
 import (
+	"context"
 	"testing"
 
 	"github.com/minio/minio/pkg/dsync"
@@ -28,18 +29,19 @@ func TestLockRESTlient(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error %v", err)
 	}
+
 	lkClient := newlockRESTClient(endpoint)
-	if lkClient.connected == 0 {
+	if !lkClient.IsOnline() {
 		t.Fatalf("unexpected error. connection failed")
 	}
 
 	// Attempt all calls.
-	_, err = lkClient.RLock(dsync.LockArgs{})
+	_, err = lkClient.RLock(context.Background(), dsync.LockArgs{})
 	if err == nil {
 		t.Fatal("Expected for Rlock to fail")
 	}
 
-	_, err = lkClient.Lock(dsync.LockArgs{})
+	_, err = lkClient.Lock(context.Background(), dsync.LockArgs{})
 	if err == nil {
 		t.Fatal("Expected for Lock to fail")
 	}

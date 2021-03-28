@@ -21,15 +21,25 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/minio/minio-go/v6/pkg/set"
+	"github.com/minio/minio-go/v7/pkg/set"
 )
 
 // ActionSet - set of actions.
 type ActionSet map[Action]struct{}
 
+// Clone clones ActionSet structure
+func (actionSet ActionSet) Clone() ActionSet {
+	return NewActionSet(actionSet.ToSlice()...)
+}
+
 // Add - add action to the set.
 func (actionSet ActionSet) Add(action Action) {
 	actionSet[action] = struct{}{}
+}
+
+// IsEmpty - returns if the current action set is empty
+func (actionSet ActionSet) IsEmpty() bool {
+	return len(actionSet) == 0
 }
 
 // Match - matches object name with anyone of action pattern in action set.
@@ -38,9 +48,36 @@ func (actionSet ActionSet) Match(action Action) bool {
 		if r.Match(action) {
 			return true
 		}
+
+		// This is a special case where GetObjectVersion
+		// means GetObject is enabled implicitly.
+		switch r {
+		case GetObjectVersionAction:
+			if action == GetObjectAction {
+				return true
+			}
+		}
 	}
 
 	return false
+}
+
+// Equals - checks whether given action set is equal to current action set or not.
+func (actionSet ActionSet) Equals(sactionSet ActionSet) bool {
+	// If length of set is not equal to length of given set, the
+	// set is not equal to given set.
+	if len(actionSet) != len(sactionSet) {
+		return false
+	}
+
+	// As both sets are equal in length, check each elements are equal.
+	for k := range actionSet {
+		if _, ok := sactionSet[k]; !ok {
+			return false
+		}
+	}
+
+	return true
 }
 
 // Intersection - returns actions available in both ActionSet.
@@ -84,6 +121,16 @@ func (actionSet ActionSet) ToSlice() []Action {
 	return actions
 }
 
+// ToAdminSlice - returns slice of admin actions from the action set.
+func (actionSet ActionSet) ToAdminSlice() []AdminAction {
+	actions := []AdminAction{}
+	for action := range actionSet {
+		actions = append(actions, AdminAction(action))
+	}
+
+	return actions
+}
+
 // UnmarshalJSON - decodes JSON data to ActionSet.
 func (actionSet *ActionSet) UnmarshalJSON(data []byte) error {
 	var sset set.StringSet
@@ -97,14 +144,29 @@ func (actionSet *ActionSet) UnmarshalJSON(data []byte) error {
 
 	*actionSet = make(ActionSet)
 	for _, s := range sset.ToSlice() {
-		action, err := parseAction(s)
-		if err != nil {
-			return err
-		}
-
-		actionSet.Add(action)
+		actionSet.Add(Action(s))
 	}
 
+	return nil
+}
+
+// ValidateAdmin checks if all actions are valid Admin actions
+func (actionSet ActionSet) ValidateAdmin() error {
+	for _, action := range actionSet.ToAdminSlice() {
+		if !action.IsValid() {
+			return Errorf("unsupported admin action '%v'", action)
+		}
+	}
+	return nil
+}
+
+// Validate checks if all actions are valid
+func (actionSet ActionSet) Validate() error {
+	for _, action := range actionSet.ToSlice() {
+		if !action.IsValid() {
+			return Errorf("unsupported action '%v'", action)
+		}
+	}
 	return nil
 }
 

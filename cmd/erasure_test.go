@@ -1,5 +1,5 @@
 /*
- * MinIO Cloud Storage, (C) 2016 MinIO, Inc.
+ * MinIO Cloud Storage, (C) 2016-2020 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -52,7 +52,7 @@ func TestErasureEncodeDecode(t *testing.T) {
 		buffer := make([]byte, len(data), 2*len(data))
 		copy(buffer, data)
 
-		erasure, err := NewErasure(context.Background(), test.dataBlocks, test.parityBlocks, blockSizeV1)
+		erasure, err := NewErasure(context.Background(), test.dataBlocks, test.parityBlocks, blockSizeV2)
 		if err != nil {
 			t.Fatalf("Test %d: failed to create erasure: %v", i, err)
 		}
@@ -130,11 +130,11 @@ func newErasureTestSetup(dataBlocks int, parityBlocks int, blockSize int64) (*er
 	disks := make([]StorageAPI, len(diskPaths))
 	var err error
 	for i := range diskPaths {
-		disks[i], diskPaths[i], err = newPosixTestSetup()
+		disks[i], diskPaths[i], err = newXLStorageTestSetup()
 		if err != nil {
 			return nil, err
 		}
-		err = disks[i].MakeVol("testbucket")
+		err = disks[i].MakeVol(context.Background(), "testbucket")
 		if err != nil {
 			return nil, err
 		}

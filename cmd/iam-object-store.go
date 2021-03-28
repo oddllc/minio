@@ -21,9 +21,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"path"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
+
+	jwtgo "github.com/dgrijalva/jwt-go"
 
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/auth"
@@ -39,29 +43,24 @@ type IAMObjectStore struct {
 	objAPI ObjectLayer
 }
 
-func newIAMObjectStore() *IAMObjectStore {
-	return &IAMObjectStore{objAPI: nil}
+func newIAMObjectStore(objAPI ObjectLayer) *IAMObjectStore {
+	return &IAMObjectStore{objAPI: objAPI}
 }
 
-func (iamOS *IAMObjectStore) getObjectAPI() ObjectLayer {
+func (iamOS *IAMObjectStore) lock() {
+	iamOS.Lock()
+}
+
+func (iamOS *IAMObjectStore) unlock() {
+	iamOS.Unlock()
+}
+
+func (iamOS *IAMObjectStore) rlock() {
 	iamOS.RLock()
-	defer iamOS.RUnlock()
-	if iamOS.objAPI != nil {
-		return iamOS.objAPI
-	}
-	return newObjectLayerWithoutSafeModeFn()
 }
 
-func (iamOS *IAMObjectStore) setObjectAPI(objAPI ObjectLayer) {
-	iamOS.Lock()
-	defer iamOS.Unlock()
-	iamOS.objAPI = objAPI
-}
-
-func (iamOS *IAMObjectStore) clearObjectAPI() {
-	iamOS.Lock()
-	defer iamOS.Unlock()
-	iamOS.objAPI = nil
+func (iamOS *IAMObjectStore) runlock() {
+	iamOS.RUnlock()
 }
 
 // Migrate users directory in a single scan.
@@ -78,28 +77,23 @@ func (iamOS *IAMObjectStore) clearObjectAPI() {
 // location.
 //
 // 3. Migrate user identity json file to include version info.
-func (iamOS *IAMObjectStore) migrateUsersConfigToV1(isSTS bool) error {
+func (iamOS *IAMObjectStore) migrateUsersConfigToV1(ctx context.Context, isSTS bool) error {
 	basePrefix := iamConfigUsersPrefix
 	if isSTS {
 		basePrefix = iamConfigSTSPrefix
 	}
 
-	objAPI := iamOS.getObjectAPI()
-
-	doneCh := make(chan struct{})
-	defer close(doneCh)
-	for item := range listIAMConfigItems(objAPI, basePrefix, true, doneCh) {
+	for item := range listIAMConfigItems(ctx, iamOS.objAPI, basePrefix) {
 		if item.Err != nil {
 			return item.Err
 		}
 
-		user := item.Item
-
+		user := path.Dir(item.Item)
 		{
 			// 1. check if there is policy file in old location.
 			oldPolicyPath := pathJoin(basePrefix, user, iamPolicyFile)
 			var policyName string
-			if err := iamOS.loadIAMConfig(&policyName, oldPolicyPath); err != nil {
+			if err := iamOS.loadIAMConfig(ctx, &policyName, oldPolicyPath); err != nil {
 				switch err {
 				case errConfigNotFound:
 					// This case means it is already
@@ -116,19 +110,23 @@ func (iamOS *IAMObjectStore) migrateUsersConfigToV1(isSTS bool) error {
 
 			// 2. copy policy file to new location.
 			mp := newMappedPolicy(policyName)
-			if err := iamOS.saveMappedPolicy(user, isSTS, false, mp); err != nil {
+			userType := regularUser
+			if isSTS {
+				userType = stsUser
+			}
+			if err := iamOS.saveMappedPolicy(ctx, user, userType, false, mp); err != nil {
 				return err
 			}
 
 			// 3. delete policy file from old
 			// location. Ignore error.
-			iamOS.deleteIAMConfig(oldPolicyPath)
+			iamOS.deleteIAMConfig(ctx, oldPolicyPath)
 		}
 	next:
 		// 4. check if user identity has old format.
 		identityPath := pathJoin(basePrefix, user, iamIdentityFile)
 		var cred auth.Credentials
-		if err := iamOS.loadIAMConfig(&cred, identityPath); err != nil {
+		if err := iamOS.loadIAMConfig(ctx, &cred, identityPath); err != nil {
 			switch err {
 			case errConfigNotFound:
 				// This should not happen.
@@ -142,7 +140,7 @@ func (iamOS *IAMObjectStore) migrateUsersConfigToV1(isSTS bool) error {
 		// then the parsed auth.Credentials will have
 		// the zero value for the struct.
 		var zeroCred auth.Credentials
-		if cred == zeroCred {
+		if cred.Equal(zeroCred) {
 			// nothing to do
 			continue
 		}
@@ -151,8 +149,8 @@ func (iamOS *IAMObjectStore) migrateUsersConfigToV1(isSTS bool) error {
 		// into new format and save it.
 		cred.AccessKey = user
 		u := newUserIdentity(cred)
-		if err := iamOS.saveIAMConfig(u, identityPath); err != nil {
-			logger.LogIf(context.Background(), err)
+		if err := iamOS.saveIAMConfig(ctx, u, identityPath); err != nil {
+			logger.LogIf(ctx, err)
 			return err
 		}
 
@@ -163,10 +161,10 @@ func (iamOS *IAMObjectStore) migrateUsersConfigToV1(isSTS bool) error {
 
 }
 
-func (iamOS *IAMObjectStore) migrateToV1() error {
+func (iamOS *IAMObjectStore) migrateToV1(ctx context.Context) error {
 	var iamFmt iamFormat
 	path := getIAMFormatFilePath()
-	if err := iamOS.loadIAMConfig(&iamFmt, path); err != nil {
+	if err := iamOS.loadIAMConfig(ctx, &iamFmt, path); err != nil {
 		switch err {
 		case errConfigNotFound:
 			// Need to migrate to V1.
@@ -184,35 +182,29 @@ func (iamOS *IAMObjectStore) migrateToV1() error {
 	}
 
 	// Migrate long-term users
-	if err := iamOS.migrateUsersConfigToV1(false); err != nil {
-		logger.LogIf(context.Background(), err)
+	if err := iamOS.migrateUsersConfigToV1(ctx, false); err != nil {
+		logger.LogIf(ctx, err)
 		return err
 	}
 	// Migrate STS users
-	if err := iamOS.migrateUsersConfigToV1(true); err != nil {
-		logger.LogIf(context.Background(), err)
+	if err := iamOS.migrateUsersConfigToV1(ctx, true); err != nil {
+		logger.LogIf(ctx, err)
 		return err
 	}
 	// Save iam format to version 1.
-	if err := iamOS.saveIAMConfig(newIAMFormatVersion1(), path); err != nil {
-		logger.LogIf(context.Background(), err)
+	if err := iamOS.saveIAMConfig(ctx, newIAMFormatVersion1(), path); err != nil {
+		logger.LogIf(ctx, err)
 		return err
 	}
 	return nil
 }
 
 // Should be called under config migration lock
-func (iamOS *IAMObjectStore) migrateBackendFormat(objAPI ObjectLayer) error {
-	iamOS.setObjectAPI(objAPI)
-	defer iamOS.clearObjectAPI()
-	if err := iamOS.migrateToV1(); err != nil {
-		return err
-	}
-	return nil
+func (iamOS *IAMObjectStore) migrateBackendFormat(ctx context.Context) error {
+	return iamOS.migrateToV1(ctx)
 }
 
-func (iamOS *IAMObjectStore) saveIAMConfig(item interface{}, path string) error {
-	objectAPI := iamOS.getObjectAPI()
+func (iamOS *IAMObjectStore) saveIAMConfig(ctx context.Context, item interface{}, path string, opts ...options) error {
 	data, err := json.Marshal(item)
 	if err != nil {
 		return err
@@ -223,16 +215,15 @@ func (iamOS *IAMObjectStore) saveIAMConfig(item interface{}, path string) error 
 			return err
 		}
 	}
-	return saveConfig(context.Background(), objectAPI, path, data)
+	return saveConfig(ctx, iamOS.objAPI, path, data)
 }
 
-func (iamOS *IAMObjectStore) loadIAMConfig(item interface{}, path string) error {
-	objectAPI := iamOS.getObjectAPI()
-	data, err := readConfig(context.Background(), objectAPI, path)
+func (iamOS *IAMObjectStore) loadIAMConfig(ctx context.Context, item interface{}, path string) error {
+	data, err := readConfig(ctx, iamOS.objAPI, path)
 	if err != nil {
 		return err
 	}
-	if globalConfigEncrypted {
+	if globalConfigEncrypted && !utf8.Valid(data) {
 		data, err = madmin.DecryptData(globalActiveCred.String(), bytes.NewReader(data))
 		if err != nil {
 			return err
@@ -241,22 +232,13 @@ func (iamOS *IAMObjectStore) loadIAMConfig(item interface{}, path string) error 
 	return json.Unmarshal(data, item)
 }
 
-func (iamOS *IAMObjectStore) deleteIAMConfig(path string) error {
-	err := deleteConfig(context.Background(), iamOS.getObjectAPI(), path)
-	if _, ok := err.(ObjectNotFound); ok {
-		return errConfigNotFound
-	}
-	return err
+func (iamOS *IAMObjectStore) deleteIAMConfig(ctx context.Context, path string) error {
+	return deleteConfig(ctx, iamOS.objAPI, path)
 }
 
-func (iamOS *IAMObjectStore) loadPolicyDoc(policy string, m map[string]iampolicy.Policy) error {
-	objectAPI := iamOS.getObjectAPI()
-	if objectAPI == nil {
-		return errServerNotInitialized
-	}
-
+func (iamOS *IAMObjectStore) loadPolicyDoc(ctx context.Context, policy string, m map[string]iampolicy.Policy) error {
 	var p iampolicy.Policy
-	err := iamOS.loadIAMConfig(&p, getPolicyDocPath(policy))
+	err := iamOS.loadIAMConfig(ctx, &p, getPolicyDocPath(policy))
 	if err != nil {
 		if err == errConfigNotFound {
 			return errNoSuchPolicy
@@ -267,36 +249,23 @@ func (iamOS *IAMObjectStore) loadPolicyDoc(policy string, m map[string]iampolicy
 	return nil
 }
 
-func (iamOS *IAMObjectStore) loadPolicyDocs(m map[string]iampolicy.Policy) error {
-	objectAPI := iamOS.getObjectAPI()
-	if objectAPI == nil {
-		return errServerNotInitialized
-	}
-
-	doneCh := make(chan struct{})
-	defer close(doneCh)
-	for item := range listIAMConfigItems(objectAPI, iamConfigPoliciesPrefix, true, doneCh) {
+func (iamOS *IAMObjectStore) loadPolicyDocs(ctx context.Context, m map[string]iampolicy.Policy) error {
+	for item := range listIAMConfigItems(ctx, iamOS.objAPI, iamConfigPoliciesPrefix) {
 		if item.Err != nil {
 			return item.Err
 		}
 
-		policyName := item.Item
-		err := iamOS.loadPolicyDoc(policyName, m)
-		if err != nil {
+		policyName := path.Dir(item.Item)
+		if err := iamOS.loadPolicyDoc(ctx, policyName, m); err != nil && err != errNoSuchPolicy {
 			return err
 		}
 	}
 	return nil
 }
 
-func (iamOS *IAMObjectStore) loadUser(user string, isSTS bool, m map[string]auth.Credentials) error {
-	objectAPI := iamOS.getObjectAPI()
-	if objectAPI == nil {
-		return errServerNotInitialized
-	}
-
+func (iamOS *IAMObjectStore) loadUser(ctx context.Context, user string, userType IAMUserType, m map[string]auth.Credentials) error {
 	var u UserIdentity
-	err := iamOS.loadIAMConfig(&u, getUserIdentityPath(user, isSTS))
+	err := iamOS.loadIAMConfig(ctx, &u, getUserIdentityPath(user, userType))
 	if err != nil {
 		if err == errConfigNotFound {
 			return errNoSuchUser
@@ -306,52 +275,66 @@ func (iamOS *IAMObjectStore) loadUser(user string, isSTS bool, m map[string]auth
 
 	if u.Credentials.IsExpired() {
 		// Delete expired identity - ignoring errors here.
-		iamOS.deleteIAMConfig(getUserIdentityPath(user, isSTS))
-		iamOS.deleteIAMConfig(getMappedPolicyPath(user, isSTS, false))
+		iamOS.deleteIAMConfig(ctx, getUserIdentityPath(user, userType))
+		iamOS.deleteIAMConfig(ctx, getMappedPolicyPath(user, userType, false))
 		return nil
+	}
+
+	// If this is a service account, rotate the session key if needed
+	if globalOldCred.IsValid() && u.Credentials.IsServiceAccount() {
+		if !globalOldCred.Equal(globalActiveCred) {
+			m := jwtgo.MapClaims{}
+			stsTokenCallback := func(t *jwtgo.Token) (interface{}, error) {
+				return []byte(globalOldCred.SecretKey), nil
+			}
+			if _, err := jwtgo.ParseWithClaims(u.Credentials.SessionToken, m, stsTokenCallback); err == nil {
+				jwt := jwtgo.NewWithClaims(jwtgo.SigningMethodHS512, jwtgo.MapClaims(m))
+				if token, err := jwt.SignedString([]byte(globalActiveCred.SecretKey)); err == nil {
+					u.Credentials.SessionToken = token
+					err := iamOS.saveIAMConfig(ctx, &u, getUserIdentityPath(user, userType))
+					if err != nil {
+						return err
+					}
+				}
+			}
+		}
 	}
 
 	if u.Credentials.AccessKey == "" {
 		u.Credentials.AccessKey = user
 	}
+
 	m[user] = u.Credentials
 	return nil
 }
 
-func (iamOS *IAMObjectStore) loadUsers(isSTS bool, m map[string]auth.Credentials) error {
-	objectAPI := iamOS.getObjectAPI()
-	if objectAPI == nil {
-		return errServerNotInitialized
+func (iamOS *IAMObjectStore) loadUsers(ctx context.Context, userType IAMUserType, m map[string]auth.Credentials) error {
+	var basePrefix string
+	switch userType {
+	case srvAccUser:
+		basePrefix = iamConfigServiceAccountsPrefix
+	case stsUser:
+		basePrefix = iamConfigSTSPrefix
+	default:
+		basePrefix = iamConfigUsersPrefix
 	}
 
-	doneCh := make(chan struct{})
-	defer close(doneCh)
-	basePrefix := iamConfigUsersPrefix
-	if isSTS {
-		basePrefix = iamConfigSTSPrefix
-	}
-	for item := range listIAMConfigItems(objectAPI, basePrefix, true, doneCh) {
+	for item := range listIAMConfigItems(ctx, iamOS.objAPI, basePrefix) {
 		if item.Err != nil {
 			return item.Err
 		}
 
-		userName := item.Item
-		err := iamOS.loadUser(userName, isSTS, m)
-		if err != nil {
+		userName := path.Dir(item.Item)
+		if err := iamOS.loadUser(ctx, userName, userType, m); err != nil && err != errNoSuchUser {
 			return err
 		}
 	}
 	return nil
 }
 
-func (iamOS *IAMObjectStore) loadGroup(group string, m map[string]GroupInfo) error {
-	objectAPI := iamOS.getObjectAPI()
-	if objectAPI == nil {
-		return errServerNotInitialized
-	}
-
+func (iamOS *IAMObjectStore) loadGroup(ctx context.Context, group string, m map[string]GroupInfo) error {
 	var g GroupInfo
-	err := iamOS.loadIAMConfig(&g, getGroupInfoPath(group))
+	err := iamOS.loadIAMConfig(ctx, &g, getGroupInfoPath(group))
 	if err != nil {
 		if err == errConfigNotFound {
 			return errNoSuchGroup
@@ -362,38 +345,25 @@ func (iamOS *IAMObjectStore) loadGroup(group string, m map[string]GroupInfo) err
 	return nil
 }
 
-func (iamOS *IAMObjectStore) loadGroups(m map[string]GroupInfo) error {
-	objectAPI := iamOS.getObjectAPI()
-	if objectAPI == nil {
-		return errServerNotInitialized
-	}
-
-	doneCh := make(chan struct{})
-	defer close(doneCh)
-	for item := range listIAMConfigItems(objectAPI, iamConfigGroupsPrefix, true, doneCh) {
+func (iamOS *IAMObjectStore) loadGroups(ctx context.Context, m map[string]GroupInfo) error {
+	for item := range listIAMConfigItems(ctx, iamOS.objAPI, iamConfigGroupsPrefix) {
 		if item.Err != nil {
 			return item.Err
 		}
 
-		group := item.Item
-		err := iamOS.loadGroup(group, m)
-		if err != nil {
+		group := path.Dir(item.Item)
+		if err := iamOS.loadGroup(ctx, group, m); err != nil && err != errNoSuchGroup {
 			return err
 		}
 	}
 	return nil
 }
 
-func (iamOS *IAMObjectStore) loadMappedPolicy(name string, isSTS, isGroup bool,
+func (iamOS *IAMObjectStore) loadMappedPolicy(ctx context.Context, name string, userType IAMUserType, isGroup bool,
 	m map[string]MappedPolicy) error {
 
-	objectAPI := iamOS.getObjectAPI()
-	if objectAPI == nil {
-		return errServerNotInitialized
-	}
-
 	var p MappedPolicy
-	err := iamOS.loadIAMConfig(&p, getMappedPolicyPath(name, isSTS, isGroup))
+	err := iamOS.loadIAMConfig(ctx, &p, getMappedPolicyPath(name, userType, isGroup))
 	if err != nil {
 		if err == errConfigNotFound {
 			return errNoSuchPolicy
@@ -404,150 +374,81 @@ func (iamOS *IAMObjectStore) loadMappedPolicy(name string, isSTS, isGroup bool,
 	return nil
 }
 
-func (iamOS *IAMObjectStore) loadMappedPolicies(isSTS, isGroup bool, m map[string]MappedPolicy) error {
-	objectAPI := iamOS.getObjectAPI()
-	if objectAPI == nil {
-		return errServerNotInitialized
-	}
-
-	doneCh := make(chan struct{})
-	defer close(doneCh)
+func (iamOS *IAMObjectStore) loadMappedPolicies(ctx context.Context, userType IAMUserType, isGroup bool, m map[string]MappedPolicy) error {
 	var basePath string
-	switch {
-	case isSTS:
-		basePath = iamConfigPolicyDBSTSUsersPrefix
-	case isGroup:
+	if isGroup {
 		basePath = iamConfigPolicyDBGroupsPrefix
-	default:
-		basePath = iamConfigPolicyDBUsersPrefix
+	} else {
+		switch userType {
+		case srvAccUser:
+			basePath = iamConfigPolicyDBServiceAccountsPrefix
+		case stsUser:
+			basePath = iamConfigPolicyDBSTSUsersPrefix
+		default:
+			basePath = iamConfigPolicyDBUsersPrefix
+		}
 	}
-	for item := range listIAMConfigItems(objectAPI, basePath, false, doneCh) {
+	for item := range listIAMConfigItems(ctx, iamOS.objAPI, basePath) {
 		if item.Err != nil {
 			return item.Err
 		}
 
 		policyFile := item.Item
 		userOrGroupName := strings.TrimSuffix(policyFile, ".json")
-		err := iamOS.loadMappedPolicy(userOrGroupName, isSTS, isGroup, m)
-		if err != nil {
+		if err := iamOS.loadMappedPolicy(ctx, userOrGroupName, userType, isGroup, m); err != nil && err != errNoSuchPolicy {
 			return err
 		}
 	}
 	return nil
 }
 
-// Refresh IAMSys. If an object layer is passed in use that, otherwise
-// load from global.
-func (iamOS *IAMObjectStore) loadAll(sys *IAMSys, objectAPI ObjectLayer) error {
-	if objectAPI == nil {
-		objectAPI = iamOS.getObjectAPI()
-	}
-	if objectAPI == nil {
-		return errServerNotInitialized
-	}
-	// cache object layer for other load* functions
-	iamOS.setObjectAPI(objectAPI)
-	defer iamOS.clearObjectAPI()
-
-	iamUsersMap := make(map[string]auth.Credentials)
-	iamGroupsMap := make(map[string]GroupInfo)
-	iamPolicyDocsMap := make(map[string]iampolicy.Policy)
-	iamUserPolicyMap := make(map[string]MappedPolicy)
-	iamGroupPolicyMap := make(map[string]MappedPolicy)
-
-	isMinIOUsersSys := false
-	sys.RLock()
-	if sys.usersSysType == MinIOUsersSysType {
-		isMinIOUsersSys = true
-	}
-	sys.RUnlock()
-
-	if err := iamOS.loadPolicyDocs(iamPolicyDocsMap); err != nil {
-		return err
-	}
-	// load STS temp users
-	if err := iamOS.loadUsers(true, iamUsersMap); err != nil {
-		return err
-	}
-	if isMinIOUsersSys {
-		if err := iamOS.loadUsers(false, iamUsersMap); err != nil {
-			return err
-		}
-		if err := iamOS.loadGroups(iamGroupsMap); err != nil {
-			return err
-		}
-
-		if err := iamOS.loadMappedPolicies(false, false, iamUserPolicyMap); err != nil {
-			return err
-		}
-	}
-	// load STS policy mappings
-	if err := iamOS.loadMappedPolicies(true, false, iamUserPolicyMap); err != nil {
-		return err
-	}
-	// load policies mapped to groups
-	if err := iamOS.loadMappedPolicies(false, true, iamGroupPolicyMap); err != nil {
-		return err
-	}
-
-	// Sets default canned policies, if none are set.
-	setDefaultCannedPolicies(iamPolicyDocsMap)
-
-	sys.Lock()
-	defer sys.Unlock()
-
-	sys.iamUsersMap = iamUsersMap
-	sys.iamPolicyDocsMap = iamPolicyDocsMap
-	sys.iamUserPolicyMap = iamUserPolicyMap
-	sys.iamGroupPolicyMap = iamGroupPolicyMap
-	sys.iamGroupsMap = iamGroupsMap
-	sys.buildUserGroupMemberships()
-
-	return nil
+// Refresh IAMSys. If an object layer is passed in use that, otherwise load from global.
+func (iamOS *IAMObjectStore) loadAll(ctx context.Context, sys *IAMSys) error {
+	return sys.Load(ctx, iamOS)
 }
 
-func (iamOS *IAMObjectStore) savePolicyDoc(policyName string, p iampolicy.Policy) error {
-	return iamOS.saveIAMConfig(&p, getPolicyDocPath(policyName))
+func (iamOS *IAMObjectStore) savePolicyDoc(ctx context.Context, policyName string, p iampolicy.Policy) error {
+	return iamOS.saveIAMConfig(ctx, &p, getPolicyDocPath(policyName))
 }
 
-func (iamOS *IAMObjectStore) saveMappedPolicy(name string, isSTS, isGroup bool, mp MappedPolicy) error {
-	return iamOS.saveIAMConfig(mp, getMappedPolicyPath(name, isSTS, isGroup))
+func (iamOS *IAMObjectStore) saveMappedPolicy(ctx context.Context, name string, userType IAMUserType, isGroup bool, mp MappedPolicy, opts ...options) error {
+	return iamOS.saveIAMConfig(ctx, mp, getMappedPolicyPath(name, userType, isGroup), opts...)
 }
 
-func (iamOS *IAMObjectStore) saveUserIdentity(name string, isSTS bool, u UserIdentity) error {
-	return iamOS.saveIAMConfig(u, getUserIdentityPath(name, isSTS))
+func (iamOS *IAMObjectStore) saveUserIdentity(ctx context.Context, name string, userType IAMUserType, u UserIdentity, opts ...options) error {
+	return iamOS.saveIAMConfig(ctx, u, getUserIdentityPath(name, userType), opts...)
 }
 
-func (iamOS *IAMObjectStore) saveGroupInfo(name string, gi GroupInfo) error {
-	return iamOS.saveIAMConfig(gi, getGroupInfoPath(name))
+func (iamOS *IAMObjectStore) saveGroupInfo(ctx context.Context, name string, gi GroupInfo) error {
+	return iamOS.saveIAMConfig(ctx, gi, getGroupInfoPath(name))
 }
 
-func (iamOS *IAMObjectStore) deletePolicyDoc(name string) error {
-	err := iamOS.deleteIAMConfig(getPolicyDocPath(name))
+func (iamOS *IAMObjectStore) deletePolicyDoc(ctx context.Context, name string) error {
+	err := iamOS.deleteIAMConfig(ctx, getPolicyDocPath(name))
 	if err == errConfigNotFound {
 		err = errNoSuchPolicy
 	}
 	return err
 }
 
-func (iamOS *IAMObjectStore) deleteMappedPolicy(name string, isSTS, isGroup bool) error {
-	err := iamOS.deleteIAMConfig(getMappedPolicyPath(name, isSTS, isGroup))
+func (iamOS *IAMObjectStore) deleteMappedPolicy(ctx context.Context, name string, userType IAMUserType, isGroup bool) error {
+	err := iamOS.deleteIAMConfig(ctx, getMappedPolicyPath(name, userType, isGroup))
 	if err == errConfigNotFound {
 		err = errNoSuchPolicy
 	}
 	return err
 }
 
-func (iamOS *IAMObjectStore) deleteUserIdentity(name string, isSTS bool) error {
-	err := iamOS.deleteIAMConfig(getUserIdentityPath(name, isSTS))
+func (iamOS *IAMObjectStore) deleteUserIdentity(ctx context.Context, name string, userType IAMUserType) error {
+	err := iamOS.deleteIAMConfig(ctx, getUserIdentityPath(name, userType))
 	if err == errConfigNotFound {
 		err = errNoSuchUser
 	}
 	return err
 }
 
-func (iamOS *IAMObjectStore) deleteGroupInfo(name string) error {
-	err := iamOS.deleteIAMConfig(getGroupInfoPath(name))
+func (iamOS *IAMObjectStore) deleteGroupInfo(ctx context.Context, name string) error {
+	err := iamOS.deleteIAMConfig(ctx, getGroupInfoPath(name))
 	if err == errConfigNotFound {
 		err = errNoSuchGroup
 	}
@@ -564,70 +465,43 @@ type itemOrErr struct {
 // prefix. If dirs is true, only directories are listed, otherwise
 // only objects are listed. All returned items have the pathPrefix
 // removed from their names.
-func listIAMConfigItems(objectAPI ObjectLayer, pathPrefix string, dirs bool,
-	doneCh <-chan struct{}) <-chan itemOrErr {
-
+func listIAMConfigItems(ctx context.Context, objAPI ObjectLayer, pathPrefix string) <-chan itemOrErr {
 	ch := make(chan itemOrErr)
-	dirList := func(lo ListObjectsInfo) []string {
-		return lo.Prefixes
-	}
-	filesList := func(lo ListObjectsInfo) (r []string) {
-		for _, o := range lo.Objects {
-			r = append(r, o.Name)
-		}
-		return r
-	}
 
 	go func() {
-		marker := ""
-		for {
-			lo, err := objectAPI.ListObjects(context.Background(),
-				minioMetaBucket, pathPrefix, marker, SlashSeparator, maxObjectList)
-			if err != nil {
-				select {
-				case ch <- itemOrErr{Err: err}:
-				case <-doneCh:
-				}
-				close(ch)
-				return
+		defer close(ch)
+
+		// Allocate new results channel to receive ObjectInfo.
+		objInfoCh := make(chan ObjectInfo)
+
+		if err := objAPI.Walk(ctx, minioMetaBucket, pathPrefix, objInfoCh, ObjectOptions{}); err != nil {
+			select {
+			case ch <- itemOrErr{Err: err}:
+			case <-ctx.Done():
 			}
-			marker = lo.NextMarker
-			lister := dirList(lo)
-			if !dirs {
-				lister = filesList(lo)
-			}
-			for _, itemPrefix := range lister {
-				item := strings.TrimPrefix(itemPrefix, pathPrefix)
-				item = strings.TrimSuffix(item, SlashSeparator)
-				select {
-				case ch <- itemOrErr{Item: item}:
-				case <-doneCh:
-					close(ch)
-					return
-				}
-			}
-			if !lo.IsTruncated {
-				close(ch)
+			return
+		}
+
+		for obj := range objInfoCh {
+			item := strings.TrimPrefix(obj.Name, pathPrefix)
+			item = strings.TrimSuffix(item, SlashSeparator)
+			select {
+			case ch <- itemOrErr{Item: item}:
+			case <-ctx.Done():
 				return
 			}
 		}
 	}()
+
 	return ch
 }
 
-func (iamOS *IAMObjectStore) watch(sys *IAMSys) {
-	watchDisk := func() {
-		ticker := time.NewTicker(globalRefreshIAMInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-GlobalServiceDoneCh:
-				return
-			case <-ticker.C:
-				iamOS.loadAll(sys, nil)
-			}
+func (iamOS *IAMObjectStore) watch(ctx context.Context, sys *IAMSys) {
+	// Refresh IAMSys.
+	for {
+		time.Sleep(globalRefreshIAMInterval)
+		if err := iamOS.loadAll(ctx, sys); err != nil {
+			logger.LogIf(ctx, err)
 		}
 	}
-	// Refresh IAMSys in background.
-	go watchDisk()
 }

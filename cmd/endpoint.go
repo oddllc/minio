@@ -18,23 +18,28 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"path"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	humanize "github.com/dustin/go-humanize"
-	"github.com/minio/cli"
-	"github.com/minio/minio-go/v6/pkg/set"
+	"github.com/dustin/go-humanize"
+	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/cmd/config"
+	xhttp "github.com/minio/minio/cmd/http"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/env"
 	"github.com/minio/minio/pkg/mountinfo"
+	xnet "github.com/minio/minio/pkg/net"
 )
 
 // EndpointType - enum for endpoint type.
@@ -46,15 +51,19 @@ const (
 
 	// URLEndpointType - URL style endpoint type enum.
 	URLEndpointType
-
-	retryInterval = 5 // In Seconds.
 )
+
+// ProxyEndpoint - endpoint used for proxy redirects
+// See proxyRequest() for details.
+type ProxyEndpoint struct {
+	Endpoint
+	Transport http.RoundTripper
+}
 
 // Endpoint - any type of endpoint.
 type Endpoint struct {
 	*url.URL
-	IsLocal  bool
-	SetIndex int
+	IsLocal bool
 }
 
 func (endpoint Endpoint) String() string {
@@ -173,7 +182,11 @@ func NewEndpoint(arg string) (ep Endpoint, e error) {
 		if isHostIP(arg) {
 			return ep, fmt.Errorf("invalid URL endpoint format: missing scheme http or https")
 		}
-		u = &url.URL{Path: path.Clean(arg)}
+		absArg, err := filepath.Abs(arg)
+		if err != nil {
+			return Endpoint{}, fmt.Errorf("absolute path failed %s", err)
+		}
+		u = &url.URL{Path: path.Clean(absArg)}
 		isLocal = true
 	}
 
@@ -183,33 +196,142 @@ func NewEndpoint(arg string) (ep Endpoint, e error) {
 	}, nil
 }
 
-// ZoneEndpoints represent endpoints in a given zone
-// along with its setCount and drivesPerSet.
-type ZoneEndpoints struct {
+// PoolEndpoints represent endpoints in a given pool
+// along with its setCount and setDriveCount.
+type PoolEndpoints struct {
 	SetCount     int
 	DrivesPerSet int
 	Endpoints    Endpoints
 }
 
-// EndpointZones - list of list of endpoints
-type EndpointZones []ZoneEndpoints
+// EndpointServerPools - list of list of endpoints
+type EndpointServerPools []PoolEndpoints
+
+// GetLocalPoolIdx returns the pool which endpoint belongs to locally.
+// if ep is remote this code will return -1 poolIndex
+func (l EndpointServerPools) GetLocalPoolIdx(ep Endpoint) int {
+	for i, zep := range l {
+		for _, cep := range zep.Endpoints {
+			if cep.IsLocal && ep.IsLocal {
+				if reflect.DeepEqual(cep, ep) {
+					return i
+				}
+			}
+		}
+	}
+	return -1
+}
+
+// Add add pool endpoints
+func (l *EndpointServerPools) Add(zeps PoolEndpoints) error {
+	existSet := set.NewStringSet()
+	for _, zep := range *l {
+		for _, ep := range zep.Endpoints {
+			existSet.Add(ep.String())
+		}
+	}
+	// Validate if there are duplicate endpoints across serverPools
+	for _, ep := range zeps.Endpoints {
+		if existSet.Contains(ep.String()) {
+			return fmt.Errorf("duplicate endpoints found")
+		}
+	}
+	*l = append(*l, zeps)
+	return nil
+}
+
+// Localhost - returns the local hostname from list of endpoints
+func (l EndpointServerPools) Localhost() string {
+	for _, ep := range l {
+		for _, endpoint := range ep.Endpoints {
+			if endpoint.IsLocal {
+				u := &url.URL{
+					Scheme: endpoint.Scheme,
+					Host:   endpoint.Host,
+				}
+				return u.String()
+			}
+		}
+	}
+	return ""
+}
 
 // FirstLocal returns true if the first endpoint is local.
-func (l EndpointZones) FirstLocal() bool {
+func (l EndpointServerPools) FirstLocal() bool {
 	return l[0].Endpoints[0].IsLocal
 }
 
 // HTTPS - returns true if secure for URLEndpointType.
-func (l EndpointZones) HTTPS() bool {
+func (l EndpointServerPools) HTTPS() bool {
 	return l[0].Endpoints.HTTPS()
 }
 
-// Nodes - returns all nodes count
-func (l EndpointZones) Nodes() (count int) {
+// NEndpoints - returns all nodes count
+func (l EndpointServerPools) NEndpoints() (count int) {
 	for _, ep := range l {
 		count += len(ep.Endpoints)
 	}
 	return count
+}
+
+// Hostnames - returns list of unique hostnames
+func (l EndpointServerPools) Hostnames() []string {
+	foundSet := set.NewStringSet()
+	for _, ep := range l {
+		for _, endpoint := range ep.Endpoints {
+			if foundSet.Contains(endpoint.Hostname()) {
+				continue
+			}
+			foundSet.Add(endpoint.Hostname())
+		}
+	}
+	return foundSet.ToSlice()
+}
+
+// hostsSorted will return all hosts found.
+// The LOCAL host will be nil, but the indexes of all hosts should
+// remain consistent across the cluster.
+func (l EndpointServerPools) hostsSorted() []*xnet.Host {
+	peers, localPeer := l.peers()
+	sort.Strings(peers)
+	hosts := make([]*xnet.Host, len(peers))
+	for i, hostStr := range peers {
+		if hostStr == localPeer {
+			continue
+		}
+		host, err := xnet.ParseHost(hostStr)
+		if err != nil {
+			logger.LogIf(GlobalContext, err)
+			continue
+		}
+		hosts[i] = host
+	}
+
+	return hosts
+}
+
+// peers will return all peers, including local.
+// The local peer is returned as a separate string.
+func (l EndpointServerPools) peers() (peers []string, local string) {
+	allSet := set.NewStringSet()
+	for _, ep := range l {
+		for _, endpoint := range ep.Endpoints {
+			if endpoint.Type() != URLEndpointType {
+				continue
+			}
+
+			peer := endpoint.Host
+			if endpoint.IsLocal {
+				if _, port := mustSplitHostPort(peer); port == globalMinioPort {
+					local = peer
+				}
+			}
+
+			allSet.Add(peer)
+		}
+	}
+
+	return allSet.ToSlice(), local
 }
 
 // Endpoints - list of same type of endpoint.
@@ -229,6 +351,14 @@ func (endpoints Endpoints) GetString(i int) string {
 	return endpoints[i].String()
 }
 
+// GetAllStrings - returns allstring of all endpoints
+func (endpoints Endpoints) GetAllStrings() (all []string) {
+	for _, e := range endpoints {
+		all = append(all, e.String())
+	}
+	return
+}
+
 func hostResolveToLocalhost(endpoint Endpoint) bool {
 	hostIPs, err := getHostIP(endpoint.Hostname())
 	if err != nil {
@@ -237,7 +367,7 @@ func hostResolveToLocalhost(endpoint Endpoint) bool {
 			"host",
 			endpoint.Hostname(),
 		)
-		ctx := logger.SetReqInfo(context.Background(), reqInfo)
+		ctx := logger.SetReqInfo(GlobalContext, reqInfo)
 		logger.LogIf(ctx, err, logger.Application)
 		return false
 	}
@@ -269,7 +399,7 @@ func (endpoints Endpoints) UpdateIsLocal(foundPrevLocal bool) error {
 	resolvedList := make([]bool, len(endpoints))
 	// Mark the starting time
 	startTime := time.Now()
-	keepAliveTicker := time.NewTicker(retryInterval * time.Second)
+	keepAliveTicker := time.NewTicker(10 * time.Millisecond)
 	defer keepAliveTicker.Stop()
 	for {
 		// Break if the local endpoint is found already Or all the endpoints are resolved.
@@ -307,7 +437,7 @@ func (endpoints Endpoints) UpdateIsLocal(foundPrevLocal bool) error {
 								startTime.Add(timeElapsed),
 								"elapsed",
 								""))
-						ctx := logger.SetReqInfo(context.Background(), reqInfo)
+						ctx := logger.SetReqInfo(GlobalContext, reqInfo)
 						logger.LogIf(ctx, err, logger.Application)
 					}
 					continue
@@ -334,7 +464,7 @@ func (endpoints Endpoints) UpdateIsLocal(foundPrevLocal bool) error {
 								"elapsed",
 								"",
 							))
-						ctx := logger.SetReqInfo(context.Background(),
+						ctx := logger.SetReqInfo(GlobalContext,
 							reqInfo)
 						logger.LogIf(ctx, err, logger.Application)
 					}
@@ -348,8 +478,8 @@ func (endpoints Endpoints) UpdateIsLocal(foundPrevLocal bool) error {
 						// participate atleast one disk and be local.
 						//
 						// In special cases for replica set with expanded
-						// zone setups we need to make sure to provide
-						// value of foundPrevLocal from zone1 if we already
+						// pool setups we need to make sure to provide
+						// value of foundPrevLocal from pool1 if we already
 						// found a local setup. Only if we haven't found
 						// previous local we continue to wait to look for
 						// atleast one local.
@@ -365,7 +495,7 @@ func (endpoints Endpoints) UpdateIsLocal(foundPrevLocal bool) error {
 									"elapsed",
 									"",
 								))
-							ctx := logger.SetReqInfo(context.Background(),
+							ctx := logger.SetReqInfo(GlobalContext,
 								reqInfo)
 							logger.LogIf(ctx, err, logger.Application)
 						}
@@ -442,28 +572,6 @@ func NewEndpoints(args ...string) (endpoints Endpoints, err error) {
 	return endpoints, nil
 }
 
-func checkEndpointsSubOptimal(ctx *cli.Context, setupType SetupType, endpointZones EndpointZones) (err error) {
-	// Validate sub optimal ordering only for distributed setup.
-	if setupType != DistXLSetupType {
-		return nil
-	}
-	var endpointOrder int
-	err = fmt.Errorf("Too many disk args are local, input is in sub-optimal order. Please review input args: %s", ctx.Args())
-	for _, endpoints := range endpointZones {
-		for _, endpoint := range endpoints.Endpoints {
-			if endpoint.IsLocal {
-				endpointOrder++
-			} else {
-				endpointOrder--
-			}
-			if endpointOrder >= 2 {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
 // Checks if there are any cross device mounts.
 func checkCrossDeviceMounts(endpoints Endpoints) (err error) {
 	var absPaths []string
@@ -517,9 +625,8 @@ func CreateEndpoints(serverAddr string, foundLocal bool, args ...[]string) (Endp
 		return endpoints, setupType, nil
 	}
 
-	for i, iargs := range args {
+	for _, iargs := range args {
 		// Convert args to endpoints
-		var newEndpoints Endpoints
 		eps, err := NewEndpoints(iargs...)
 		if err != nil {
 			return endpoints, setupType, config.ErrInvalidErasureEndpoints(nil).Msg(err.Error())
@@ -530,20 +637,16 @@ func CreateEndpoints(serverAddr string, foundLocal bool, args ...[]string) (Endp
 			return endpoints, setupType, config.ErrInvalidErasureEndpoints(nil).Msg(err.Error())
 		}
 
-		for _, ep := range eps {
-			ep.SetIndex = i
-			newEndpoints = append(newEndpoints, ep)
-		}
-		endpoints = append(endpoints, newEndpoints...)
+		endpoints = append(endpoints, eps...)
 	}
 
 	if len(endpoints) == 0 {
 		return endpoints, setupType, config.ErrInvalidErasureEndpoints(nil).Msg("invalid number of endpoints")
 	}
 
-	// Return XL setup when all endpoints are path style.
+	// Return Erasure setup when all endpoints are path style.
 	if endpoints[0].Type() == PathEndpointType {
-		setupType = XLSetupType
+		setupType = ErasureSetupType
 		return endpoints, setupType, nil
 	}
 
@@ -608,17 +711,18 @@ func CreateEndpoints(serverAddr string, foundLocal bool, args ...[]string) (Endp
 
 	// All endpoints are pointing to local host
 	if len(endpoints) == localEndpointCount {
-		// If all endpoints have same port number, then this is XL setup using URL style endpoints.
+		// If all endpoints have same port number, Just treat it as local erasure setup
+		// using URL style endpoints.
 		if len(localPortSet) == 1 {
 			if len(localServerHostSet) > 1 {
 				return endpoints, setupType,
 					config.ErrInvalidErasureEndpoints(nil).Msg("all local endpoints should not have different hostnames/ips")
 			}
-			return endpoints, XLSetupType, nil
+			return endpoints, ErasureSetupType, nil
 		}
 
 		// Even though all endpoints are local, but those endpoints use different ports.
-		// This means it is DistXL setup.
+		// This means it is DistErasure setup.
 	}
 
 	// Add missing port in all endpoints.
@@ -638,7 +742,7 @@ func CreateEndpoints(serverAddr string, foundLocal bool, args ...[]string) (Endp
 	}
 
 	// Error out if we have less than 2 unique servers.
-	if len(uniqueArgs.ToSlice()) < 2 && setupType == DistXLSetupType {
+	if len(uniqueArgs.ToSlice()) < 2 && setupType == DistErasureSetupType {
 		err := fmt.Errorf("Unsupported number of endpoints (%s), minimum number of servers cannot be less than 2 in distributed setup", endpoints)
 		return endpoints, setupType, err
 	}
@@ -648,7 +752,7 @@ func CreateEndpoints(serverAddr string, foundLocal bool, args ...[]string) (Endp
 		updateDomainIPs(uniqueArgs)
 	}
 
-	setupType = DistXLSetupType
+	setupType = DistErasureSetupType
 	return endpoints, setupType, nil
 }
 
@@ -657,9 +761,9 @@ func CreateEndpoints(serverAddr string, foundLocal bool, args ...[]string) (Endp
 // the first element from the set of peers which indicate that
 // they are local. There is always one entry that is local
 // even with repeated server endpoints.
-func GetLocalPeer(endpointZones EndpointZones) (localPeer string) {
+func GetLocalPeer(endpointServerPools EndpointServerPools, host, port string) (localPeer string) {
 	peerSet := set.NewStringSet()
-	for _, ep := range endpointZones {
+	for _, ep := range endpointServerPools {
 		for _, endpoint := range ep.Endpoints {
 			if endpoint.Type() != URLEndpointType {
 				continue
@@ -672,35 +776,116 @@ func GetLocalPeer(endpointZones EndpointZones) (localPeer string) {
 	if peerSet.IsEmpty() {
 		// Local peer can be empty in FS or Erasure coded mode.
 		// If so, return globalMinioHost + globalMinioPort value.
-		if globalMinioHost != "" {
-			return net.JoinHostPort(globalMinioHost, globalMinioPort)
+		if host != "" {
+			return net.JoinHostPort(host, port)
 		}
 
-		return net.JoinHostPort("127.0.0.1", globalMinioPort)
+		return net.JoinHostPort("127.0.0.1", port)
 	}
 	return peerSet.ToSlice()[0]
 }
 
-// GetRemotePeers - get hosts information other than this minio service.
-func GetRemotePeers(endpointZones EndpointZones) []string {
-	peerSet := set.NewStringSet()
-	for _, ep := range endpointZones {
+// GetProxyEndpointLocalIndex returns index of the local proxy endpoint
+func GetProxyEndpointLocalIndex(proxyEps []ProxyEndpoint) int {
+	for i, pep := range proxyEps {
+		if pep.IsLocal {
+			return i
+		}
+	}
+	return -1
+}
+
+func httpDo(clnt *http.Client, req *http.Request, f func(*http.Response, error) error) error {
+	ctx, cancel := context.WithTimeout(GlobalContext, 200*time.Millisecond)
+	defer cancel()
+
+	// Run the HTTP request in a goroutine and pass the response to f.
+	c := make(chan error, 1)
+	req = req.WithContext(ctx)
+	go func() { c <- f(clnt.Do(req)) }()
+	select {
+	case <-ctx.Done():
+		<-c // Wait for f to return.
+		return ctx.Err()
+	case err := <-c:
+		return err
+	}
+}
+
+func getOnlineProxyEndpointIdx() int {
+	type reqIndex struct {
+		Request *http.Request
+		Idx     int
+	}
+
+	proxyRequests := make(map[*http.Client]reqIndex, len(globalProxyEndpoints))
+	for i, proxyEp := range globalProxyEndpoints {
+		proxyEp := proxyEp
+		serverURL := &url.URL{
+			Scheme: proxyEp.Scheme,
+			Host:   proxyEp.Host,
+			Path:   pathJoin(healthCheckPathPrefix, healthCheckLivenessPath),
+		}
+
+		req, err := http.NewRequest(http.MethodGet, serverURL.String(), nil)
+		if err != nil {
+			continue
+		}
+
+		proxyRequests[&http.Client{
+			Transport: proxyEp.Transport,
+		}] = reqIndex{
+			Request: req,
+			Idx:     i,
+		}
+	}
+
+	for c, r := range proxyRequests {
+		if err := httpDo(c, r.Request, func(resp *http.Response, err error) error {
+			if err != nil {
+				return err
+			}
+			xhttp.DrainBody(resp.Body)
+			if resp.StatusCode != http.StatusOK {
+				return errors.New(resp.Status)
+			}
+			if v := resp.Header.Get(xhttp.MinIOServerStatus); v == unavailable {
+				return errors.New(v)
+			}
+			return nil
+		}); err != nil {
+			continue
+		}
+		return r.Idx
+	}
+	return -1
+}
+
+// GetProxyEndpoints - get all endpoints that can be used to proxy list request.
+func GetProxyEndpoints(endpointServerPools EndpointServerPools) []ProxyEndpoint {
+	var proxyEps []ProxyEndpoint
+
+	proxyEpSet := set.NewStringSet()
+
+	for _, ep := range endpointServerPools {
 		for _, endpoint := range ep.Endpoints {
 			if endpoint.Type() != URLEndpointType {
 				continue
 			}
 
-			peer := endpoint.Host
-			if endpoint.IsLocal {
-				if _, port := mustSplitHostPort(peer); port == globalMinioPort {
-					continue
-				}
+			host := endpoint.Host
+			if proxyEpSet.Contains(host) {
+				continue
 			}
+			proxyEpSet.Add(host)
 
-			peerSet.Add(peer)
+			proxyEps = append(proxyEps, ProxyEndpoint{
+				Endpoint:  endpoint,
+				Transport: globalProxyTransport,
+			})
 		}
 	}
-	return peerSet.ToSlice()
+	return proxyEps
 }
 
 func updateDomainIPs(endPoints set.StringSet) {

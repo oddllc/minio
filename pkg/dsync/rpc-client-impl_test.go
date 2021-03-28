@@ -17,6 +17,7 @@
 package dsync_test
 
 import (
+	"context"
 	"net/rpc"
 	"sync"
 
@@ -47,6 +48,10 @@ func (rpcClient *ReconnectRPCClient) IsOnline() bool {
 	defer rpcClient.mutex.Unlock()
 	// If rpc client has not connected yet there is nothing to close.
 	return rpcClient.rpc != nil
+}
+
+func (rpcClient *ReconnectRPCClient) IsLocal() bool {
+	return false
 }
 
 // Close closes the underlying socket file descriptor.
@@ -89,12 +94,12 @@ func (rpcClient *ReconnectRPCClient) Call(serviceMethod string, args interface{}
 	return err
 }
 
-func (rpcClient *ReconnectRPCClient) RLock(args LockArgs) (status bool, err error) {
+func (rpcClient *ReconnectRPCClient) RLock(ctx context.Context, args LockArgs) (status bool, err error) {
 	err = rpcClient.Call("Dsync.RLock", &args, &status)
 	return status, err
 }
 
-func (rpcClient *ReconnectRPCClient) Lock(args LockArgs) (status bool, err error) {
+func (rpcClient *ReconnectRPCClient) Lock(ctx context.Context, args LockArgs) (status bool, err error) {
 	err = rpcClient.Call("Dsync.Lock", &args, &status)
 	return status, err
 }
@@ -109,9 +114,14 @@ func (rpcClient *ReconnectRPCClient) Unlock(args LockArgs) (status bool, err err
 	return status, err
 }
 
-func (rpcClient *ReconnectRPCClient) Expired(args LockArgs) (expired bool, err error) {
-	err = rpcClient.Call("Dsync.Expired", &args, &expired)
-	return expired, err
+func (rpcClient *ReconnectRPCClient) Refresh(ctx context.Context, args LockArgs) (refreshed bool, err error) {
+	err = rpcClient.Call("Dsync.Refresh", &args, &refreshed)
+	return refreshed, err
+}
+
+func (rpcClient *ReconnectRPCClient) ForceUnlock(ctx context.Context, args LockArgs) (reply bool, err error) {
+	err = rpcClient.Call("Dsync.ForceUnlock", &args, &reply)
+	return reply, err
 }
 
 func (rpcClient *ReconnectRPCClient) String() string {

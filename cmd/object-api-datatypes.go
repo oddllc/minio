@@ -18,8 +18,11 @@ package cmd
 
 import (
 	"io"
+	"math"
 	"time"
 
+	humanize "github.com/dustin/go-humanize"
+	"github.com/minio/minio/pkg/bucket/replication"
 	"github.com/minio/minio/pkg/hash"
 	"github.com/minio/minio/pkg/madmin"
 )
@@ -29,46 +32,18 @@ type BackendType int
 
 // Enum for different backend types.
 const (
-	Unknown BackendType = iota
+	Unknown = BackendType(madmin.Unknown)
 	// Filesystem backend.
-	BackendFS
+	BackendFS = BackendType(madmin.FS)
 	// Multi disk BackendErasure (single, distributed) backend.
-	BackendErasure
+	BackendErasure = BackendType(madmin.Erasure)
 	// Gateway backend.
-	BackendGateway
+	BackendGateway = BackendType(madmin.Gateway)
 	// Add your own backend.
 )
 
 // StorageInfo - represents total capacity of underlying storage.
-type StorageInfo struct {
-	Used []uint64 // Used total used per disk.
-
-	Total []uint64 // Total disk space per disk.
-
-	Available []uint64 // Total disk space available per disk.
-
-	MountPaths []string // Disk mountpoints
-
-	// Backend type.
-	Backend struct {
-		// Represents various backend types, currently on FS, Erasure and Gateway
-		Type BackendType
-
-		// Following fields are only meaningful if BackendType is Gateway.
-		GatewayOnline bool
-
-		// Following fields are only meaningful if BackendType is Erasure.
-		OnlineDisks      madmin.BackendDisks // Online disks during server startup.
-		OfflineDisks     madmin.BackendDisks // Offline disks during server startup.
-		StandardSCData   int                 // Data disks for currently configured Standard storage class.
-		StandardSCParity int                 // Parity disks for currently configured Standard storage class.
-		RRSCData         int                 // Data disks for currently configured Reduced Redundancy storage class.
-		RRSCParity       int                 // Parity disks for currently configured Reduced Redundancy storage class.
-
-		// List of all disk status, this is only meaningful if BackendType is Erasure.
-		Sets [][]madmin.DriveInfo
-	}
-}
+type StorageInfo = madmin.StorageInfo
 
 // objectHistogramInterval is an interval that will be
 // used to report the histogram of objects data sizes
@@ -77,30 +52,72 @@ type objectHistogramInterval struct {
 	start, end int64
 }
 
+const (
+	// dataUsageBucketLen must be length of ObjectsHistogramIntervals
+	dataUsageBucketLen = 7
+)
+
 // ObjectsHistogramIntervals is the list of all intervals
 // of object sizes to be included in objects histogram.
 var ObjectsHistogramIntervals = []objectHistogramInterval{
-	{"LESS_THAN_1024_B", -1, 1024 - 1},
-	{"BETWEEN_1024_B_AND_1_MB", 1024, 1024*1024 - 1},
-	{"BETWEEN_1_MB_AND_10_MB", 1024 * 1024, 1024*1024*10 - 1},
-	{"BETWEEN_10_MB_AND_64_MB", 1024 * 1024 * 10, 1024*1024*64 - 1},
-	{"BETWEEN_64_MB_AND_128_MB", 1024 * 1024 * 64, 1024*1024*128 - 1},
-	{"BETWEEN_128_MB_AND_512_MB", 1024 * 1024 * 128, 1024*1024*512 - 1},
-	{"GREATER_THAN_512_MB", 1024 * 1024 * 512, -1},
+	{"LESS_THAN_1024_B", 0, humanize.KiByte - 1},
+	{"BETWEEN_1024_B_AND_1_MB", humanize.KiByte, humanize.MiByte - 1},
+	{"BETWEEN_1_MB_AND_10_MB", humanize.MiByte, humanize.MiByte*10 - 1},
+	{"BETWEEN_10_MB_AND_64_MB", humanize.MiByte * 10, humanize.MiByte*64 - 1},
+	{"BETWEEN_64_MB_AND_128_MB", humanize.MiByte * 64, humanize.MiByte*128 - 1},
+	{"BETWEEN_128_MB_AND_512_MB", humanize.MiByte * 128, humanize.MiByte*512 - 1},
+	{"GREATER_THAN_512_MB", humanize.MiByte * 512, math.MaxInt64},
+}
+
+// BucketUsageInfo - bucket usage info provides
+// - total size of the bucket
+// - total objects in a bucket
+// - object size histogram per bucket
+type BucketUsageInfo struct {
+	Size                   uint64            `json:"size"`
+	ReplicationPendingSize uint64            `json:"objectsPendingReplicationTotalSize"`
+	ReplicationFailedSize  uint64            `json:"objectsFailedReplicationTotalSize"`
+	ReplicatedSize         uint64            `json:"objectsReplicatedTotalSize"`
+	ReplicaSize            uint64            `json:"objectReplicaTotalSize"`
+	ObjectsCount           uint64            `json:"objectsCount"`
+	ObjectSizesHistogram   map[string]uint64 `json:"objectsSizesHistogram"`
 }
 
 // DataUsageInfo represents data usage stats of the underlying Object API
 type DataUsageInfo struct {
-	// The timestamp of when the data usage info is generated
+	// LastUpdate is the timestamp of when the data usage info was last updated.
+	// This does not indicate a full scan.
 	LastUpdate time.Time `json:"lastUpdate"`
 
-	ObjectsCount uint64 `json:"objectsCount"`
-	// Objects total size
-	ObjectsTotalSize      uint64            `json:"objectsTotalSize"`
-	ObjectsSizesHistogram map[string]uint64 `json:"objectsSizesHistogram"`
+	// Objects total count across all buckets
+	ObjectsTotalCount uint64 `json:"objectsCount"`
 
-	BucketsCount uint64            `json:"bucketsCount"`
-	BucketsSizes map[string]uint64 `json:"bucketsSizes"`
+	// Objects total size across all buckets
+	ObjectsTotalSize uint64 `json:"objectsTotalSize"`
+
+	// Total Size for objects that have not yet been replicated
+	ReplicationPendingSize uint64 `json:"objectsPendingReplicationTotalSize"`
+
+	// Total size for objects that have witness one or more failures and will be retried
+	ReplicationFailedSize uint64 `json:"objectsFailedReplicationTotalSize"`
+
+	// Total size for objects that have been replicated to destination
+	ReplicatedSize uint64 `json:"objectsReplicatedTotalSize"`
+
+	// Total size for objects that are replicas
+	ReplicaSize uint64 `json:"objectsReplicaTotalSize"`
+
+	// Total number of buckets in this cluster
+	BucketsCount uint64 `json:"bucketsCount"`
+
+	// Buckets usage info provides following information across all buckets
+	// - total size of the bucket
+	// - total objects in a bucket
+	// - object size histogram per bucket
+	BucketsUsage map[string]BucketUsageInfo `json:"bucketsUsageInfo"`
+
+	// Deprecated kept here for backward compatibility reasons.
+	BucketSizes map[string]uint64 `json:"bucketsSizes"`
 }
 
 // BucketInfo - represents bucket metadata.
@@ -132,6 +149,29 @@ type ObjectInfo struct {
 	// Hex encoded unique entity tag of the object.
 	ETag string
 
+	// The ETag stored in the gateway backend
+	InnerETag string
+
+	// Version ID of this object.
+	VersionID string
+
+	// IsLatest indicates if this is the latest current version
+	// latest can be true for delete marker or a version.
+	IsLatest bool
+
+	// DeleteMarker indicates if the versionId corresponds
+	// to a delete marker on an object.
+	DeleteMarker bool
+
+	// TransitionStatus indicates if transition is complete/pending
+	TransitionStatus string
+
+	// RestoreExpires indicates date a restored object expires
+	RestoreExpires time.Time
+
+	// RestoreOngoing indicates if a restore is in progress
+	RestoreOngoing bool
+
 	// A standard MIME type describing the format of the object.
 	ContentType string
 
@@ -143,11 +183,20 @@ type ObjectInfo struct {
 	// Date and time at which the object is no longer able to be cached
 	Expires time.Time
 
+	// CacheStatus sets status of whether this is a cache hit/miss
+	CacheStatus CacheStatusType
+	// CacheLookupStatus sets whether a cacheable response is present in the cache
+	CacheLookupStatus CacheStatusType
+
 	// Specify object storage class
 	StorageClass string
 
+	ReplicationStatus replication.StatusType
 	// User-Defined metadata
 	UserDefined map[string]string
+
+	// User-Defined object tags
+	UserTags string
 
 	// List of individual parts, maximum size of upto 10,000
 	Parts []ObjectPartInfo `json:"-"`
@@ -158,12 +207,90 @@ type ObjectInfo struct {
 	PutObjReader *PutObjReader  `json:"-"`
 
 	metadataOnly bool
+	versionOnly  bool // adds a new version, only used by CopyObject
+	keyRotation  bool
 
 	// Date and time when the object was last accessed.
 	AccTime time.Time
 
+	Legacy bool // indicates object on disk is in legacy data format
+
 	// backendType indicates which backend filled this structure
 	backendType BackendType
+
+	VersionPurgeStatus VersionPurgeStatusType
+
+	// The total count of all versions of this object
+	NumVersions int
+	//  The modtime of the successor object version if any
+	SuccessorModTime time.Time
+}
+
+// Clone - Returns a cloned copy of current objectInfo
+func (o ObjectInfo) Clone() (cinfo ObjectInfo) {
+	cinfo = ObjectInfo{
+		Bucket:             o.Bucket,
+		Name:               o.Name,
+		ModTime:            o.ModTime,
+		Size:               o.Size,
+		IsDir:              o.IsDir,
+		ETag:               o.ETag,
+		InnerETag:          o.InnerETag,
+		VersionID:          o.VersionID,
+		IsLatest:           o.IsLatest,
+		DeleteMarker:       o.DeleteMarker,
+		TransitionStatus:   o.TransitionStatus,
+		RestoreExpires:     o.RestoreExpires,
+		RestoreOngoing:     o.RestoreOngoing,
+		ContentType:        o.ContentType,
+		ContentEncoding:    o.ContentEncoding,
+		Expires:            o.Expires,
+		CacheStatus:        o.CacheStatus,
+		CacheLookupStatus:  o.CacheLookupStatus,
+		StorageClass:       o.StorageClass,
+		ReplicationStatus:  o.ReplicationStatus,
+		UserTags:           o.UserTags,
+		Parts:              o.Parts,
+		Writer:             o.Writer,
+		Reader:             o.Reader,
+		PutObjReader:       o.PutObjReader,
+		metadataOnly:       o.metadataOnly,
+		versionOnly:        o.versionOnly,
+		keyRotation:        o.keyRotation,
+		backendType:        o.backendType,
+		AccTime:            o.AccTime,
+		Legacy:             o.Legacy,
+		VersionPurgeStatus: o.VersionPurgeStatus,
+		NumVersions:        o.NumVersions,
+		SuccessorModTime:   o.SuccessorModTime,
+	}
+	cinfo.UserDefined = make(map[string]string, len(o.UserDefined))
+	for k, v := range o.UserDefined {
+		cinfo.UserDefined[k] = v
+	}
+	return cinfo
+}
+
+// MultipartInfo captures metadata information about the uploadId
+// this data structure is used primarily for some internal purposes
+// for verifying upload type such as was the upload
+// - encrypted
+// - compressed
+type MultipartInfo struct {
+	// Name of the bucket.
+	Bucket string
+
+	// Name of the object.
+	Object string
+
+	// Upload ID identifying the multipart upload whose parts are being listed.
+	UploadID string
+
+	// Date and time at which the multipart upload was initiated.
+	Initiated time.Time
+
+	// Any metadata set during InitMultipartUpload, including encryption headers.
+	UserDefined map[string]string
 }
 
 // ListPartsInfo - represents list of all parts.
@@ -199,8 +326,6 @@ type ListPartsInfo struct {
 
 	// Any metadata set during InitMultipartUpload, including encryption headers.
 	UserDefined map[string]string
-
-	EncodingType string // Not supported yet.
 }
 
 // Lookup - returns if uploadID is valid
@@ -258,6 +383,50 @@ type ListMultipartsInfo struct {
 	CommonPrefixes []string
 
 	EncodingType string // Not supported yet.
+}
+
+// DeletedObjectInfo - container for list objects versions deleted objects.
+type DeletedObjectInfo struct {
+	// Name of the bucket.
+	Bucket string
+
+	// Name of the object.
+	Name string
+
+	// Date and time when the object was last modified.
+	ModTime time.Time
+
+	// Version ID of this object.
+	VersionID string
+
+	// Indicates the deleted marker is latest
+	IsLatest bool
+}
+
+// ListObjectVersionsInfo - container for list objects versions.
+type ListObjectVersionsInfo struct {
+	// Indicates whether the returned list objects response is truncated. A
+	// value of true indicates that the list was truncated. The list can be truncated
+	// if the number of objects exceeds the limit allowed or specified
+	// by max keys.
+	IsTruncated bool
+
+	// When response is truncated (the IsTruncated element value in the response is true),
+	// you can use the key name in this field as marker in the subsequent
+	// request to get next set of objects.
+	//
+	// NOTE: AWS S3 returns NextMarker only if you have delimiter request parameter specified,
+	//       MinIO always returns NextMarker.
+	NextMarker string
+
+	// NextVersionIDMarker may be set of IsTruncated is true
+	NextVersionIDMarker string
+
+	// List of objects info for this request.
+	Objects []ObjectInfo
+
+	// List of prefixes for this request.
+	Prefixes []string
 }
 
 // ListObjectsInfo - container for list objects.
@@ -324,20 +493,6 @@ type PartInfo struct {
 
 	// Decompressed Size.
 	ActualSize int64
-}
-
-// MultipartInfo - represents metadata in progress multipart upload.
-type MultipartInfo struct {
-	// Object name for which the multipart upload was initiated.
-	Object string
-
-	// Unique identifier for this multipart upload.
-	UploadID string
-
-	// Date and time at which the multipart upload was initiated.
-	Initiated time.Time
-
-	StorageClass string // Not supported yet.
 }
 
 // CompletePart - represents the part that was completed, this is sent by the client

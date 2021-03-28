@@ -22,11 +22,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/coreos/etcd/clientv3"
-	"github.com/coreos/etcd/clientv3/namespace"
 	"github.com/minio/minio/cmd/config"
 	"github.com/minio/minio/pkg/env"
 	xnet "github.com/minio/minio/pkg/net"
+	"go.etcd.io/etcd/clientv3"
+	"go.etcd.io/etcd/clientv3/namespace"
+	"go.uber.org/zap"
 )
 
 const (
@@ -144,6 +145,13 @@ func LookupConfig(kvs config.KVS, rootCAs *x509.CertPool) (Config, error) {
 	cfg.Enabled = true
 	cfg.DialTimeout = defaultDialTimeout
 	cfg.DialKeepAliveTime = defaultDialKeepAlive
+	// Disable etcd client SDK logging, etcd client
+	// incorrectly starts logging in unexpected data
+	// format.
+	cfg.LogConfig = &zap.Config{
+		Level:    zap.NewAtomicLevelAt(zap.FatalLevel),
+		Encoding: "console",
+	}
 	cfg.Endpoints = etcdEndpoints
 	cfg.CoreDNSPath = env.Get(EnvEtcdCoreDNSPath, kvs.Get(CoreDNSPath))
 	// Default path prefix for all keys on etcd, other than CoreDNSPath.

@@ -16,6 +16,8 @@
 
 package csv
 
+import "errors"
+
 type s3Error struct {
 	code       string
 	message    string
@@ -43,29 +45,20 @@ func (err *s3Error) Error() string {
 	return err.message
 }
 
-func errInvalidFileHeaderInfo(err error) *s3Error {
-	return &s3Error{
-		code:       "InvalidFileHeaderInfo",
-		message:    "The FileHeaderInfo is invalid. Only NONE, USE, and IGNORE are supported.",
-		statusCode: 400,
-		cause:      err,
-	}
-}
-
-func errInvalidQuoteFields(err error) *s3Error {
-	return &s3Error{
-		code:       "InvalidQuoteFields",
-		message:    "The QuoteFields is invalid. Only ALWAYS and ASNEEDED are supported.",
-		statusCode: 400,
-		cause:      err,
-	}
-}
-
 func errCSVParsingError(err error) *s3Error {
 	return &s3Error{
 		code:       "CSVParsingError",
 		message:    "Encountered an error parsing the CSV file. Check the file and try again.",
 		statusCode: 400,
 		cause:      err,
+	}
+}
+
+func errInvalidTextEncodingError() *s3Error {
+	return &s3Error{
+		code:       "InvalidTextEncoding",
+		message:    "UTF-8 encoding is required.",
+		statusCode: 400,
+		cause:      errors.New("invalid utf8 encoding"),
 	}
 }

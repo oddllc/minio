@@ -39,6 +39,9 @@ func (r *countUpReader) Read(p []byte) (n int, err error) {
 }
 
 func (r *countUpReader) BytesRead() int64 {
+	if r == nil {
+		return 0
+	}
 	return atomic.LoadInt64(&r.bytesRead)
 }
 
@@ -54,6 +57,7 @@ type progressReader struct {
 	processedReader *countUpReader
 
 	closedMu sync.Mutex
+	gzr      *gzip.Reader
 	closed   bool
 }
 
@@ -75,34 +79,49 @@ func (pr *progressReader) Close() error {
 		return nil
 	}
 	pr.closed = true
+	if pr.gzr != nil {
+		pr.gzr.Close()
+	}
 	return pr.rc.Close()
 }
 
 func (pr *progressReader) Stats() (bytesScanned, bytesProcessed int64) {
+	if pr == nil {
+		return 0, 0
+	}
 	return pr.scannedReader.BytesRead(), pr.processedReader.BytesRead()
 }
 
 func newProgressReader(rc io.ReadCloser, compType CompressionType) (*progressReader, error) {
+	if rc == nil {
+		return nil, errors.New("newProgressReader: nil reader provided")
+	}
 	scannedReader := newCountUpReader(rc)
-	var r io.Reader
+	pr := progressReader{
+		rc:            rc,
+		scannedReader: scannedReader,
+	}
 	var err error
+	var r io.Reader
 
 	switch compType {
 	case noneType:
 		r = scannedReader
 	case gzipType:
-		if r, err = gzip.NewReader(scannedReader); err != nil {
+		pr.gzr, err = gzip.NewReader(scannedReader)
+		if err != nil {
+			if errors.Is(err, gzip.ErrHeader) || errors.Is(err, gzip.ErrChecksum) {
+				return nil, errInvalidGZIPCompressionFormat(err)
+			}
 			return nil, errTruncatedInput(err)
 		}
+		r = pr.gzr
 	case bzip2Type:
 		r = bzip2.NewReader(scannedReader)
 	default:
 		return nil, errInvalidCompressionFormat(fmt.Errorf("unknown compression type '%v'", compType))
 	}
+	pr.processedReader = newCountUpReader(r)
 
-	return &progressReader{
-		rc:              rc,
-		scannedReader:   scannedReader,
-		processedReader: newCountUpReader(r),
-	}, nil
+	return &pr, nil
 }

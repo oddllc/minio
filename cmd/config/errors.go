@@ -24,6 +24,18 @@ var (
 		"Browser can only accept `on` and `off` values. To disable web browser access, set this value to `off`",
 	)
 
+	ErrInvalidFSOSyncValue = newErrFn(
+		"Invalid O_SYNC value",
+		"Please check the passed value",
+		"Can only accept `on` and `off` values. To enable O_SYNC for fs backend, set this value to `on`",
+	)
+
+	ErrOverlappingDomainValue = newErrFn(
+		"Overlapping domain values",
+		"Please check the passed value",
+		"MINIO_DOMAIN only accepts non-overlapping domain values",
+	)
+
 	ErrInvalidDomainValue = newErrFn(
 		"Invalid domain value",
 		"Please check the passed value",
@@ -33,7 +45,7 @@ var (
 	ErrInvalidErasureSetSize = newErrFn(
 		"Invalid erasure set size",
 		"Please check the passed value",
-		"Erasure set can only accept any of [4, 6, 8, 10, 12, 14, 16] values",
+		"Erasure set can only accept any of [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16] values",
 	)
 
 	ErrInvalidWormValue = newErrFn(
@@ -66,28 +78,63 @@ var (
 		"MINIO_CACHE_QUOTA: Valid cache quota value must be between 0-100",
 	)
 
+	ErrInvalidCacheAfter = newErrFn(
+		"Invalid cache after value",
+		"Please check the passed value",
+		"MINIO_CACHE_AFTER: Valid cache after value must be 0 or greater",
+	)
+
+	ErrInvalidCacheWatermarkLow = newErrFn(
+		"Invalid cache low watermark value",
+		"Please check the passed value",
+		"MINIO_CACHE_WATERMARK_LOW: Valid cache low watermark value must be between 0-100",
+	)
+
+	ErrInvalidCacheWatermarkHigh = newErrFn(
+		"Invalid cache high watermark value",
+		"Please check the passed value",
+		"MINIO_CACHE_WATERMARK_HIGH: Valid cache high watermark value must be between 0-100",
+	)
+
 	ErrInvalidCacheEncryptionKey = newErrFn(
 		"Invalid cache encryption master key value",
 		"Please check the passed value",
 		"MINIO_CACHE_ENCRYPTION_MASTER_KEY: For more information, please refer to https://docs.min.io/docs/minio-disk-cache-guide",
 	)
 
+	ErrInvalidCacheRange = newErrFn(
+		"Invalid cache range value",
+		"Please check the passed value",
+		"MINIO_CACHE_RANGE: Valid expected value is `on` or `off`",
+	)
+
+	ErrInvalidCacheCommitValue = newErrFn(
+		"Invalid cache commit value",
+		"Please check the passed value",
+		"MINIO_CACHE_COMMIT: Valid expected value is `writeback` or `writethrough`",
+	)
+
+	ErrInvalidCacheSetting = newErrFn(
+		"Incompatible cache setting",
+		"Please check the passed value",
+		"MINIO_CACHE_AFTER cannot be used with MINIO_CACHE_COMMIT setting",
+	)
 	ErrInvalidRotatingCredentialsBackendEncrypted = newErrFn(
 		"Invalid rotating credentials",
 		"Please set correct rotating credentials in the environment for decryption",
-		`Detected encrypted config backend, correct old access and secret keys should be specified via environment variables MINIO_ACCESS_KEY_OLD and MINIO_SECRET_KEY_OLD to be able to re-encrypt the MinIO config, user IAM and policies with new credentials`,
+		`Detected encrypted config backend, correct old access and secret keys should be specified via environment variables MINIO_ROOT_USER_OLD and MINIO_ROOT_PASSWORD_OLD to be able to re-encrypt the MinIO config, user IAM and policies with new credentials`,
 	)
 
 	ErrInvalidCredentialsBackendEncrypted = newErrFn(
 		"Invalid credentials",
 		"Please set correct credentials in the environment for decryption",
-		`Detected encrypted config backend, correct access and secret keys should be specified via environment variables MINIO_ACCESS_KEY and MINIO_SECRET_KEY to be able to decrypt the MinIO config, user IAM and policies`,
+		`Detected encrypted config backend, correct access and secret keys should be specified via environment variables MINIO_ROOT_USER and MINIO_ROOT_PASSWORD to be able to decrypt the MinIO config, user IAM and policies`,
 	)
 
 	ErrMissingCredentialsBackendEncrypted = newErrFn(
 		"Credentials missing",
 		"Please set your credentials in the environment",
-		`Detected encrypted config backend, access and secret keys should be specified via environment variables MINIO_ACCESS_KEY and MINIO_SECRET_KEY to be able to decrypt the MinIO config, user IAM and policies`,
+		`Detected encrypted config backend, access and secret keys should be specified via environment variables MINIO_ROOT_USER and MINIO_ROOT_PASSWORD to be able to decrypt the MinIO config, user IAM and policies`,
 	)
 
 	ErrInvalidCredentials = newErrFn(
@@ -99,13 +146,13 @@ var (
 	ErrEnvCredentialsMissingGateway = newErrFn(
 		"Credentials missing",
 		"Please set your credentials in the environment",
-		`In Gateway mode, access and secret keys should be specified via environment variables MINIO_ACCESS_KEY and MINIO_SECRET_KEY respectively`,
+		`In Gateway mode, access and secret keys should be specified via environment variables MINIO_ROOT_USER and MINIO_ROOT_PASSWORD respectively`,
 	)
 
 	ErrEnvCredentialsMissingDistributed = newErrFn(
 		"Credentials missing",
 		"Please set your credentials in the environment",
-		`In distributed server mode, access and secret keys should be specified via environment variables MINIO_ACCESS_KEY and MINIO_SECRET_KEY respectively`,
+		`In distributed server mode, access and secret keys should be specified via environment variables MINIO_ROOT_USER and MINIO_ROOT_PASSWORD respectively`,
 	)
 
 	ErrInvalidErasureEndpoints = newErrFn(
@@ -151,6 +198,12 @@ Example 1:
    $ minio server /data/minio/`,
 	)
 
+	ErrUnsupportedBackend = newErrFn(
+		"Unable to write to the backend",
+		"Please ensure your disk supports O_DIRECT",
+		"",
+	)
+
 	ErrUnableToWriteInBackend = newErrFn(
 		"Unable to write to the backend",
 		"Please ensure MinIO binary has write permissions for the backend",
@@ -167,12 +220,6 @@ Example 1:
 		"Unable to use specified port",
 		"Please ensure MinIO binary has 'cap_net_bind_service=+ep' permissions",
 		`Use 'sudo setcap cap_net_bind_service=+ep /path/to/minio' to provide sufficient permissions`,
-	)
-
-	ErrNoPermissionsToAccessDirFiles = newErrFn(
-		"Missing permissions to access the specified path",
-		"Please ensure the specified path can be accessed",
-		"",
 	)
 
 	ErrSSLUnexpectedError = newErrFn(
@@ -211,12 +258,6 @@ Example 1:
 		"",
 	)
 
-	ErrUnexpectedDataContent = newErrFn(
-		"Unexpected data content",
-		"Please contact MinIO at https://slack.min.io",
-		"",
-	)
-
 	ErrUnexpectedError = newErrFn(
 		"Unexpected error",
 		"Please contact MinIO at https://slack.min.io",
@@ -239,5 +280,11 @@ Example 1:
 		"Invalid gateway SSE configuration",
 		"",
 		"Refer to https://docs.min.io/docs/minio-kms-quickstart-guide.html for setting up SSE",
+	)
+
+	ErrInvalidReplicationWorkersValue = newErrFn(
+		"Invalid value for replication workers",
+		"",
+		"MINIO_API_REPLICATION_WORKERS: should be > 0",
 	)
 )

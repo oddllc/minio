@@ -52,7 +52,7 @@ func TestGetRequestAuthType(t *testing.T) {
 					"X-Amz-Content-Sha256": []string{streamingContentSHA256},
 					"Content-Encoding":     []string{streamingContentEncoding},
 				},
-				Method: "PUT",
+				Method: http.MethodPut,
 			},
 			authT: authTypeStreamingSigned,
 		},
@@ -111,7 +111,7 @@ func TestGetRequestAuthType(t *testing.T) {
 				Header: http.Header{
 					"Content-Type": []string{"multipart/form-data"},
 				},
-				Method: "POST",
+				Method: http.MethodPost,
 			},
 			authT: authTypePostPolicy,
 		},
@@ -212,7 +212,7 @@ func TestIsRequestPresignedSignatureV2(t *testing.T) {
 	for i, testCase := range testCases {
 		// creating an input HTTP request.
 		// Only the query parameters are relevant for this particular test.
-		inputReq, err := http.NewRequest("GET", "http://example.com", nil)
+		inputReq, err := http.NewRequest(http.MethodGet, "http://example.com", nil)
 		if err != nil {
 			t.Fatalf("Error initializing input HTTP request: %v", err)
 		}
@@ -246,7 +246,7 @@ func TestIsRequestPresignedSignatureV4(t *testing.T) {
 	for i, testCase := range testCases {
 		// creating an input HTTP request.
 		// Only the query parameters are relevant for this particular test.
-		inputReq, err := http.NewRequest("GET", "http://example.com", nil)
+		inputReq, err := http.NewRequest(http.MethodGet, "http://example.com", nil)
 		if err != nil {
 			t.Fatalf("Error initializing input HTTP request: %v", err)
 		}
@@ -369,15 +369,15 @@ func TestIsReqAuthenticated(t *testing.T) {
 		s3Error APIErrorCode
 	}{
 		// When request is unsigned, access denied is returned.
-		{mustNewRequest("GET", "http://127.0.0.1:9000", 0, nil, t), ErrAccessDenied},
+		{mustNewRequest(http.MethodGet, "http://127.0.0.1:9000", 0, nil, t), ErrAccessDenied},
 		// Empty Content-Md5 header.
-		{mustNewSignedEmptyMD5Request("PUT", "http://127.0.0.1:9000/", 5, bytes.NewReader([]byte("hello")), t), ErrInvalidDigest},
+		{mustNewSignedEmptyMD5Request(http.MethodPut, "http://127.0.0.1:9000/", 5, bytes.NewReader([]byte("hello")), t), ErrInvalidDigest},
 		// Short Content-Md5 header.
-		{mustNewSignedShortMD5Request("PUT", "http://127.0.0.1:9000/", 5, bytes.NewReader([]byte("hello")), t), ErrInvalidDigest},
+		{mustNewSignedShortMD5Request(http.MethodPut, "http://127.0.0.1:9000/", 5, bytes.NewReader([]byte("hello")), t), ErrInvalidDigest},
 		// When request is properly signed, but has bad Content-MD5 header.
-		{mustNewSignedBadMD5Request("PUT", "http://127.0.0.1:9000/", 5, bytes.NewReader([]byte("hello")), t), ErrBadDigest},
+		{mustNewSignedBadMD5Request(http.MethodPut, "http://127.0.0.1:9000/", 5, bytes.NewReader([]byte("hello")), t), ErrBadDigest},
 		// When request is properly signed, error is none.
-		{mustNewSignedRequest("GET", "http://127.0.0.1:9000", 0, nil, t), ErrNone},
+		{mustNewSignedRequest(http.MethodGet, "http://127.0.0.1:9000", 0, nil, t), ErrNone},
 	}
 
 	ctx := context.Background()
@@ -391,6 +391,7 @@ func TestIsReqAuthenticated(t *testing.T) {
 		}
 	}
 }
+
 func TestCheckAdminRequestAuthType(t *testing.T) {
 	objLayer, fsDir, err := prepareFS()
 	if err != nil {
@@ -412,16 +413,61 @@ func TestCheckAdminRequestAuthType(t *testing.T) {
 		Request *http.Request
 		ErrCode APIErrorCode
 	}{
-		{Request: mustNewRequest("GET", "http://127.0.0.1:9000", 0, nil, t), ErrCode: ErrAccessDenied},
-		{Request: mustNewSignedRequest("GET", "http://127.0.0.1:9000", 0, nil, t), ErrCode: ErrNone},
-		{Request: mustNewSignedV2Request("GET", "http://127.0.0.1:9000", 0, nil, t), ErrCode: ErrAccessDenied},
-		{Request: mustNewPresignedV2Request("GET", "http://127.0.0.1:9000", 0, nil, t), ErrCode: ErrAccessDenied},
-		{Request: mustNewPresignedRequest("GET", "http://127.0.0.1:9000", 0, nil, t), ErrCode: ErrAccessDenied},
+		{Request: mustNewRequest(http.MethodGet, "http://127.0.0.1:9000", 0, nil, t), ErrCode: ErrAccessDenied},
+		{Request: mustNewSignedRequest(http.MethodGet, "http://127.0.0.1:9000", 0, nil, t), ErrCode: ErrNone},
+		{Request: mustNewSignedV2Request(http.MethodGet, "http://127.0.0.1:9000", 0, nil, t), ErrCode: ErrAccessDenied},
+		{Request: mustNewPresignedV2Request(http.MethodGet, "http://127.0.0.1:9000", 0, nil, t), ErrCode: ErrAccessDenied},
+		{Request: mustNewPresignedRequest(http.MethodGet, "http://127.0.0.1:9000", 0, nil, t), ErrCode: ErrAccessDenied},
 	}
 	ctx := context.Background()
 	for i, testCase := range testCases {
-		if _, s3Error := checkAdminRequestAuthType(ctx, testCase.Request, iampolicy.AllAdminActions, globalServerRegion); s3Error != testCase.ErrCode {
+		if _, s3Error := checkAdminRequestAuth(ctx, testCase.Request, iampolicy.AllAdminActions, globalServerRegion); s3Error != testCase.ErrCode {
 			t.Errorf("Test %d: Unexpected s3error returned wanted %d, got %d", i, testCase.ErrCode, s3Error)
+		}
+	}
+}
+
+func TestValidateAdminSignature(t *testing.T) {
+
+	ctx := context.Background()
+
+	objLayer, fsDir, err := prepareFS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(fsDir)
+
+	if err = newTestConfig(globalMinioDefaultRegion, objLayer); err != nil {
+		t.Fatalf("unable initialize config file, %s", err)
+	}
+
+	creds, err := auth.CreateCredentials("admin", "mypassword")
+	if err != nil {
+		t.Fatalf("unable create credential, %s", err)
+	}
+	globalActiveCred = creds
+
+	testCases := []struct {
+		AccessKey string
+		SecretKey string
+		ErrCode   APIErrorCode
+	}{
+		{"", "", ErrInvalidAccessKeyID},
+		{"admin", "", ErrSignatureDoesNotMatch},
+		{"admin", "wrongpassword", ErrSignatureDoesNotMatch},
+		{"wronguser", "mypassword", ErrInvalidAccessKeyID},
+		{"", "mypassword", ErrInvalidAccessKeyID},
+		{"admin", "mypassword", ErrNone},
+	}
+
+	for i, testCase := range testCases {
+		req := mustNewRequest(http.MethodGet, "http://localhost:9000/", 0, nil, t)
+		if err := signRequestV4(req, testCase.AccessKey, testCase.SecretKey); err != nil {
+			t.Fatalf("Unable to inititalized new signed http request %s", err)
+		}
+		_, _, _, s3Error := validateAdminSignature(ctx, req, globalMinioDefaultRegion)
+		if s3Error != testCase.ErrCode {
+			t.Errorf("Test %d: Unexpected s3error returned wanted %d, got %d", i+1, testCase.ErrCode, s3Error)
 		}
 	}
 }

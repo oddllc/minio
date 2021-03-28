@@ -28,7 +28,7 @@ import (
 	"cloud.google.com/go/storage"
 	"google.golang.org/api/googleapi"
 
-	miniogo "github.com/minio/minio-go/v6"
+	miniogo "github.com/minio/minio-go/v7"
 	minio "github.com/minio/minio/cmd"
 )
 
@@ -478,7 +478,7 @@ func TestGCSAttrsToObjectInfo(t *testing.T) {
 	if objInfo.Bucket != attrs.Bucket {
 		t.Fatalf("Test failed with Bucket mistmatch, expected %s, got %s", attrs.Bucket, objInfo.Bucket)
 	}
-	if objInfo.ModTime != attrs.Updated {
+	if !objInfo.ModTime.Equal(attrs.Updated) {
 		t.Fatalf("Test failed with ModTime mistmatch, expected %s, got %s", attrs.Updated, objInfo.ModTime)
 	}
 	if objInfo.Size != attrs.Size {

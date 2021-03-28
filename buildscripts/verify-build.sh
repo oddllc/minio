@@ -33,6 +33,7 @@ export ACCESS_KEY="minio"
 export SECRET_KEY="minio123"
 export ENABLE_HTTPS=0
 export GO111MODULE=on
+export GOGC=25
 
 MINIO_CONFIG_DIR="$WORK_DIR/.minio"
 MINIO=( "$PWD/minio" --config-dir "$MINIO_CONFIG_DIR" )
@@ -45,88 +46,64 @@ FUNCTIONAL_TESTS="$WORK_DIR/functional-tests.sh"
 function start_minio_fs()
 {
     "${MINIO[@]}" server "${WORK_DIR}/fs-disk" >"$WORK_DIR/fs-minio.log" 2>&1 &
-    minio_pid=$!
     sleep 10
-
-    echo "$minio_pid"
 }
 
 function start_minio_erasure()
 {
     "${MINIO[@]}" server "${WORK_DIR}/erasure-disk1" "${WORK_DIR}/erasure-disk2" "${WORK_DIR}/erasure-disk3" "${WORK_DIR}/erasure-disk4" >"$WORK_DIR/erasure-minio.log" 2>&1 &
-    minio_pid=$!
     sleep 15
-
-    echo "$minio_pid"
 }
 
 function start_minio_erasure_sets()
 {
-    "${MINIO[@]}" server "${WORK_DIR}/erasure-disk-sets{1...32}" >"$WORK_DIR/erasure-minio-sets.log" 2>&1 &
-    minio_pid=$!
+    export MINIO_ENDPOINTS="${WORK_DIR}/erasure-disk-sets{1...32}"
+    "${MINIO[@]}" server > "$WORK_DIR/erasure-minio-sets.log" 2>&1 &
     sleep 15
-
-    echo "$minio_pid"
 }
 
-function start_minio_zone_erasure_sets()
+function start_minio_pool_erasure_sets()
 {
-    declare -a minio_pids
-    export MINIO_ACCESS_KEY=$ACCESS_KEY
-    export MINIO_SECRET_KEY=$SECRET_KEY
-
-    "${MINIO[@]}" server --address=:9000 "http://127.0.0.1:9000${WORK_DIR}/zone-disk-sets{1...4}" "http://127.0.0.1:9001${WORK_DIR}/zone-disk-sets{5...8}" >"$WORK_DIR/zone-minio-9000.log" 2>&1 &
-    minio_pids[0]=$!
-
-    "${MINIO[@]}" server --address=:9001 "http://127.0.0.1:9000${WORK_DIR}/zone-disk-sets{1...4}" "http://127.0.0.1:9001${WORK_DIR}/zone-disk-sets{5...8}" >"$WORK_DIR/zone-minio-9001.log" 2>&1 &
-    minio_pids[1]=$!
+    export MINIO_ROOT_USER=$ACCESS_KEY
+    export MINIO_ROOT_PASSWORD=$SECRET_KEY
+    export MINIO_ENDPOINTS="http://127.0.0.1:9000${WORK_DIR}/pool-disk-sets{1...4} http://127.0.0.1:9001${WORK_DIR}/pool-disk-sets{5...8}"
+    "${MINIO[@]}" server --address ":9000" > "$WORK_DIR/pool-minio-9000.log" 2>&1 &
+    "${MINIO[@]}" server --address ":9001" > "$WORK_DIR/pool-minio-9001.log" 2>&1 &
 
     sleep 40
-    echo "${minio_pids[@]}"
 }
 
-function start_minio_zone_erasure_sets_ipv6()
+function start_minio_pool_erasure_sets_ipv6()
 {
-    declare -a minio_pids
-    export MINIO_ACCESS_KEY=$ACCESS_KEY
-    export MINIO_SECRET_KEY=$SECRET_KEY
-
-    "${MINIO[@]}" server --address="[::1]:9000" "http://[::1]:9000${WORK_DIR}/zone-disk-sets{1...4}" "http://[::1]:9001${WORK_DIR}/zone-disk-sets{5...8}" >"$WORK_DIR/zone-minio-9000.log" 2>&1 &
-    minio_pids[0]=$!
-
-    "${MINIO[@]}" server --address="[::1]:9001" "http://[::1]:9000${WORK_DIR}/zone-disk-sets{1...4}" "http://[::1]:9001${WORK_DIR}/zone-disk-sets{5...8}" >"$WORK_DIR/zone-minio-9001.log" 2>&1 &
-    minio_pids[1]=$!
+    export MINIO_ROOT_USER=$ACCESS_KEY
+    export MINIO_ROOT_PASSWORD=$SECRET_KEY
+    export MINIO_ENDPOINTS="http://[::1]:9000${WORK_DIR}/pool-disk-sets{1...4} http://[::1]:9001${WORK_DIR}/pool-disk-sets{5...8}"
+    "${MINIO[@]}" server --address="[::1]:9000" > "$WORK_DIR/pool-minio-ipv6-9000.log" 2>&1 &
+    "${MINIO[@]}" server --address="[::1]:9001" > "$WORK_DIR/pool-minio-ipv6-9001.log" 2>&1 &
 
     sleep 40
-    echo "${minio_pids[@]}"
 }
 
 function start_minio_dist_erasure()
 {
-    declare -a minio_pids
-    export MINIO_ACCESS_KEY=$ACCESS_KEY
-    export MINIO_SECRET_KEY=$SECRET_KEY
-    "${MINIO[@]}" server --address=:9000 "http://127.0.0.1:9000${WORK_DIR}/dist-disk1" "http://127.0.0.1:9001${WORK_DIR}/dist-disk2" "http://127.0.0.1:9002${WORK_DIR}/dist-disk3" "http://127.0.0.1:9003${WORK_DIR}/dist-disk4" >"$WORK_DIR/dist-minio-9000.log" 2>&1 &
-    minio_pids[0]=$!
-    "${MINIO[@]}" server --address=:9001 "http://127.0.0.1:9000${WORK_DIR}/dist-disk1" "http://127.0.0.1:9001${WORK_DIR}/dist-disk2" "http://127.0.0.1:9002${WORK_DIR}/dist-disk3" "http://127.0.0.1:9003${WORK_DIR}/dist-disk4" >"$WORK_DIR/dist-minio-9001.log" 2>&1 &
-    minio_pids[1]=$!
-    "${MINIO[@]}" server --address=:9002 "http://127.0.0.1:9000${WORK_DIR}/dist-disk1" "http://127.0.0.1:9001${WORK_DIR}/dist-disk2" "http://127.0.0.1:9002${WORK_DIR}/dist-disk3" "http://127.0.0.1:9003${WORK_DIR}/dist-disk4" >"$WORK_DIR/dist-minio-9002.log" 2>&1 &
-    minio_pids[2]=$!
-    "${MINIO[@]}" server --address=:9003 "http://127.0.0.1:9000${WORK_DIR}/dist-disk1" "http://127.0.0.1:9001${WORK_DIR}/dist-disk2" "http://127.0.0.1:9002${WORK_DIR}/dist-disk3" "http://127.0.0.1:9003${WORK_DIR}/dist-disk4" >"$WORK_DIR/dist-minio-9003.log" 2>&1 &
-    minio_pids[3]=$!
+    export MINIO_ROOT_USER=$ACCESS_KEY
+    export MINIO_ROOT_PASSWORD=$SECRET_KEY
+    export MINIO_ENDPOINTS="http://127.0.0.1:9000${WORK_DIR}/dist-disk1 http://127.0.0.1:9001${WORK_DIR}/dist-disk2 http://127.0.0.1:9002${WORK_DIR}/dist-disk3 http://127.0.0.1:9003${WORK_DIR}/dist-disk4"
+    for i in $(seq 0 3); do
+        "${MINIO[@]}" server --address ":900${i}" > "$WORK_DIR/dist-minio-900${i}.log" 2>&1 &
+    done
 
     sleep 40
-    echo "${minio_pids[@]}"
 }
 
 function run_test_fs()
 {
-    minio_pid="$(start_minio_fs)"
+    start_minio_fs
 
     (cd "$WORK_DIR" && "$FUNCTIONAL_TESTS")
     rv=$?
 
-    kill "$minio_pid"
+    pkill minio
     sleep 3
 
     if [ "$rv" -ne 0 ]; then
@@ -137,13 +114,14 @@ function run_test_fs()
     return "$rv"
 }
 
-function run_test_erasure_sets() {
-    minio_pid="$(start_minio_erasure_sets)"
+function run_test_erasure_sets()
+{
+    start_minio_erasure_sets
 
     (cd "$WORK_DIR" && "$FUNCTIONAL_TESTS")
     rv=$?
 
-    kill "$minio_pid"
+    pkill minio
     sleep 3
 
     if [ "$rv" -ne 0 ]; then
@@ -154,83 +132,51 @@ function run_test_erasure_sets() {
     return "$rv"
 }
 
-function run_test_dist_erasure_sets_ipv6()
+function run_test_pool_erasure_sets()
 {
-    minio_pids=( $(start_minio_dist_erasure_sets_ipv6) )
+    start_minio_pool_erasure_sets
+
+    (cd "$WORK_DIR" && "$FUNCTIONAL_TESTS")
+    rv=$?
+
+    pkill minio
+    sleep 3
+
+    if [ "$rv" -ne 0 ]; then
+        for i in $(seq 0 1); do
+            echo "server$i log:"
+            cat "$WORK_DIR/pool-minio-900$i.log"
+        done
+    fi
+
+    for i in $(seq 0 1); do
+        rm -f "$WORK_DIR/pool-minio-900$i.log"
+    done
+
+    return "$rv"
+}
+
+function run_test_pool_erasure_sets_ipv6()
+{
+    start_minio_pool_erasure_sets_ipv6
 
     export SERVER_ENDPOINT="[::1]:9000"
 
     (cd "$WORK_DIR" && "$FUNCTIONAL_TESTS")
     rv=$?
 
-    for pid in "${minio_pids[@]}"; do
-        kill "$pid"
-    done
-    sleep 3
-
-    if [ "$rv" -ne 0 ]; then
-        for i in $(seq 0 9); do
-            echo "server$i log:"
-            cat "$WORK_DIR/dist-minio-v6-900$i.log"
-        done
-    fi
-
-    for i in $(seq 0 9); do
-        rm -f "$WORK_DIR/dist-minio-v6-900$i.log"
-    done
-
-    return "$rv"
-}
-
-function run_test_zone_erasure_sets()
-{
-    minio_pids=( $(start_minio_zone_erasure_sets) )
-
-    (cd "$WORK_DIR" && "$FUNCTIONAL_TESTS")
-    rv=$?
-
-    for pid in "${minio_pids[@]}"; do
-        kill "$pid"
-    done
+    pkill minio
     sleep 3
 
     if [ "$rv" -ne 0 ]; then
         for i in $(seq 0 1); do
             echo "server$i log:"
-            cat "$WORK_DIR/zone-minio-900$i.log"
+            cat "$WORK_DIR/pool-minio-ipv6-900$i.log"
         done
     fi
 
     for i in $(seq 0 1); do
-        rm -f "$WORK_DIR/zone-minio-900$i.log"
-    done
-
-    return "$rv"
-}
-
-function run_test_zone_erasure_sets_ipv6()
-{
-    minio_pids=( $(start_minio_zone_erasure_sets_ipv6) )
-
-    export SERVER_ENDPOINT="[::1]:9000"
-
-    (cd "$WORK_DIR" && "$FUNCTIONAL_TESTS")
-    rv=$?
-
-    for pid in "${minio_pids[@]}"; do
-        kill "$pid"
-    done
-    sleep 3
-
-    if [ "$rv" -ne 0 ]; then
-        for i in $(seq 0 1); do
-            echo "server$i log:"
-            cat "$WORK_DIR/zone-minio-ipv6-900$i.log"
-        done
-    fi
-
-    for i in $(seq 0 1); do
-        rm -f "$WORK_DIR/zone-minio-ipv6-900$i.log"
+        rm -f "$WORK_DIR/pool-minio-ipv6-900$i.log"
     done
 
     return "$rv"
@@ -238,12 +184,12 @@ function run_test_zone_erasure_sets_ipv6()
 
 function run_test_erasure()
 {
-    minio_pid="$(start_minio_erasure)"
+    start_minio_erasure
 
     (cd "$WORK_DIR" && "$FUNCTIONAL_TESTS")
     rv=$?
 
-    kill "$minio_pid"
+    pkill minio
     sleep 3
 
     if [ "$rv" -ne 0 ]; then
@@ -256,14 +202,12 @@ function run_test_erasure()
 
 function run_test_dist_erasure()
 {
-    minio_pids=( $(start_minio_dist_erasure) )
+    start_minio_dist_erasure
 
     (cd "$WORK_DIR" && "$FUNCTIONAL_TESTS")
     rv=$?
 
-    for pid in "${minio_pids[@]}"; do
-        kill "$pid"
-    done
+    pkill minio
     sleep 3
 
     if [ "$rv" -ne 0 ]; then
@@ -279,7 +223,7 @@ function run_test_dist_erasure()
 
     rm -f "$WORK_DIR/dist-minio-9000.log" "$WORK_DIR/dist-minio-9001.log" "$WORK_DIR/dist-minio-9002.log" "$WORK_DIR/dist-minio-9003.log"
 
-   return "$rv"
+    return "$rv"
 }
 
 function purge()
@@ -352,14 +296,14 @@ function main()
     fi
 
     echo "Testing in Distributed Eraure expanded setup"
-    if ! run_test_zone_erasure_sets; then
+    if ! run_test_pool_erasure_sets; then
         echo "FAILED"
         purge "$WORK_DIR"
         exit 1
     fi
 
     echo "Testing in Distributed Erasure expanded setup with ipv6"
-    if ! run_test_zone_erasure_sets_ipv6; then
+    if ! run_test_pool_erasure_sets_ipv6; then
         echo "FAILED"
         purge "$WORK_DIR"
         exit 1

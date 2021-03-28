@@ -29,8 +29,10 @@ import (
 //   path: 'bucket/' or '/bucket/' => Heal bucket
 //   path: 'bucket/object' => Heal object
 type healTask struct {
-	path string
-	opts madmin.HealOpts
+	bucket    string
+	object    string
+	versionID string
+	opts      madmin.HealOpts
 	// Healing response will be sent here
 	responseCh chan healResult
 }
@@ -52,49 +54,77 @@ func (h *healRoutine) queueHealTask(task healTask) {
 	h.tasks <- task
 }
 
+func waitForLowHTTPReq(maxIO int, maxWait time.Duration) {
+	// No need to wait run at full speed.
+	if maxIO <= 0 {
+		return
+	}
+
+	// At max 10 attempts to wait with 100 millisecond interval before proceeding
+	waitTick := 100 * time.Millisecond
+
+	// Bucket notification and http trace are not costly, it is okay to ignore them
+	// while counting the number of concurrent connections
+	maxIOFn := func() int {
+		return maxIO + int(globalHTTPListen.NumSubscribers()) + int(globalTrace.NumSubscribers())
+	}
+
+	tmpMaxWait := maxWait
+	if httpServer := newHTTPServerFn(); httpServer != nil {
+		// Any requests in progress, delay the heal.
+		for httpServer.GetRequestCount() >= maxIOFn() {
+			if tmpMaxWait > 0 {
+				if tmpMaxWait < waitTick {
+					time.Sleep(tmpMaxWait)
+				} else {
+					time.Sleep(waitTick)
+				}
+				tmpMaxWait = tmpMaxWait - waitTick
+			}
+			if tmpMaxWait <= 0 {
+				if intDataUpdateTracker.debug {
+					logger.Info("waitForLowHTTPReq: waited max %s, resuming", maxWait)
+				}
+				break
+			}
+		}
+	}
+}
+
 // Wait for heal requests and process them
-func (h *healRoutine) run() {
-	ctx := context.Background()
+func (h *healRoutine) run(ctx context.Context, objAPI ObjectLayer) {
 	for {
 		select {
 		case task, ok := <-h.tasks:
 			if !ok {
-				break
-			}
-			if httpServer := newHTTPServerFn(); httpServer != nil {
-				// Wait at max 10 minute for an inprogress request before proceeding to heal
-				waitCount := 600
-				// Any requests in progress, delay the heal.
-				for (httpServer.GetRequestCount() >= int32(globalEndpoints.Nodes())) &&
-					waitCount > 0 {
-					waitCount--
-					time.Sleep(1 * time.Second)
-				}
+				return
 			}
 
 			var res madmin.HealResultItem
 			var err error
-			bucket, object := urlPath2BucketObjectName(task.path)
-			switch {
-			case bucket == "" && object == "":
-				res, err = bgHealDiskFormat(ctx, task.opts)
-			case bucket != "" && object == "":
-				res, err = bgHealBucket(ctx, bucket, task.opts)
-			case bucket != "" && object != "":
-				res, err = bgHealObject(ctx, bucket, object, task.opts)
+			switch task.bucket {
+			case nopHeal:
+				continue
+			case SlashSeparator:
+				res, err = healDiskFormat(ctx, objAPI, task.opts)
+			default:
+				if task.object == "" {
+					res, err = objAPI.HealBucket(ctx, task.bucket, task.opts)
+				} else {
+					res, err = objAPI.HealObject(ctx, task.bucket, task.object, task.versionID, task.opts)
+				}
 			}
-			if task.responseCh != nil {
-				task.responseCh <- healResult{result: res, err: err}
-			}
+			task.responseCh <- healResult{result: res, err: err}
+
 		case <-h.doneCh:
 			return
-		case <-GlobalServiceDoneCh:
+		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-func initHealRoutine() *healRoutine {
+func newHealRoutine() *healRoutine {
 	return &healRoutine{
 		tasks:  make(chan healTask),
 		doneCh: make(chan struct{}),
@@ -102,45 +132,10 @@ func initHealRoutine() *healRoutine {
 
 }
 
-func startBackgroundHealing() {
-	ctx := context.Background()
-
-	var objAPI ObjectLayer
-	for {
-		objAPI = newObjectLayerWithoutSafeModeFn()
-		if objAPI == nil {
-			time.Sleep(time.Second)
-			continue
-		}
-		break
-	}
-
-	// Run the background healer
-	globalBackgroundHealRoutine = initHealRoutine()
-	go globalBackgroundHealRoutine.run()
-
-	// Launch the background healer sequence to track
-	// background healing operations
-	info := objAPI.StorageInfo(ctx)
-	numDisks := info.Backend.OnlineDisks.Sum() + info.Backend.OfflineDisks.Sum()
-	nh := newBgHealSequence(numDisks)
-	globalBackgroundHealState.LaunchNewHealSequence(nh)
-}
-
-func initBackgroundHealing() {
-	go startBackgroundHealing()
-}
-
-// bgHealDiskFormat - heals format.json, return value indicates if a
+// healDiskFormat - heals format.json, return value indicates if a
 // failure error occurred.
-func bgHealDiskFormat(ctx context.Context, opts madmin.HealOpts) (madmin.HealResultItem, error) {
-	// Get current object layer instance.
-	objectAPI := newObjectLayerWithoutSafeModeFn()
-	if objectAPI == nil {
-		return madmin.HealResultItem{}, errServerNotInitialized
-	}
-
-	res, err := objectAPI.HealFormat(ctx, opts.DryRun)
+func healDiskFormat(ctx context.Context, objAPI ObjectLayer, opts madmin.HealOpts) (madmin.HealResultItem, error) {
+	res, err := objAPI.HealFormat(ctx, opts.DryRun)
 
 	// return any error, ignore error returned when disks have
 	// already healed.
@@ -148,37 +143,5 @@ func bgHealDiskFormat(ctx context.Context, opts madmin.HealOpts) (madmin.HealRes
 		return madmin.HealResultItem{}, err
 	}
 
-	// Healing succeeded notify the peers to reload format and re-initialize disks.
-	// We will not notify peers if healing is not required.
-	if err == nil {
-		for _, nerr := range globalNotificationSys.ReloadFormat(opts.DryRun) {
-			if nerr.Err != nil {
-				logger.GetReqInfo(ctx).SetTags("peerAddress", nerr.Host.String())
-				logger.LogIf(ctx, nerr.Err)
-			}
-		}
-	}
-
 	return res, nil
-}
-
-// bghealBucket - traverses and heals given bucket
-func bgHealBucket(ctx context.Context, bucket string, opts madmin.HealOpts) (madmin.HealResultItem, error) {
-	// Get current object layer instance.
-	objectAPI := newObjectLayerWithoutSafeModeFn()
-	if objectAPI == nil {
-		return madmin.HealResultItem{}, errServerNotInitialized
-	}
-
-	return objectAPI.HealBucket(ctx, bucket, opts.DryRun, opts.Remove)
-}
-
-// bgHealObject - heal the given object and record result
-func bgHealObject(ctx context.Context, bucket, object string, opts madmin.HealOpts) (madmin.HealResultItem, error) {
-	// Get current object layer instance.
-	objectAPI := newObjectLayerWithoutSafeModeFn()
-	if objectAPI == nil {
-		return madmin.HealResultItem{}, errServerNotInitialized
-	}
-	return objectAPI.HealObject(ctx, bucket, object, opts.DryRun, opts.Remove, opts.ScanMode)
 }

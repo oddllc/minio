@@ -24,9 +24,6 @@ jest.mock("jwt-decode")
 jwtDecode.mockImplementation(() => ({ sub: "minio" }))
 
 jest.mock("../../web", () => ({
-  GenerateAuth: jest.fn(() => {
-    return Promise.resolve({ accessKey: "gen1", secretKey: "gen2" })
-  }),
   SetAuth: jest.fn(
     ({ currentAccessKey, currentSecretKey, newAccessKey, newSecretKey }) => {
       if (
@@ -62,17 +59,6 @@ describe("ChangePasswordModal", () => {
 
   it("should render without crashing", () => {
     shallow(<ChangePasswordModal serverInfo={serverInfo} />)
-  })
-
-  it("should not allow changing password when isWorm is true", () => {
-    const newServerInfo = { ...serverInfo, info: { isWorm: true } }
-    const wrapper = shallow(<ChangePasswordModal serverInfo={newServerInfo} />)
-    expect(
-      wrapper
-        .find("ModalBody")
-        .childAt(0)
-        .text()
-    ).toBe("Credentials of this user cannot be updated through MinIO Browser.")
   })
 
   it("should not allow changing password when not IAM user", () => {

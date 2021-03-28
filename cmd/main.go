@@ -29,10 +29,12 @@ import (
 
 // GlobalFlags - global flags for minio.
 var GlobalFlags = []cli.Flag{
+	// Deprecated flag, so its hidden now - existing deployments will keep working.
 	cli.StringFlag{
-		Name:  "config-dir, C",
-		Value: defaultConfigDir.Get(),
-		Usage: "[DEPRECATED] path to legacy configuration directory",
+		Name:   "config-dir, C",
+		Value:  defaultConfigDir.Get(),
+		Usage:  "[DEPRECATED] path to legacy configuration directory",
+		Hidden: true,
 	},
 	cli.StringFlag{
 		Name:  "certs-dir, S",
@@ -51,9 +53,17 @@ var GlobalFlags = []cli.Flag{
 		Name:  "json",
 		Usage: "output server logs and startup information in json format",
 	},
+	// Deprecated flag, so its hidden now, existing deployments will keep working.
 	cli.BoolFlag{
-		Name:  "compat",
-		Usage: "enable strict S3 compatibility by turning off certain performance optimizations",
+		Name:   "compat",
+		Usage:  "enable strict S3 compatibility by turning off certain performance optimizations",
+		Hidden: true,
+	},
+	// This flag is hidden and to be used only during certain performance testing.
+	cli.BoolFlag{
+		Name:   "no-compat",
+		Usage:  "disable strict S3 compatibility by turning on certain performance optimizations",
+		Hidden: true,
 	},
 }
 
@@ -74,7 +84,7 @@ FLAGS:
   {{range .VisibleFlags}}{{.}}
   {{end}}{{end}}
 VERSION:
-{{.Version}}
+  {{.Version}}
 `
 
 func newApp(name string) *cli.App {
@@ -92,21 +102,19 @@ func newApp(name string) *cli.App {
 
 	findClosestCommands := func(command string) []string {
 		var closestCommands []string
-		for _, value := range commandsTree.PrefixMatch(command) {
-			closestCommands = append(closestCommands, value.(string))
-		}
+		closestCommands = append(closestCommands, commandsTree.PrefixMatch(command)...)
 
 		sort.Strings(closestCommands)
 		// Suggest other close commands - allow missed, wrongly added and
 		// even transposed characters
 		for _, value := range commandsTree.Walk(commandsTree.Root()) {
-			if sort.SearchStrings(closestCommands, value.(string)) < len(closestCommands) {
+			if sort.SearchStrings(closestCommands, value) < len(closestCommands) {
 				continue
 			}
 			// 2 is arbitrary and represents the max
 			// allowed number of typed errors
-			if words.DamerauLevenshteinDistance(command, value.(string)) < 2 {
-				closestCommands = append(closestCommands, value.(string))
+			if words.DamerauLevenshteinDistance(command, value) < 2 {
+				closestCommands = append(closestCommands, value)
 			}
 		}
 

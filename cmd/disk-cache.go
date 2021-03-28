@@ -1,5 +1,5 @@
 /*
- * MinIO Cloud Storage, (C) 2019 MinIO, Inc.
+ * MinIO Cloud Storage, (C) 2019,2020 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,24 +21,47 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
-	"os"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/djherbis/atime"
 	"github.com/minio/minio/cmd/config/cache"
+	xhttp "github.com/minio/minio/cmd/http"
 	"github.com/minio/minio/cmd/logger"
+	objectlock "github.com/minio/minio/pkg/bucket/object/lock"
 	"github.com/minio/minio/pkg/color"
+	"github.com/minio/minio/pkg/hash"
 	"github.com/minio/minio/pkg/sync/errgroup"
 	"github.com/minio/minio/pkg/wildcard"
 )
 
 const (
-	cacheBlkSize = int64(1 * 1024 * 1024)
+	cacheBlkSize          = 1 << 20
+	cacheGCInterval       = time.Minute * 30
+	writeBackStatusHeader = ReservedMetadataPrefixLower + "write-back-status"
+	writeBackRetryHeader  = ReservedMetadataPrefixLower + "write-back-retry"
 )
+
+type cacheCommitStatus string
+
+const (
+	// CommitPending - cache writeback with backend is pending.
+	CommitPending cacheCommitStatus = "pending"
+
+	// CommitComplete - cache writeback completed ok.
+	CommitComplete cacheCommitStatus = "complete"
+
+	// CommitFailed - cache writeback needs a retry.
+	CommitFailed cacheCommitStatus = "failed"
+)
+
+// String returns string representation of status
+func (s cacheCommitStatus) String() string {
+	return string(s)
+}
 
 // CacheStorageInfo - represents total, free capacity of
 // underlying cache storage.
@@ -52,9 +75,10 @@ type CacheObjectLayer interface {
 	// Object operations.
 	GetObjectNInfo(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, lockType LockType, opts ObjectOptions) (gr *GetObjectReader, err error)
 	GetObjectInfo(ctx context.Context, bucket, object string, opts ObjectOptions) (objInfo ObjectInfo, err error)
-	DeleteObject(ctx context.Context, bucket, object string) error
-	DeleteObjects(ctx context.Context, bucket string, objects []string) ([]error, error)
+	DeleteObject(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error)
+	DeleteObjects(ctx context.Context, bucket string, objects []ObjectToDelete, opts ObjectOptions) ([]DeletedObject, []error)
 	PutObject(ctx context.Context, bucket, object string, data *PutObjReader, opts ObjectOptions) (objInfo ObjectInfo, err error)
+	CopyObject(ctx context.Context, srcBucket, srcObject, destBucket, destObject string, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (objInfo ObjectInfo, err error)
 	// Storage operations.
 	StorageInfo(ctx context.Context) CacheStorageInfo
 	CacheStats() *CacheStats
@@ -66,79 +90,63 @@ type cacheObjects struct {
 	cache []*diskCache
 	// file path patterns to exclude from cache
 	exclude []string
-
+	// number of accesses after which to cache an object
+	after int
+	// commit objects in async manner
+	commitWriteback bool
 	// if true migration is in progress from v1 to v2
 	migrating bool
 	// mutex to protect migration bool
 	migMutex sync.Mutex
-
-	// nsMutex namespace lock
-	nsMutex *nsLockMap
-
+	// retry queue for writeback cache mode to reattempt upload to backend
+	wbRetryCh chan ObjectInfo
 	// Cache stats
 	cacheStats *CacheStats
 
-	// Object functions pointing to the corresponding functions of backend implementation.
-	NewNSLockFn      func(ctx context.Context, bucket, object string) RWLocker
-	GetObjectNInfoFn func(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, lockType LockType, opts ObjectOptions) (gr *GetObjectReader, err error)
-	GetObjectInfoFn  func(ctx context.Context, bucket, object string, opts ObjectOptions) (objInfo ObjectInfo, err error)
-	DeleteObjectFn   func(ctx context.Context, bucket, object string) error
-	DeleteObjectsFn  func(ctx context.Context, bucket string, objects []string) ([]error, error)
-	PutObjectFn      func(ctx context.Context, bucket, object string, data *PutObjReader, opts ObjectOptions) (objInfo ObjectInfo, err error)
+	InnerGetObjectNInfoFn func(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, lockType LockType, opts ObjectOptions) (gr *GetObjectReader, err error)
+	InnerGetObjectInfoFn  func(ctx context.Context, bucket, object string, opts ObjectOptions) (objInfo ObjectInfo, err error)
+	InnerDeleteObjectFn   func(ctx context.Context, bucket, object string, opts ObjectOptions) (objInfo ObjectInfo, err error)
+	InnerPutObjectFn      func(ctx context.Context, bucket, object string, data *PutObjReader, opts ObjectOptions) (objInfo ObjectInfo, err error)
+	InnerCopyObjectFn     func(ctx context.Context, srcBucket, srcObject, destBucket, destObject string, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (objInfo ObjectInfo, err error)
 }
 
-func (c *cacheObjects) delete(ctx context.Context, dcache *diskCache, bucket, object string) (err error) {
-	cLock := c.NewNSLockFn(ctx, bucket, object)
-	if err := cLock.GetLock(globalObjectTimeout); err != nil {
-		return err
-	}
-	defer cLock.Unlock()
-	return dcache.Delete(ctx, bucket, object)
+func (c *cacheObjects) incHitsToMeta(ctx context.Context, dcache *diskCache, bucket, object string, size int64, eTag string, rs *HTTPRangeSpec) error {
+	metadata := map[string]string{"etag": eTag}
+	return dcache.SaveMetadata(ctx, bucket, object, metadata, size, rs, "", true)
 }
 
-func (c *cacheObjects) put(ctx context.Context, dcache *diskCache, bucket, object string, data io.Reader, size int64, rs *HTTPRangeSpec, opts ObjectOptions) error {
-	cLock := c.NewNSLockFn(ctx, bucket, object)
-	if err := cLock.GetLock(globalObjectTimeout); err != nil {
-		return err
+// Backend metadata could have changed through server side copy - reset cache metadata if that is the case
+func (c *cacheObjects) updateMetadataIfChanged(ctx context.Context, dcache *diskCache, bucket, object string, bkObjectInfo, cacheObjInfo ObjectInfo, rs *HTTPRangeSpec) error {
+
+	bkMeta := make(map[string]string, len(bkObjectInfo.UserDefined))
+	cacheMeta := make(map[string]string, len(cacheObjInfo.UserDefined))
+	for k, v := range bkObjectInfo.UserDefined {
+		if strings.HasPrefix(strings.ToLower(k), ReservedMetadataPrefixLower) {
+			// Do not need to send any internal metadata
+			continue
+		}
+		bkMeta[http.CanonicalHeaderKey(k)] = v
 	}
-	defer cLock.Unlock()
-	return dcache.Put(ctx, bucket, object, data, size, rs, opts)
-}
-
-func (c *cacheObjects) get(ctx context.Context, dcache *diskCache, bucket, object string, rs *HTTPRangeSpec, h http.Header, opts ObjectOptions) (gr *GetObjectReader, err error) {
-	cLock := c.NewNSLockFn(ctx, bucket, object)
-	if err := cLock.GetRLock(globalObjectTimeout); err != nil {
-		return nil, err
-	}
-
-	defer cLock.RUnlock()
-	return dcache.Get(ctx, bucket, object, rs, h, opts)
-}
-
-func (c *cacheObjects) stat(ctx context.Context, dcache *diskCache, bucket, object string) (oi ObjectInfo, err error) {
-	cLock := c.NewNSLockFn(ctx, bucket, object)
-	if err := cLock.GetRLock(globalObjectTimeout); err != nil {
-		return oi, err
+	for k, v := range cacheObjInfo.UserDefined {
+		if strings.HasPrefix(strings.ToLower(k), ReservedMetadataPrefixLower) {
+			// Do not need to send any internal metadata
+			continue
+		}
+		cacheMeta[http.CanonicalHeaderKey(k)] = v
 	}
 
-	defer cLock.RUnlock()
-	return dcache.Stat(ctx, bucket, object)
-}
-
-func (c *cacheObjects) statRange(ctx context.Context, dcache *diskCache, bucket, object string, rs *HTTPRangeSpec) (oi ObjectInfo, err error) {
-	cLock := c.NewNSLockFn(ctx, bucket, object)
-	if err := cLock.GetRLock(globalObjectTimeout); err != nil {
-		return oi, err
+	if !isMetadataSame(bkMeta, cacheMeta) ||
+		bkObjectInfo.ETag != cacheObjInfo.ETag ||
+		bkObjectInfo.ContentType != cacheObjInfo.ContentType ||
+		!bkObjectInfo.Expires.Equal(cacheObjInfo.Expires) {
+		return dcache.SaveMetadata(ctx, bucket, object, getMetadata(bkObjectInfo), bkObjectInfo.Size, nil, "", false)
 	}
-
-	defer cLock.RUnlock()
-	oi, _, err = dcache.statRange(ctx, bucket, object, rs)
-	return oi, err
+	return c.incHitsToMeta(ctx, dcache, bucket, object, cacheObjInfo.Size, cacheObjInfo.ETag, rs)
 }
 
 // DeleteObject clears cache entry if backend delete operation succeeds
-func (c *cacheObjects) DeleteObject(ctx context.Context, bucket, object string) (err error) {
-	if err = c.DeleteObjectFn(ctx, bucket, object); err != nil {
+func (c *cacheObjects) DeleteObject(ctx context.Context, bucket, object string, opts ObjectOptions) (objInfo ObjectInfo, err error) {
+	if objInfo, err = c.InnerDeleteObjectFn(ctx, bucket, object, opts); err != nil {
 		return
 	}
 	if c.isCacheExclude(bucket, object) || c.skipCache() {
@@ -147,34 +155,52 @@ func (c *cacheObjects) DeleteObject(ctx context.Context, bucket, object string) 
 
 	dcache, cerr := c.getCacheLoc(bucket, object)
 	if cerr != nil {
-		return
+		return objInfo, cerr
 	}
-	if dcache.Exists(ctx, bucket, object) {
-		c.delete(ctx, dcache, bucket, object)
-	}
+	dcache.Delete(ctx, bucket, object)
 	return
 }
 
 // DeleteObjects batch deletes objects in slice, and clears any cached entries
-func (c *cacheObjects) DeleteObjects(ctx context.Context, bucket string, objects []string) ([]error, error) {
+func (c *cacheObjects) DeleteObjects(ctx context.Context, bucket string, objects []ObjectToDelete, opts ObjectOptions) ([]DeletedObject, []error) {
 	errs := make([]error, len(objects))
+	objInfos := make([]ObjectInfo, len(objects))
 	for idx, object := range objects {
-		errs[idx] = c.DeleteObject(ctx, bucket, object)
+		opts.VersionID = object.VersionID
+		objInfos[idx], errs[idx] = c.DeleteObject(ctx, bucket, object.ObjectName, opts)
 	}
-	return errs, nil
+	deletedObjects := make([]DeletedObject, len(objInfos))
+	for idx := range errs {
+		if errs[idx] != nil {
+			continue
+		}
+		if objInfos[idx].DeleteMarker {
+			deletedObjects[idx] = DeletedObject{
+				DeleteMarker:          objInfos[idx].DeleteMarker,
+				DeleteMarkerVersionID: objInfos[idx].VersionID,
+			}
+			continue
+		}
+		deletedObjects[idx] = DeletedObject{
+			ObjectName: objInfos[idx].Name,
+			VersionID:  objInfos[idx].VersionID,
+		}
+	}
+	return deletedObjects, errs
 }
 
 // construct a metadata k-v map
 func getMetadata(objInfo ObjectInfo) map[string]string {
-	metadata := make(map[string]string)
+	metadata := make(map[string]string, len(objInfo.UserDefined)+4)
 	metadata["etag"] = objInfo.ETag
 	metadata["content-type"] = objInfo.ContentType
 	if objInfo.ContentEncoding != "" {
 		metadata["content-encoding"] = objInfo.ContentEncoding
 	}
-	if objInfo.Expires != timeSentinel {
+	if !objInfo.Expires.Equal(timeSentinel) {
 		metadata["expires"] = objInfo.Expires.Format(http.TimeFormat)
 	}
+	metadata["last-modified"] = objInfo.ModTime.Format(http.TimeFormat)
 	for k, v := range objInfo.UserDefined {
 		metadata[k] = v
 	}
@@ -189,17 +215,17 @@ func (c *cacheObjects) incCacheStats(size int64) {
 
 func (c *cacheObjects) GetObjectNInfo(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, lockType LockType, opts ObjectOptions) (gr *GetObjectReader, err error) {
 	if c.isCacheExclude(bucket, object) || c.skipCache() {
-		return c.GetObjectNInfoFn(ctx, bucket, object, rs, h, lockType, opts)
+		return c.InnerGetObjectNInfoFn(ctx, bucket, object, rs, h, lockType, opts)
 	}
-	var cc cacheControl
+	var cc *cacheControl
 	var cacheObjSize int64
 	// fetch diskCache if object is currently cached or nearest available cache drive
 	dcache, err := c.getCacheToLoc(ctx, bucket, object)
 	if err != nil {
-		return c.GetObjectNInfoFn(ctx, bucket, object, rs, h, lockType, opts)
+		return c.InnerGetObjectNInfoFn(ctx, bucket, object, rs, h, lockType, opts)
 	}
 
-	cacheReader, cacheErr := c.get(ctx, dcache, bucket, object, rs, h, opts)
+	cacheReader, numCacheHits, cacheErr := dcache.Get(ctx, bucket, object, rs, h, opts)
 	if cacheErr == nil {
 		cacheObjSize = cacheReader.ObjInfo.Size
 		if rs != nil {
@@ -208,8 +234,8 @@ func (c *cacheObjects) GetObjectNInfo(ctx context.Context, bucket, object string
 			}
 		}
 		cc = cacheControlOpts(cacheReader.ObjInfo)
-		if (!cc.isEmpty() && !cc.isStale(cacheReader.ObjInfo.ModTime)) ||
-			cc.onlyIfCached {
+		if cc != nil && (!cc.isStale(cacheReader.ObjInfo.ModTime) ||
+			cc.onlyIfCached) {
 			// This is a cache hit, mark it so
 			bytesServed := cacheReader.ObjInfo.Size
 			if rs != nil {
@@ -219,22 +245,29 @@ func (c *cacheObjects) GetObjectNInfo(ctx context.Context, bucket, object string
 			}
 			c.cacheStats.incHit()
 			c.cacheStats.incBytesServed(bytesServed)
+			c.incHitsToMeta(ctx, dcache, bucket, object, cacheReader.ObjInfo.Size, cacheReader.ObjInfo.ETag, rs)
 			return cacheReader, nil
 		}
-		if cc.noStore {
+		if cc != nil && cc.noStore {
+			cacheReader.Close()
 			c.cacheStats.incMiss()
-			return c.GetObjectNInfo(ctx, bucket, object, rs, h, lockType, opts)
+			bReader, err := c.InnerGetObjectNInfoFn(ctx, bucket, object, rs, h, lockType, opts)
+			bReader.ObjInfo.CacheLookupStatus = CacheHit
+			bReader.ObjInfo.CacheStatus = CacheMiss
+			return bReader, err
 		}
 	}
 
-	objInfo, err := c.GetObjectInfoFn(ctx, bucket, object, opts)
+	objInfo, err := c.InnerGetObjectInfoFn(ctx, bucket, object, opts)
 	if backendDownError(err) && cacheErr == nil {
 		c.incCacheStats(cacheObjSize)
 		return cacheReader, nil
 	} else if err != nil {
+		if cacheErr == nil {
+			cacheReader.Close()
+		}
 		if _, ok := err.(ObjectNotFound); ok {
 			if cacheErr == nil {
-				cacheReader.Close()
 				// Delete cached entry if backend object
 				// was deleted.
 				dcache.Delete(ctx, bucket, object)
@@ -245,74 +278,105 @@ func (c *cacheObjects) GetObjectNInfo(ctx context.Context, bucket, object string
 	}
 
 	if !objInfo.IsCacheable() {
+		if cacheErr == nil {
+			cacheReader.Close()
+		}
 		c.cacheStats.incMiss()
-		return c.GetObjectNInfoFn(ctx, bucket, object, rs, h, lockType, opts)
+		return c.InnerGetObjectNInfoFn(ctx, bucket, object, rs, h, lockType, opts)
 	}
-
+	// skip cache for objects with locks
+	objRetention := objectlock.GetObjectRetentionMeta(objInfo.UserDefined)
+	legalHold := objectlock.GetObjectLegalHoldMeta(objInfo.UserDefined)
+	if objRetention.Mode.Valid() || legalHold.Status.Valid() {
+		if cacheErr == nil {
+			cacheReader.Close()
+		}
+		c.cacheStats.incMiss()
+		return c.InnerGetObjectNInfoFn(ctx, bucket, object, rs, h, lockType, opts)
+	}
 	if cacheErr == nil {
 		// if ETag matches for stale cache entry, serve from cache
 		if cacheReader.ObjInfo.ETag == objInfo.ETag {
 			// Update metadata in case server-side copy might have changed object metadata
-			dcache.updateMetadataIfChanged(ctx, bucket, object, objInfo, cacheReader.ObjInfo)
+			c.updateMetadataIfChanged(ctx, dcache, bucket, object, objInfo, cacheReader.ObjInfo, rs)
 			c.incCacheStats(cacheObjSize)
 			return cacheReader, nil
 		}
 		cacheReader.Close()
 		// Object is stale, so delete from cache
-		c.delete(ctx, dcache, bucket, object)
+		dcache.Delete(ctx, bucket, object)
 	}
 
 	// Reaching here implies cache miss
 	c.cacheStats.incMiss()
-	// Since we got here, we are serving the request from backend,
-	// and also adding the object to the cache.
-	if !dcache.diskUsageLow() {
-		select {
-		case dcache.purgeChan <- struct{}{}:
-		default:
-		}
+
+	bkReader, bkErr := c.InnerGetObjectNInfoFn(ctx, bucket, object, rs, h, lockType, opts)
+
+	if bkErr != nil {
+		return bkReader, bkErr
 	}
-	if !dcache.diskAvailable(objInfo.Size) {
-		return c.GetObjectNInfoFn(ctx, bucket, object, rs, h, lockType, opts)
+	// If object has less hits than configured cache after, just increment the hit counter
+	// but do not cache it.
+	if numCacheHits < c.after {
+		c.incHitsToMeta(ctx, dcache, bucket, object, objInfo.Size, objInfo.ETag, rs)
+		return bkReader, bkErr
 	}
 
-	if rs != nil {
+	// Record if cache has a hit that was invalidated by ETag verification
+	if cacheErr == nil {
+		bkReader.ObjInfo.CacheLookupStatus = CacheHit
+	}
+
+	// Check if we can add it without exceeding total cache size.
+	if !dcache.diskSpaceAvailable(objInfo.Size) {
+		return bkReader, bkErr
+	}
+
+	if rs != nil && !dcache.enableRange {
 		go func() {
+			// if range caching is disabled, download entire object.
+			rs = nil
 			// fill cache in the background for range GET requests
-			bReader, bErr := c.GetObjectNInfoFn(ctx, bucket, object, rs, h, lockType, opts)
+			bReader, bErr := c.InnerGetObjectNInfoFn(GlobalContext, bucket, object, rs, h, lockType, opts)
 			if bErr != nil {
 				return
 			}
 			defer bReader.Close()
-			oi, err := c.statRange(ctx, dcache, bucket, object, rs)
+			oi, _, _, err := dcache.statRange(GlobalContext, bucket, object, rs)
 			// avoid cache overwrite if another background routine filled cache
 			if err != nil || oi.ETag != bReader.ObjInfo.ETag {
-				c.put(ctx, dcache, bucket, object, bReader, bReader.ObjInfo.Size, rs, ObjectOptions{UserDefined: getMetadata(bReader.ObjInfo)})
+				// use a new context to avoid locker prematurely timing out operation when the GetObjectNInfo returns.
+				dcache.Put(GlobalContext, bucket, object, bReader, bReader.ObjInfo.Size, rs, ObjectOptions{
+					UserDefined: getMetadata(bReader.ObjInfo),
+				}, false)
+				return
 			}
 		}()
-		return c.GetObjectNInfoFn(ctx, bucket, object, rs, h, lockType, opts)
+		return bkReader, bkErr
 	}
-	bkReader, bkErr := c.GetObjectNInfoFn(ctx, bucket, object, rs, h, lockType, opts)
-	if bkErr != nil {
-		return nil, bkErr
-	}
+
 	// Initialize pipe.
 	pipeReader, pipeWriter := io.Pipe()
 	teeReader := io.TeeReader(bkReader, pipeWriter)
+	userDefined := getMetadata(bkReader.ObjInfo)
 	go func() {
-		putErr := c.put(ctx, dcache, bucket, object, io.LimitReader(pipeReader, bkReader.ObjInfo.Size), bkReader.ObjInfo.Size, nil, ObjectOptions{UserDefined: getMetadata(bkReader.ObjInfo)})
+		_, putErr := dcache.Put(ctx, bucket, object,
+			io.LimitReader(pipeReader, bkReader.ObjInfo.Size),
+			bkReader.ObjInfo.Size, rs, ObjectOptions{
+				UserDefined: userDefined,
+			}, false)
 		// close the write end of the pipe, so the error gets
 		// propagated to getObjReader
 		pipeWriter.CloseWithError(putErr)
 	}()
 	cleanupBackend := func() { bkReader.Close() }
 	cleanupPipe := func() { pipeWriter.Close() }
-	return NewGetObjectReaderFromReader(teeReader, bkReader.ObjInfo, opts.CheckCopyPrecondFn, cleanupBackend, cleanupPipe)
+	return NewGetObjectReaderFromReader(teeReader, bkReader.ObjInfo, opts, cleanupBackend, cleanupPipe)
 }
 
 // Returns ObjectInfo from cache if available.
 func (c *cacheObjects) GetObjectInfo(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error) {
-	getObjectInfoFn := c.GetObjectInfoFn
+	getObjectInfoFn := c.InnerGetObjectInfoFn
 
 	if c.isCacheExclude(bucket, object) || c.skipCache() {
 		return getObjectInfoFn(ctx, bucket, object, opts)
@@ -323,12 +387,12 @@ func (c *cacheObjects) GetObjectInfo(ctx context.Context, bucket, object string,
 	if err != nil {
 		return getObjectInfoFn(ctx, bucket, object, opts)
 	}
-	var cc cacheControl
+	var cc *cacheControl
 	// if cache control setting is valid, avoid HEAD operation to backend
-	cachedObjInfo, cerr := c.stat(ctx, dcache, bucket, object)
+	cachedObjInfo, _, cerr := dcache.Stat(ctx, bucket, object)
 	if cerr == nil {
 		cc = cacheControlOpts(cachedObjInfo)
-		if !cc.isStale(cachedObjInfo.ModTime) {
+		if cc == nil || (cc != nil && !cc.isStale(cachedObjInfo.ModTime)) {
 			// This is a cache hit, mark it so
 			c.cacheStats.incHit()
 			return cachedObjInfo, nil
@@ -339,7 +403,7 @@ func (c *cacheObjects) GetObjectInfo(ctx context.Context, bucket, object string,
 	if err != nil {
 		if _, ok := err.(ObjectNotFound); ok {
 			// Delete the cached entry if backend object was deleted.
-			c.delete(ctx, dcache, bucket, object)
+			dcache.Delete(ctx, bucket, object)
 			c.cacheStats.incMiss()
 			return ObjectInfo{}, err
 		}
@@ -363,9 +427,33 @@ func (c *cacheObjects) GetObjectInfo(ctx context.Context, bucket, object string,
 	}
 	if cachedObjInfo.ETag != objInfo.ETag {
 		// Delete the cached entry if the backend object was replaced.
-		c.delete(ctx, dcache, bucket, object)
+		dcache.Delete(ctx, bucket, object)
 	}
 	return objInfo, nil
+}
+
+// CopyObject reverts to backend after evicting any stale cache entries
+func (c *cacheObjects) CopyObject(ctx context.Context, srcBucket, srcObject, dstBucket, dstObject string, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (objInfo ObjectInfo, err error) {
+	copyObjectFn := c.InnerCopyObjectFn
+	if c.isCacheExclude(srcBucket, srcObject) || c.skipCache() {
+		return copyObjectFn(ctx, srcBucket, srcObject, dstBucket, dstObject, srcInfo, srcOpts, dstOpts)
+	}
+	if srcBucket != dstBucket || srcObject != dstObject {
+		return copyObjectFn(ctx, srcBucket, srcObject, dstBucket, dstObject, srcInfo, srcOpts, dstOpts)
+	}
+	// fetch diskCache if object is currently cached or nearest available cache drive
+	dcache, err := c.getCacheToLoc(ctx, srcBucket, srcObject)
+	if err != nil {
+		return copyObjectFn(ctx, srcBucket, srcObject, dstBucket, dstObject, srcInfo, srcOpts, dstOpts)
+	}
+	// if currently cached, evict old entry and revert to backend.
+	if cachedObjInfo, _, cerr := dcache.Stat(ctx, srcBucket, srcObject); cerr == nil {
+		cc := cacheControlOpts(cachedObjInfo)
+		if cc == nil || !cc.isStale(cachedObjInfo.ModTime) {
+			dcache.Delete(ctx, srcBucket, srcObject)
+		}
+	}
+	return copyObjectFn(ctx, srcBucket, srcObject, dstBucket, dstObject, srcInfo, srcOpts, dstOpts)
 }
 
 // StorageInfo - returns underlying storage statistics.
@@ -472,7 +560,7 @@ func (c *cacheObjects) hashIndex(bucket, object string) int {
 // or the global env overrides.
 func newCache(config cache.Config) ([]*diskCache, bool, error) {
 	var caches []*diskCache
-	ctx := logger.SetReqInfo(context.Background(), &logger.ReqInfo{})
+	ctx := logger.SetReqInfo(GlobalContext, &logger.ReqInfo{})
 	formats, migrating, err := loadAndValidateCacheFormat(ctx, config.Drives)
 	if err != nil {
 		return nil, false, err
@@ -487,50 +575,15 @@ func newCache(config cache.Config) ([]*diskCache, bool, error) {
 			return nil, false, errors.New("Atime support required for disk caching")
 		}
 
-		quota := config.MaxUse
-		if quota == 0 {
-			quota = config.Quota
-		}
-
-		cache, err := newDiskCache(dir, config.Expiry, quota)
+		cache, err := newDiskCache(ctx, dir, config)
 		if err != nil {
 			return nil, false, err
 		}
-		// Start the purging go-routine for entries that have expired if no migration in progress
-		if !migrating {
-			go cache.purge()
-		}
-
 		caches = append(caches, cache)
 	}
 	return caches, migrating, nil
 }
 
-// Return error if Atime is disabled on the O/S
-func checkAtimeSupport(dir string) (err error) {
-	file, err := ioutil.TempFile(dir, "prefix")
-	if err != nil {
-		return
-	}
-	defer os.Remove(file.Name())
-	finfo1, err := os.Stat(file.Name())
-	if err != nil {
-		return
-	}
-	// add a sleep to ensure atime change is detected
-	time.Sleep(10 * time.Millisecond)
-
-	if _, err = io.Copy(ioutil.Discard, file); err != nil {
-		return
-	}
-
-	finfo2, err := os.Stat(file.Name())
-
-	if atime.Get(finfo2).Equal(atime.Get(finfo1)) {
-		return errors.New("Atime not supported")
-	}
-	return
-}
 func (c *cacheObjects) migrateCacheFromV1toV2(ctx context.Context) {
 	logStartupMessage(color.Blue("Cache migration initiated ...."))
 
@@ -547,13 +600,12 @@ func (c *cacheObjects) migrateCacheFromV1toV2(ctx context.Context) {
 	}
 
 	errCnt := 0
-	for index, err := range g.Wait() {
+	for _, err := range g.Wait() {
 		if err != nil {
 			errCnt++
 			logger.LogIf(ctx, err)
 			continue
 		}
-		go c.cache[index].purge()
 	}
 
 	if errCnt > 0 {
@@ -569,7 +621,7 @@ func (c *cacheObjects) migrateCacheFromV1toV2(ctx context.Context) {
 
 // PutObject - caches the uploaded object for single Put operations
 func (c *cacheObjects) PutObject(ctx context.Context, bucket, object string, r *PutObjReader, opts ObjectOptions) (objInfo ObjectInfo, err error) {
-	putObjectFn := c.PutObjectFn
+	putObjectFn := c.InnerPutObjectFn
 	dcache, err := c.getCacheToLoc(ctx, bucket, object)
 	if err != nil {
 		// disk cache could not be located,execute backend call.
@@ -581,17 +633,19 @@ func (c *cacheObjects) PutObject(ctx context.Context, bucket, object string, r *
 	}
 
 	// fetch from backend if there is no space on cache drive
-	if !dcache.diskAvailable(size) {
+	if !dcache.diskSpaceAvailable(size) {
 		return putObjectFn(ctx, bucket, object, r, opts)
 	}
+
 	if opts.ServerSideEncryption != nil {
 		dcache.Delete(ctx, bucket, object)
 		return putObjectFn(ctx, bucket, object, r, opts)
 	}
 
 	// skip cache for objects with locks
-	objRetention := getObjectRetentionMeta(opts.UserDefined)
-	if objRetention.Mode == Governance || objRetention.Mode == Compliance {
+	objRetention := objectlock.GetObjectRetentionMeta(opts.UserDefined)
+	legalHold := objectlock.GetObjectLegalHoldMeta(opts.UserDefined)
+	if objRetention.Mode.Valid() || legalHold.Status.Valid() {
 		dcache.Delete(ctx, bucket, object)
 		return putObjectFn(ctx, bucket, object, r, opts)
 	}
@@ -602,27 +656,93 @@ func (c *cacheObjects) PutObject(ctx context.Context, bucket, object string, r *
 		dcache.Delete(ctx, bucket, object)
 		return putObjectFn(ctx, bucket, object, r, opts)
 	}
-
+	if c.commitWriteback {
+		oi, err := dcache.Put(ctx, bucket, object, r, r.Size(), nil, opts, false)
+		if err != nil {
+			return ObjectInfo{}, err
+		}
+		go c.uploadObject(GlobalContext, oi)
+		return oi, nil
+	}
 	objInfo, err = putObjectFn(ctx, bucket, object, r, opts)
 
 	if err == nil {
 		go func() {
 			// fill cache in the background
-			bReader, bErr := c.GetObjectNInfoFn(ctx, bucket, object, nil, http.Header{}, readLock, ObjectOptions{})
+			bReader, bErr := c.InnerGetObjectNInfoFn(GlobalContext, bucket, object, nil, http.Header{}, readLock, ObjectOptions{})
 			if bErr != nil {
 				return
 			}
 			defer bReader.Close()
-			oi, err := c.stat(ctx, dcache, bucket, object)
+			oi, _, err := dcache.Stat(GlobalContext, bucket, object)
 			// avoid cache overwrite if another background routine filled cache
 			if err != nil || oi.ETag != bReader.ObjInfo.ETag {
-				c.put(ctx, dcache, bucket, object, bReader, bReader.ObjInfo.Size, nil, ObjectOptions{UserDefined: getMetadata(bReader.ObjInfo)})
+				dcache.Put(GlobalContext, bucket, object, bReader, bReader.ObjInfo.Size, nil, ObjectOptions{UserDefined: getMetadata(bReader.ObjInfo)}, false)
 			}
 		}()
 	}
-
 	return objInfo, err
+}
 
+// upload cached object to backend in async commit mode.
+func (c *cacheObjects) uploadObject(ctx context.Context, oi ObjectInfo) {
+	dcache, err := c.getCacheToLoc(ctx, oi.Bucket, oi.Name)
+	if err != nil {
+		// disk cache could not be located.
+		logger.LogIf(ctx, fmt.Errorf("Could not upload %s/%s to backend: %w", oi.Bucket, oi.Name, err))
+		return
+	}
+	cReader, _, bErr := dcache.Get(ctx, oi.Bucket, oi.Name, nil, http.Header{}, ObjectOptions{})
+	if bErr != nil {
+		return
+	}
+	defer cReader.Close()
+
+	if cReader.ObjInfo.ETag != oi.ETag {
+		return
+	}
+	st := cacheCommitStatus(oi.UserDefined[writeBackStatusHeader])
+	if st == CommitComplete || st.String() == "" {
+		return
+	}
+	hashReader, err := hash.NewReader(cReader, oi.Size, "", "", oi.Size)
+	if err != nil {
+		return
+	}
+	var opts ObjectOptions
+	opts.UserDefined = make(map[string]string)
+	opts.UserDefined[xhttp.ContentMD5] = oi.UserDefined["content-md5"]
+	objInfo, err := c.InnerPutObjectFn(ctx, oi.Bucket, oi.Name, NewPutObjReader(hashReader), opts)
+	wbCommitStatus := CommitComplete
+	if err != nil {
+		wbCommitStatus = CommitFailed
+	}
+
+	meta := cloneMSS(cReader.ObjInfo.UserDefined)
+	retryCnt := 0
+	if wbCommitStatus == CommitFailed {
+		retryCnt, _ = strconv.Atoi(meta[writeBackRetryHeader])
+		retryCnt++
+		meta[writeBackRetryHeader] = strconv.Itoa(retryCnt)
+	} else {
+		delete(meta, writeBackRetryHeader)
+	}
+	meta[writeBackStatusHeader] = wbCommitStatus.String()
+	meta["etag"] = oi.ETag
+	dcache.SaveMetadata(ctx, oi.Bucket, oi.Name, meta, objInfo.Size, nil, "", false)
+	if retryCnt > 0 {
+		// slow down retries
+		time.Sleep(time.Second * time.Duration(retryCnt%10+1))
+		c.queueWritebackRetry(oi)
+	}
+}
+
+func (c *cacheObjects) queueWritebackRetry(oi ObjectInfo) {
+	select {
+	case c.wbRetryCh <- oi:
+		c.uploadObject(GlobalContext, oi)
+	default:
+	}
 }
 
 // Returns cacheObjects for use by Server.
@@ -632,40 +752,104 @@ func newServerCacheObjects(ctx context.Context, config cache.Config) (CacheObjec
 	if err != nil {
 		return nil, err
 	}
-
 	c := &cacheObjects{
-		cache:      cache,
-		exclude:    config.Exclude,
-		migrating:  migrateSw,
-		migMutex:   sync.Mutex{},
-		nsMutex:    newNSLock(false),
-		cacheStats: newCacheStats(),
-		GetObjectInfoFn: func(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error) {
+		cache:           cache,
+		exclude:         config.Exclude,
+		after:           config.After,
+		migrating:       migrateSw,
+		migMutex:        sync.Mutex{},
+		commitWriteback: config.CommitWriteback,
+		cacheStats:      newCacheStats(),
+		InnerGetObjectInfoFn: func(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error) {
 			return newObjectLayerFn().GetObjectInfo(ctx, bucket, object, opts)
 		},
-		GetObjectNInfoFn: func(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, lockType LockType, opts ObjectOptions) (gr *GetObjectReader, err error) {
+		InnerGetObjectNInfoFn: func(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, lockType LockType, opts ObjectOptions) (gr *GetObjectReader, err error) {
 			return newObjectLayerFn().GetObjectNInfo(ctx, bucket, object, rs, h, lockType, opts)
 		},
-		DeleteObjectFn: func(ctx context.Context, bucket, object string) error {
-			return newObjectLayerFn().DeleteObject(ctx, bucket, object)
+		InnerDeleteObjectFn: func(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error) {
+			return newObjectLayerFn().DeleteObject(ctx, bucket, object, opts)
 		},
-		DeleteObjectsFn: func(ctx context.Context, bucket string, objects []string) ([]error, error) {
-			errs := make([]error, len(objects))
-			for idx, object := range objects {
-				errs[idx] = newObjectLayerFn().DeleteObject(ctx, bucket, object)
-			}
-			return errs, nil
-		},
-		PutObjectFn: func(ctx context.Context, bucket, object string, data *PutObjReader, opts ObjectOptions) (objInfo ObjectInfo, err error) {
+		InnerPutObjectFn: func(ctx context.Context, bucket, object string, data *PutObjReader, opts ObjectOptions) (objInfo ObjectInfo, err error) {
 			return newObjectLayerFn().PutObject(ctx, bucket, object, data, opts)
 		},
+		InnerCopyObjectFn: func(ctx context.Context, srcBucket, srcObject, destBucket, destObject string, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (objInfo ObjectInfo, err error) {
+			return newObjectLayerFn().CopyObject(ctx, srcBucket, srcObject, destBucket, destObject, srcInfo, srcOpts, dstOpts)
+		},
 	}
-	c.NewNSLockFn = func(ctx context.Context, bucket, object string) RWLocker {
-		return c.nsMutex.NewNSLock(ctx, nil, bucket, object)
+	c.cacheStats.GetDiskStats = func() []CacheDiskStats {
+		cacheDiskStats := make([]CacheDiskStats, len(c.cache))
+		for i := range c.cache {
+			dcache := c.cache[i]
+			cacheDiskStats[i] = CacheDiskStats{}
+			if dcache != nil {
+				info, err := getDiskInfo(dcache.dir)
+				logger.LogIf(ctx, err)
+				cacheDiskStats[i].UsageSize = info.Used
+				cacheDiskStats[i].TotalCapacity = info.Total
+				cacheDiskStats[i].Dir = dcache.stats.Dir
+				atomic.StoreInt32(&cacheDiskStats[i].UsageState, atomic.LoadInt32(&dcache.stats.UsageState))
+				atomic.StoreUint64(&cacheDiskStats[i].UsagePercent, atomic.LoadUint64(&dcache.stats.UsagePercent))
+			}
+		}
+		return cacheDiskStats
 	}
-
 	if migrateSw {
 		go c.migrateCacheFromV1toV2(ctx)
 	}
+	go c.gc(ctx)
+	if c.commitWriteback {
+		c.wbRetryCh = make(chan ObjectInfo, 10000)
+		go func() {
+			<-GlobalContext.Done()
+			close(c.wbRetryCh)
+		}()
+		go c.queuePendingWriteback(ctx)
+	}
+
 	return c, nil
+}
+
+func (c *cacheObjects) gc(ctx context.Context) {
+	ticker := time.NewTicker(cacheGCInterval)
+
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if c.migrating {
+				continue
+			}
+			for _, dcache := range c.cache {
+				if dcache != nil {
+					// Check if there is disk.
+					// Will queue a GC scan if at high watermark.
+					dcache.diskSpaceAvailable(0)
+				}
+			}
+		}
+	}
+}
+
+// queues any pending or failed async commits when server restarts
+func (c *cacheObjects) queuePendingWriteback(ctx context.Context) {
+	for _, dcache := range c.cache {
+		if dcache != nil {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case oi, ok := <-dcache.retryWritebackCh:
+					if !ok {
+						goto next
+					}
+					c.queueWritebackRetry(oi)
+				default:
+					time.Sleep(time.Second * 1)
+				}
+			}
+		next:
+		}
+	}
 }

@@ -24,7 +24,7 @@ import (
 )
 
 // AppendFile - appends the file "src" to the file "dst"
-func AppendFile(dst string, src string) error {
+func AppendFile(dst string, src string, osync bool) error {
 	appendFile, err := lock.Open(dst, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
 	if err != nil {
 		return err
@@ -36,8 +36,6 @@ func AppendFile(dst string, src string) error {
 		return err
 	}
 	defer srcFile.Close()
-	// Allocate staging buffer.
-	var buf = make([]byte, defaultAppendBufferSize)
-	_, err = io.CopyBuffer(appendFile, srcFile, buf)
+	_, err = io.Copy(appendFile, srcFile)
 	return err
 }

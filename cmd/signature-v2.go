@@ -33,19 +33,15 @@ import (
 	"github.com/minio/minio/pkg/auth"
 )
 
-// Signature and API related constants.
-const (
-	signV2Algorithm = "AWS"
-)
-
-// AWS S3 Signature V2 calculation rule is give here:
-// http://docs.aws.amazon.com/AmazonS3/latest/dev/RESTAuthentication.html#RESTAuthenticationStringToSign
-
 // Whitelist resource list that will be used in query string for signature-V2 calculation.
-// The list should be alphabetically sorted
+//
+// This list should be kept alphabetically sorted, do not hastily edit.
 var resourceList = []string{
 	"acl",
+	"cors",
 	"delete",
+	"encryption",
+	"legal-hold",
 	"lifecycle",
 	"location",
 	"logging",
@@ -59,6 +55,10 @@ var resourceList = []string{
 	"response-content-language",
 	"response-content-type",
 	"response-expires",
+	"retention",
+	"select",
+	"select-type",
+	"tagging",
 	"torrent",
 	"uploadId",
 	"uploads",
@@ -68,19 +68,25 @@ var resourceList = []string{
 	"website",
 }
 
-func doesPolicySignatureV2Match(formValues http.Header) APIErrorCode {
-	cred := globalActiveCred
+// Signature and API related constants.
+const (
+	signV2Algorithm = "AWS"
+)
+
+// AWS S3 Signature V2 calculation rule is give here:
+// http://docs.aws.amazon.com/AmazonS3/latest/dev/RESTAuthentication.html#RESTAuthenticationStringToSign
+func doesPolicySignatureV2Match(formValues http.Header) (auth.Credentials, APIErrorCode) {
 	accessKey := formValues.Get(xhttp.AmzAccessKeyID)
 	cred, _, s3Err := checkKeyValid(accessKey)
 	if s3Err != ErrNone {
-		return s3Err
+		return cred, s3Err
 	}
 	policy := formValues.Get("Policy")
 	signature := formValues.Get(xhttp.AmzSignatureV2)
 	if !compareSignatureV2(signature, calculateSignatureV2(policy, cred.SecretKey)) {
-		return ErrSignatureDoesNotMatch
+		return cred, ErrSignatureDoesNotMatch
 	}
-	return ErrNone
+	return cred, ErrNone
 }
 
 // Escape encodedQuery string into unescaped list of query params, returns error
@@ -313,7 +319,7 @@ func compareSignatureV2(sig1, sig2 string) bool {
 // Return canonical headers.
 func canonicalizedAmzHeadersV2(headers http.Header) string {
 	var keys []string
-	keyval := make(map[string]string)
+	keyval := make(map[string]string, len(headers))
 	for key := range headers {
 		lkey := strings.ToLower(key)
 		if !strings.HasPrefix(lkey, "x-amz-") {

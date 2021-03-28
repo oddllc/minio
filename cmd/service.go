@@ -17,6 +17,7 @@
 package cmd
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"syscall"
@@ -26,8 +27,9 @@ import (
 type serviceSignal int
 
 const (
-	serviceRestart serviceSignal = iota // Restarts the server.
-	serviceStop                         // Stops the server.
+	serviceRestart       serviceSignal = iota // Restarts the server.
+	serviceStop                               // Stops the server.
+	serviceReloadDynamic                      // Reload dynamic config values.
 	// Add new service requests here.
 )
 
@@ -35,11 +37,17 @@ const (
 var globalServiceSignalCh chan serviceSignal
 
 // GlobalServiceDoneCh - Global service done channel.
-var GlobalServiceDoneCh chan struct{}
+var GlobalServiceDoneCh <-chan struct{}
 
-// Initialize service mutex once.
-func init() {
-	GlobalServiceDoneCh = make(chan struct{})
+// GlobalContext context that is canceled when server is requested to shut down.
+var GlobalContext context.Context
+
+// cancelGlobalContext can be used to indicate server shutdown.
+var cancelGlobalContext context.CancelFunc
+
+func initGlobalContext() {
+	GlobalContext, cancelGlobalContext = context.WithCancel(context.Background())
+	GlobalServiceDoneCh = GlobalContext.Done()
 	globalServiceSignalCh = make(chan serviceSignal)
 }
 

@@ -32,19 +32,27 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/minio/minio/pkg/dsync"
 	. "github.com/minio/minio/pkg/dsync"
 )
+
+const numberOfNodes = 5
 
 var ds *Dsync
 var rpcPaths []string // list of rpc paths where lock server is serving.
 
-func startRPCServers(nodes []string) {
+var nodes = make([]string, numberOfNodes) // list of node IP addrs or hostname with ports.
+var lockServers []*lockServer
+
+func startRPCServers() {
 	for i := range nodes {
 		server := rpc.NewServer()
-		server.RegisterName("Dsync", &lockServer{
+		ls := &lockServer{
 			mutex:   sync.Mutex{},
 			lockMap: make(map[string]int64),
-		})
+		}
+		server.RegisterName("Dsync", ls)
 		// For some reason the registration paths need to be different (even for different server objs)
 		server.HandleHTTP(rpcPaths[i], fmt.Sprintf("%s-debug", rpcPaths[i]))
 		l, e := net.Listen("tcp", ":"+strconv.Itoa(i+12345))
@@ -52,6 +60,8 @@ func startRPCServers(nodes []string) {
 			log.Fatal("listen error:", e)
 		}
 		go http.Serve(l, nil)
+
+		lockServers = append(lockServers, ls)
 	}
 
 	// Let servers start
@@ -64,7 +74,6 @@ func TestMain(m *testing.M) {
 
 	rand.Seed(time.Now().UTC().UnixNano())
 
-	nodes := make([]string, 4) // list of node IP addrs or hostname with ports.
 	for i := range nodes {
 		nodes[i] = fmt.Sprintf("127.0.0.1:%d", i+12345)
 	}
@@ -79,17 +88,17 @@ func TestMain(m *testing.M) {
 	}
 
 	ds = &Dsync{
-		GetLockersFn: func() []NetLocker { return clnts },
+		GetLockers: func() ([]NetLocker, string) { return clnts, uuid.New().String() },
 	}
 
-	startRPCServers(nodes)
+	startRPCServers()
 
 	os.Exit(m.Run())
 }
 
 func TestSimpleLock(t *testing.T) {
 
-	dm := NewDRWMutex(context.Background(), "test", ds)
+	dm := NewDRWMutex(ds, "test")
 
 	dm.Lock(id, source)
 
@@ -101,7 +110,7 @@ func TestSimpleLock(t *testing.T) {
 
 func TestSimpleLockUnlockMultipleTimes(t *testing.T) {
 
-	dm := NewDRWMutex(context.Background(), "test", ds)
+	dm := NewDRWMutex(ds, "test")
 
 	dm.Lock(id, source)
 	time.Sleep(time.Duration(10+(rand.Float32()*50)) * time.Millisecond)
@@ -127,8 +136,8 @@ func TestSimpleLockUnlockMultipleTimes(t *testing.T) {
 // Test two locks for same resource, one succeeds, one fails (after timeout)
 func TestTwoSimultaneousLocksForSameResource(t *testing.T) {
 
-	dm1st := NewDRWMutex(context.Background(), "aap", ds)
-	dm2nd := NewDRWMutex(context.Background(), "aap", ds)
+	dm1st := NewDRWMutex(ds, "aap")
+	dm2nd := NewDRWMutex(ds, "aap")
 
 	dm1st.Lock(id, source)
 
@@ -151,9 +160,9 @@ func TestTwoSimultaneousLocksForSameResource(t *testing.T) {
 // Test three locks for same resource, one succeeds, one fails (after timeout)
 func TestThreeSimultaneousLocksForSameResource(t *testing.T) {
 
-	dm1st := NewDRWMutex(context.Background(), "aap", ds)
-	dm2nd := NewDRWMutex(context.Background(), "aap", ds)
-	dm3rd := NewDRWMutex(context.Background(), "aap", ds)
+	dm1st := NewDRWMutex(ds, "aap")
+	dm2nd := NewDRWMutex(ds, "aap")
+	dm3rd := NewDRWMutex(ds, "aap")
 
 	dm1st.Lock(id, source)
 
@@ -216,8 +225,8 @@ func TestThreeSimultaneousLocksForSameResource(t *testing.T) {
 // Test two locks for different resources, both succeed
 func TestTwoSimultaneousLocksForDifferentResources(t *testing.T) {
 
-	dm1 := NewDRWMutex(context.Background(), "aap", ds)
-	dm2 := NewDRWMutex(context.Background(), "noot", ds)
+	dm1 := NewDRWMutex(ds, "aap")
+	dm2 := NewDRWMutex(ds, "noot")
 
 	dm1.Lock(id, source)
 	dm2.Lock(id, source)
@@ -231,6 +240,42 @@ func TestTwoSimultaneousLocksForDifferentResources(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 }
 
+// Test refreshing lock
+func TestFailedRefreshLock(t *testing.T) {
+	// Simulate Refresh RPC response to return no locking found
+	for i := range lockServers {
+		lockServers[i].setRefreshReply(false)
+	}
+
+	dm := NewDRWMutex(ds, "aap")
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+
+	ctx, cl := context.WithCancel(context.Background())
+	cancel := func() {
+		cl()
+		wg.Done()
+	}
+
+	if !dm.GetLock(ctx, cancel, id, source, dsync.Options{Timeout: 5 * time.Minute}) {
+		t.Fatal("GetLock() should be successful")
+	}
+
+	// Wait until context is canceled
+	wg.Wait()
+	if ctx.Err() == nil {
+		t.Fatal("Unexpected error", ctx.Err())
+	}
+
+	// Should be safe operation in all cases
+	dm.Unlock()
+
+	// Revert Refresh RPC response to locking found
+	for i := range lockServers {
+		lockServers[i].setRefreshReply(false)
+	}
+}
+
 // Borrowed from mutex_test.go
 func HammerMutex(m *DRWMutex, loops int, cdone chan bool) {
 	for i := 0; i < loops; i++ {
@@ -242,10 +287,14 @@ func HammerMutex(m *DRWMutex, loops int, cdone chan bool) {
 
 // Borrowed from mutex_test.go
 func TestMutex(t *testing.T) {
+	loops := 200
+	if testing.Short() {
+		loops = 5
+	}
 	c := make(chan bool)
-	m := NewDRWMutex(context.Background(), "test", ds)
+	m := NewDRWMutex(ds, "test")
 	for i := 0; i < 10; i++ {
-		go HammerMutex(m, 1000, c)
+		go HammerMutex(m, loops, c)
 	}
 	for i := 0; i < 10; i++ {
 		<-c
@@ -257,7 +306,7 @@ func BenchmarkMutexUncontended(b *testing.B) {
 		*DRWMutex
 	}
 	b.RunParallel(func(pb *testing.PB) {
-		var mu = PaddedMutex{NewDRWMutex(context.Background(), "", ds)}
+		var mu = PaddedMutex{NewDRWMutex(ds, "")}
 		for pb.Next() {
 			mu.Lock(id, source)
 			mu.Unlock()
@@ -266,7 +315,7 @@ func BenchmarkMutexUncontended(b *testing.B) {
 }
 
 func benchmarkMutex(b *testing.B, slack, work bool) {
-	mu := NewDRWMutex(context.Background(), "", ds)
+	mu := NewDRWMutex(ds, "")
 	if slack {
 		b.SetParallelism(10)
 	}
@@ -309,7 +358,7 @@ func BenchmarkMutexNoSpin(b *testing.B) {
 	// These goroutines yield during local work, so that switching from
 	// a blocked goroutine to other goroutines is profitable.
 	// As a matter of fact, this benchmark still triggers some spinning in the mutex.
-	m := NewDRWMutex(context.Background(), "", ds)
+	m := NewDRWMutex(ds, "")
 	var acc0, acc1 uint64
 	b.SetParallelism(4)
 	b.RunParallel(func(pb *testing.PB) {
@@ -341,7 +390,7 @@ func BenchmarkMutexSpin(b *testing.B) {
 	// profitable. To achieve this we create a goroutine per-proc.
 	// These goroutines access considerable amount of local data so that
 	// unnecessary rescheduling is penalized by cache misses.
-	m := NewDRWMutex(context.Background(), "", ds)
+	m := NewDRWMutex(ds, "")
 	var acc0, acc1 uint64
 	b.RunParallel(func(pb *testing.PB) {
 		var data [16 << 10]uint64

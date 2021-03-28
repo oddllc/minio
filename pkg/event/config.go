@@ -24,7 +24,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/minio/minio-go/v6/pkg/set"
+	"github.com/minio/minio-go/v7/pkg/set"
 )
 
 // ValidateFilterRuleValue - checks if given value is filter rule value or not.
@@ -46,6 +46,19 @@ func ValidateFilterRuleValue(value string) error {
 type FilterRule struct {
 	Name  string `xml:"Name"`
 	Value string `xml:"Value"`
+}
+
+func (filter FilterRule) isEmpty() bool {
+	return filter.Name == "" && filter.Value == ""
+}
+
+// MarshalXML implements a custom marshaller to support `omitempty` feature.
+func (filter FilterRule) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
+	if filter.isEmpty() {
+		return nil
+	}
+	type filterRuleWrapper FilterRule
+	return e.EncodeElement(filterRuleWrapper(filter), start)
 }
 
 // UnmarshalXML - decodes XML data.
@@ -102,6 +115,10 @@ func (ruleList *FilterRuleList) UnmarshalXML(d *xml.Decoder, start xml.StartElem
 	return nil
 }
 
+func (ruleList FilterRuleList) isEmpty() bool {
+	return len(ruleList.Rules) == 0
+}
+
 // Pattern - returns pattern using prefix and suffix values.
 func (ruleList FilterRuleList) Pattern() string {
 	var prefix string
@@ -122,6 +139,15 @@ func (ruleList FilterRuleList) Pattern() string {
 // S3Key - represents elements inside <S3Key>...</S3Key>
 type S3Key struct {
 	RuleList FilterRuleList `xml:"S3Key,omitempty" json:"S3Key,omitempty"`
+}
+
+// MarshalXML implements a custom marshaller to support `omitempty` feature.
+func (s3Key S3Key) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
+	if s3Key.RuleList.isEmpty() {
+		return nil
+	}
+	type s3KeyWrapper S3Key
+	return e.EncodeElement(s3KeyWrapper(s3Key), start)
 }
 
 // common - represents common elements inside <QueueConfiguration>, <CloudFunctionConfiguration>
@@ -291,11 +317,9 @@ func ParseConfig(reader io.Reader, region string, targetList *TargetList) (*Conf
 	}
 
 	config.SetRegion(region)
-
-	// If xml namespace is empty, set a default value before returning.
+	//If xml namespace is empty, set a default value before returning.
 	if config.XMLNS == "" {
 		config.XMLNS = "http://s3.amazonaws.com/doc/2006-03-01/"
 	}
-
 	return &config, nil
 }

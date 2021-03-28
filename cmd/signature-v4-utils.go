@@ -18,8 +18,8 @@ package cmd
 
 import (
 	"bytes"
-	"context"
 	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/hex"
 	"io"
 	"io/ioutil"
@@ -30,7 +30,6 @@ import (
 	xhttp "github.com/minio/minio/cmd/http"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/auth"
-	"github.com/minio/sha256-simd"
 )
 
 // http Header "x-amz-content-sha256" == "UNSIGNED-PAYLOAD" indicates that the
@@ -64,12 +63,11 @@ func getContentSha256Cksum(r *http.Request, stype serviceType) string {
 	if stype == serviceSTS {
 		payload, err := ioutil.ReadAll(io.LimitReader(r.Body, stsRequestBodyLimit))
 		if err != nil {
-			logger.CriticalIf(context.Background(), err)
+			logger.CriticalIf(GlobalContext, err)
 		}
-		sum256 := sha256.New()
-		sum256.Write(payload)
+		sum256 := sha256.Sum256(payload)
 		r.Body = ioutil.NopCloser(bytes.NewReader(payload))
-		return hex.EncodeToString(sum256.Sum(nil))
+		return hex.EncodeToString(sum256[:])
 	}
 
 	var (
@@ -125,9 +123,6 @@ func checkKeyValid(accessKey string) (auth.Credentials, bool, APIErrorCode) {
 	var owner = true
 	var cred = globalActiveCred
 	if cred.AccessKey != accessKey {
-		if globalIAMSys == nil {
-			return cred, false, ErrInvalidAccessKeyID
-		}
 		// Check if the access key is part of users credentials.
 		var ok bool
 		if cred, ok = globalIAMSys.GetUser(accessKey); !ok {
@@ -164,9 +159,7 @@ func extractSignedHeaders(signedHeaders []string, r *http.Request) (http.Header,
 			val, ok = reqQueries[header]
 		}
 		if ok {
-			for _, enc := range val {
-				extractedSignedHeaders.Add(header, enc)
-			}
+			extractedSignedHeaders[http.CanonicalHeaderKey(header)] = val
 			continue
 		}
 		switch header {
@@ -193,9 +186,7 @@ func extractSignedHeaders(signedHeaders []string, r *http.Request) (http.Header,
 			extractedSignedHeaders.Set(header, r.Host)
 		case "transfer-encoding":
 			// Go http server removes "host" from Request.Header
-			for _, enc := range r.TransferEncoding {
-				extractedSignedHeaders.Add(header, enc)
-			}
+			extractedSignedHeaders[http.CanonicalHeaderKey(header)] = r.TransferEncoding
 		case "content-length":
 			// Signature-V4 spec excludes Content-Length from signed headers list for signature calculation.
 			// But some clients deviate from this rule. Hence we consider Content-Length for signature

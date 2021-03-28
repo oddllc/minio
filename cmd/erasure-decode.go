@@ -1,5 +1,5 @@
 /*
- * MinIO Cloud Storage, (C) 2016 MinIO, Inc.
+ * MinIO Cloud Storage, (C) 2016-2020 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,8 +18,10 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"io"
 	"sync"
+	"sync/atomic"
 
 	"github.com/minio/minio/cmd/logger"
 )
@@ -27,22 +29,61 @@ import (
 // Reads in parallel from readers.
 type parallelReader struct {
 	readers       []io.ReaderAt
+	orgReaders    []io.ReaderAt
 	dataBlocks    int
+	errs          []error
 	offset        int64
 	shardSize     int64
 	shardFileSize int64
 	buf           [][]byte
+	readerToBuf   []int
 }
 
 // newParallelReader returns parallelReader.
 func newParallelReader(readers []io.ReaderAt, e Erasure, offset, totalLength int64) *parallelReader {
+	r2b := make([]int, len(readers))
+	for i := range r2b {
+		r2b[i] = i
+	}
 	return &parallelReader{
-		readers,
-		e.dataBlocks,
-		(offset / e.blockSize) * e.ShardSize(),
-		e.ShardSize(),
-		e.ShardFileSize(totalLength),
-		make([][]byte, len(readers)),
+		readers:       readers,
+		orgReaders:    readers,
+		errs:          make([]error, len(readers)),
+		dataBlocks:    e.dataBlocks,
+		offset:        (offset / e.blockSize) * e.ShardSize(),
+		shardSize:     e.ShardSize(),
+		shardFileSize: e.ShardFileSize(totalLength),
+		buf:           make([][]byte, len(readers)),
+		readerToBuf:   r2b,
+	}
+}
+
+// preferReaders can mark readers as preferred.
+// These will be chosen before others.
+func (p *parallelReader) preferReaders(prefer []bool) {
+	if len(prefer) != len(p.orgReaders) {
+		return
+	}
+	// Copy so we don't change our input.
+	tmp := make([]io.ReaderAt, len(p.orgReaders))
+	copy(tmp, p.orgReaders)
+	p.readers = tmp
+	// next is the next non-preferred index.
+	next := 0
+	for i, ok := range prefer {
+		if !ok || p.readers[i] == nil {
+			continue
+		}
+		if i == next {
+			next++
+			continue
+		}
+		// Move reader with index i to index next.
+		// Do this by swapping next and i
+		p.readers[next], p.readers[i] = p.readers[i], p.readers[next]
+		p.readerToBuf[next] = i
+		p.readerToBuf[i] = next
+		next++
 	}
 }
 
@@ -50,7 +91,7 @@ func newParallelReader(readers []io.ReaderAt, e Erasure, offset, totalLength int
 func (p *parallelReader) canDecode(buf [][]byte) bool {
 	bufCount := 0
 	for _, b := range buf {
-		if b != nil {
+		if len(b) > 0 {
 			bufCount++
 		}
 	}
@@ -58,12 +99,22 @@ func (p *parallelReader) canDecode(buf [][]byte) bool {
 }
 
 // Read reads from readers in parallel. Returns p.dataBlocks number of bufs.
-func (p *parallelReader) Read() ([][]byte, error) {
-	newBuf := make([][]byte, len(p.readers))
+func (p *parallelReader) Read(dst [][]byte) ([][]byte, error) {
+	newBuf := dst
+	if len(dst) != len(p.readers) {
+		newBuf = make([][]byte, len(p.readers))
+	} else {
+		for i := range newBuf {
+			newBuf[i] = newBuf[i][:0]
+		}
+	}
 	var newBufLK sync.RWMutex
 
 	if p.offset+p.shardSize > p.shardFileSize {
 		p.shardSize = p.shardFileSize - p.offset
+	}
+	if p.shardSize == 0 {
+		return newBuf, nil
 	}
 
 	readTriggerCh := make(chan bool, len(p.readers))
@@ -72,6 +123,8 @@ func (p *parallelReader) Read() ([][]byte, error) {
 		readTriggerCh <- true
 	}
 
+	bitrotHeal := int32(0)       // Atomic bool flag.
+	missingPartsHeal := int32(0) // Atomic bool flag.
 	readerIndex := 0
 	var wg sync.WaitGroup
 	// if readTrigger is true, it implies next disk.ReadAt() should be tried
@@ -93,29 +146,40 @@ func (p *parallelReader) Read() ([][]byte, error) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			disk := p.readers[i]
-			if disk == nil {
-				// Since disk is nil, trigger another read.
+			rr := p.readers[i]
+			if rr == nil {
+				// Since reader is nil, trigger another read.
 				readTriggerCh <- true
 				return
 			}
-			if p.buf[i] == nil {
+			bufIdx := p.readerToBuf[i]
+			if p.buf[bufIdx] == nil {
 				// Reading first time on this disk, hence the buffer needs to be allocated.
 				// Subsequent reads will re-use this buffer.
-				p.buf[i] = make([]byte, p.shardSize)
+				p.buf[bufIdx] = make([]byte, p.shardSize)
 			}
 			// For the last shard, the shardsize might be less than previous shard sizes.
 			// Hence the following statement ensures that the buffer size is reset to the right size.
-			p.buf[i] = p.buf[i][:p.shardSize]
-			_, err := disk.ReadAt(p.buf[i], p.offset)
+			p.buf[bufIdx] = p.buf[bufIdx][:p.shardSize]
+			n, err := rr.ReadAt(p.buf[bufIdx], p.offset)
 			if err != nil {
+				if errors.Is(err, errFileNotFound) {
+					atomic.StoreInt32(&missingPartsHeal, 1)
+				} else if errors.Is(err, errFileCorrupt) {
+					atomic.StoreInt32(&bitrotHeal, 1)
+				}
+
+				// This will be communicated upstream.
+				p.orgReaders[bufIdx] = nil
 				p.readers[i] = nil
+				p.errs[i] = err
+
 				// Since ReadAt returned error, trigger another read.
 				readTriggerCh <- true
 				return
 			}
 			newBufLK.Lock()
-			newBuf[i] = p.buf[i]
+			newBuf[bufIdx] = p.buf[bufIdx][:n]
 			newBufLK.Unlock()
 			// Since ReadAt returned success, there is no need to trigger another read.
 			readTriggerCh <- false
@@ -123,35 +187,45 @@ func (p *parallelReader) Read() ([][]byte, error) {
 		readerIndex++
 	}
 	wg.Wait()
-
 	if p.canDecode(newBuf) {
 		p.offset += p.shardSize
+		if atomic.LoadInt32(&missingPartsHeal) == 1 {
+			return newBuf, errFileNotFound
+		} else if atomic.LoadInt32(&bitrotHeal) == 1 {
+			return newBuf, errFileCorrupt
+		}
 		return newBuf, nil
 	}
 
-	return nil, errXLReadQuorum
+	return nil, reduceReadQuorumErrs(context.Background(), p.errs, objectOpIgnoredErrs, p.dataBlocks)
 }
 
 // Decode reads from readers, reconstructs data if needed and writes the data to the writer.
-func (e Erasure) Decode(ctx context.Context, writer io.Writer, readers []io.ReaderAt, offset, length, totalLength int64) error {
+// A set of preferred drives can be supplied. In that case they will be used and the data reconstructed.
+func (e Erasure) Decode(ctx context.Context, writer io.Writer, readers []io.ReaderAt, offset, length, totalLength int64, prefer []bool) (written int64, derr error) {
 	if offset < 0 || length < 0 {
 		logger.LogIf(ctx, errInvalidArgument)
-		return errInvalidArgument
+		return -1, errInvalidArgument
 	}
 	if offset+length > totalLength {
 		logger.LogIf(ctx, errInvalidArgument)
-		return errInvalidArgument
+		return -1, errInvalidArgument
 	}
+
 	if length == 0 {
-		return nil
+		return 0, nil
 	}
 
 	reader := newParallelReader(readers, e, offset, totalLength)
+	if len(prefer) == len(readers) {
+		reader.preferReaders(prefer)
+	}
 
 	startBlock := offset / e.blockSize
 	endBlock := (offset + length) / e.blockSize
 
 	var bytesWritten int64
+	var bufs [][]byte
 	for block := startBlock; block <= endBlock; block++ {
 		var blockOffset, blockLength int64
 		switch {
@@ -171,23 +245,39 @@ func (e Erasure) Decode(ctx context.Context, writer io.Writer, readers []io.Read
 		if blockLength == 0 {
 			break
 		}
-		bufs, err := reader.Read()
-		if err != nil {
-			return err
+
+		var err error
+		bufs, err = reader.Read(bufs)
+		if len(bufs) > 0 {
+			// Set only if there are be enough data for reconstruction.
+			// and only for expected errors, also set once.
+			if errors.Is(err, errFileNotFound) || errors.Is(err, errFileCorrupt) {
+				if derr == nil {
+					derr = err
+				}
+			}
+		} else if err != nil {
+			// For all errors that cannot be reconstructed fail the read operation.
+			return -1, err
 		}
+
 		if err = e.DecodeDataBlocks(bufs); err != nil {
 			logger.LogIf(ctx, err)
-			return err
+			return -1, err
 		}
+
 		n, err := writeDataBlocks(ctx, writer, bufs, e.dataBlocks, blockOffset, blockLength)
 		if err != nil {
-			return err
+			return -1, err
 		}
+
 		bytesWritten += n
 	}
+
 	if bytesWritten != length {
 		logger.LogIf(ctx, errLessData)
-		return errLessData
+		return bytesWritten, errLessData
 	}
-	return nil
+
+	return bytesWritten, derr
 }

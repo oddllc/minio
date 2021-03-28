@@ -465,7 +465,9 @@ func intCast(v *Value) (int64, error) {
 	case string:
 		// Parse as number, truncate floating point if
 		// needed.
-		res, ok := strToInt(x)
+		// String might contain trimming spaces, which
+		// needs to be trimmed.
+		res, ok := strToInt(strings.TrimSpace(x))
 		if !ok {
 			return 0, errCastFailure("could not parse as int")
 		}
@@ -473,7 +475,9 @@ func intCast(v *Value) (int64, error) {
 	case []byte:
 		// Parse as number, truncate floating point if
 		// needed.
-		res, ok := strToInt(string(x))
+		// String might contain trimming spaces, which
+		// needs to be trimmed.
+		res, ok := strToInt(strings.TrimSpace(string(x)))
 		if !ok {
 			return 0, errCastFailure("could not parse as int")
 		}
@@ -488,16 +492,16 @@ func floatCast(v *Value) (float64, error) {
 	switch x := v.value.(type) {
 	case float64:
 		return x, nil
-	case int:
+	case int64:
 		return float64(x), nil
 	case string:
-		f, err := strconv.ParseFloat(x, 64)
+		f, err := strconv.ParseFloat(strings.TrimSpace(x), 64)
 		if err != nil {
 			return 0, errCastFailure("could not parse as float")
 		}
 		return f, nil
 	case []byte:
-		f, err := strconv.ParseFloat(string(x), 64)
+		f, err := strconv.ParseFloat(strings.TrimSpace(string(x)), 64)
 		if err != nil {
 			return 0, errCastFailure("could not parse as float")
 		}

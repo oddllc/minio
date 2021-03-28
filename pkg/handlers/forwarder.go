@@ -33,6 +33,7 @@ type Forwarder struct {
 	RoundTripper http.RoundTripper
 	PassHost     bool
 	Logger       func(error)
+	ErrorHandler func(http.ResponseWriter, *http.Request, error)
 
 	// internal variables
 	rewriter *headerRewriter
@@ -61,6 +62,11 @@ func (f *Forwarder) ServeHTTP(w http.ResponseWriter, inReq *http.Request) {
 		FlushInterval: defaultFlushInterval,
 		ErrorHandler:  f.customErrHandler,
 	}
+
+	if f.ErrorHandler != nil {
+		revproxy.ErrorHandler = f.ErrorHandler
+	}
+
 	revproxy.ServeHTTP(w, outReq)
 }
 
@@ -91,7 +97,8 @@ func (f *Forwarder) getURLFromRequest(req *http.Request) *url.URL {
 func copyURL(i *url.URL) *url.URL {
 	out := *i
 	if i.User != nil {
-		out.User = &(*i.User)
+		u := *i.User
+		out.User = &u
 	}
 	return &out
 }

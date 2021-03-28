@@ -35,40 +35,37 @@ import (
 	"github.com/minio/minio/cmd/config/storageclass"
 	"github.com/minio/minio/cmd/crypto"
 	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/pkg/auth"
 	iampolicy "github.com/minio/minio/pkg/iam/policy"
 	"github.com/minio/minio/pkg/madmin"
 )
 
-func validateAdminReqConfigKV(ctx context.Context, w http.ResponseWriter, r *http.Request) ObjectLayer {
+func validateAdminReqConfigKV(ctx context.Context, w http.ResponseWriter, r *http.Request) (auth.Credentials, ObjectLayer) {
 	// Get current object layer instance.
-	objectAPI := newObjectLayerWithoutSafeModeFn()
+	objectAPI := newObjectLayerFn()
 	if objectAPI == nil {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL)
-		return nil
+		return auth.Credentials{}, nil
 	}
 
 	// Validate request signature.
-	_, adminAPIErr := checkAdminRequestAuthType(ctx, r, iampolicy.ConfigUpdateAdminAction, "")
+	cred, adminAPIErr := checkAdminRequestAuth(ctx, r, iampolicy.ConfigUpdateAdminAction, "")
 	if adminAPIErr != ErrNone {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(adminAPIErr), r.URL)
-		return nil
+		return cred, nil
 	}
 
-	return objectAPI
+	return cred, objectAPI
 }
 
-// DelConfigKVHandler - DELETE /minio/admin/v2/del-config-kv
+// DelConfigKVHandler - DELETE /minio/admin/v3/del-config-kv
 func (a adminAPIHandlers) DelConfigKVHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "DelConfigKVHandler")
+	ctx := newContext(r, w, "DeleteConfigKV")
 
-	objectAPI := validateAdminReqConfigKV(ctx, w, r)
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+
+	cred, objectAPI := validateAdminReqConfigKV(ctx, w, r)
 	if objectAPI == nil {
-		return
-	}
-
-	// Deny if WORM is enabled
-	if globalWORMEnabled {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrMethodNotAllowed), r.URL)
 		return
 	}
 
@@ -78,7 +75,7 @@ func (a adminAPIHandlers) DelConfigKVHandler(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	password := globalActiveCred.SecretKey
+	password := cred.SecretKey
 	kvBytes, err := madmin.DecryptData(password, io.LimitReader(r.Body, r.ContentLength))
 	if err != nil {
 		logger.LogIf(ctx, err, logger.Application)
@@ -103,18 +100,14 @@ func (a adminAPIHandlers) DelConfigKVHandler(w http.ResponseWriter, r *http.Requ
 	}
 }
 
-// SetConfigKVHandler - PUT /minio/admin/v2/set-config-kv
+// SetConfigKVHandler - PUT /minio/admin/v3/set-config-kv
 func (a adminAPIHandlers) SetConfigKVHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "SetConfigKVHandler")
+	ctx := newContext(r, w, "SetConfigKV")
 
-	objectAPI := validateAdminReqConfigKV(ctx, w, r)
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+
+	cred, objectAPI := validateAdminReqConfigKV(ctx, w, r)
 	if objectAPI == nil {
-		return
-	}
-
-	// Deny if WORM is enabled
-	if globalWORMEnabled {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrMethodNotAllowed), r.URL)
 		return
 	}
 
@@ -124,7 +117,7 @@ func (a adminAPIHandlers) SetConfigKVHandler(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	password := globalActiveCred.SecretKey
+	password := cred.SecretKey
 	kvBytes, err := madmin.DecryptData(password, io.LimitReader(r.Body, r.ContentLength))
 	if err != nil {
 		logger.LogIf(ctx, err, logger.Application)
@@ -138,12 +131,13 @@ func (a adminAPIHandlers) SetConfigKVHandler(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	if _, err = cfg.ReadFrom(bytes.NewReader(kvBytes)); err != nil {
+	dynamic, err := cfg.ReadConfig(bytes.NewReader(kvBytes))
+	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
 
-	if err = validateConfig(cfg); err != nil {
+	if err = validateConfig(cfg, objectAPI.SetDriveCounts()); err != nil {
 		writeCustomErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAdminConfigBadJSON), err.Error(), r.URL)
 		return
 	}
@@ -162,23 +156,35 @@ func (a adminAPIHandlers) SetConfigKVHandler(w http.ResponseWriter, r *http.Requ
 
 	// Make sure to write backend is encrypted
 	if globalConfigEncrypted {
-		saveConfig(context.Background(), objectAPI, backendEncryptedFile, backendEncryptedMigrationComplete)
+		saveConfig(GlobalContext, objectAPI, backendEncryptedFile, backendEncryptedMigrationComplete)
 	}
 
+	if dynamic {
+		// Apply dynamic values.
+		if err := applyDynamicConfig(GlobalContext, objectAPI, cfg); err != nil {
+			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+			return
+		}
+		globalNotificationSys.SignalService(serviceReloadDynamic)
+		// If all values were dynamic, tell the client.
+		w.Header().Set(madmin.ConfigAppliedHeader, madmin.ConfigAppliedTrue)
+	}
 	writeSuccessResponseHeadersOnly(w)
 }
 
-// GetConfigKVHandler - GET /minio/admin/v2/get-config-kv?key={key}
+// GetConfigKVHandler - GET /minio/admin/v3/get-config-kv?key={key}
 func (a adminAPIHandlers) GetConfigKVHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "GetConfigKVHandler")
+	ctx := newContext(r, w, "GetConfigKV")
 
-	objectAPI := validateAdminReqConfigKV(ctx, w, r)
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+
+	cred, objectAPI := validateAdminReqConfigKV(ctx, w, r)
 	if objectAPI == nil {
 		return
 	}
 
 	cfg := globalServerConfig
-	if globalSafeMode {
+	if newObjectLayerFn() == nil {
 		var err error
 		cfg, err = getValidConfig(objectAPI)
 		if err != nil {
@@ -195,7 +201,7 @@ func (a adminAPIHandlers) GetConfigKVHandler(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	password := globalActiveCred.SecretKey
+	password := cred.SecretKey
 	econfigData, err := madmin.EncryptData(password, buf.Bytes())
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
@@ -206,9 +212,11 @@ func (a adminAPIHandlers) GetConfigKVHandler(w http.ResponseWriter, r *http.Requ
 }
 
 func (a adminAPIHandlers) ClearConfigHistoryKVHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "ClearConfigHistoryKVHandler")
+	ctx := newContext(r, w, "ClearConfigHistoryKV")
 
-	objectAPI := validateAdminReqConfigKV(ctx, w, r)
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+
+	_, objectAPI := validateAdminReqConfigKV(ctx, w, r)
 	if objectAPI == nil {
 		return
 	}
@@ -241,9 +249,11 @@ func (a adminAPIHandlers) ClearConfigHistoryKVHandler(w http.ResponseWriter, r *
 
 // RestoreConfigHistoryKVHandler - restores a config with KV settings for the given KV id.
 func (a adminAPIHandlers) RestoreConfigHistoryKVHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "RestoreConfigHistoryKVHandler")
+	ctx := newContext(r, w, "RestoreConfigHistoryKV")
 
-	objectAPI := validateAdminReqConfigKV(ctx, w, r)
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+
+	_, objectAPI := validateAdminReqConfigKV(ctx, w, r)
 	if objectAPI == nil {
 		return
 	}
@@ -267,12 +277,12 @@ func (a adminAPIHandlers) RestoreConfigHistoryKVHandler(w http.ResponseWriter, r
 		return
 	}
 
-	if _, err = cfg.ReadFrom(bytes.NewReader(kvBytes)); err != nil {
+	if _, err = cfg.ReadConfig(bytes.NewReader(kvBytes)); err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
 
-	if err = validateConfig(cfg); err != nil {
+	if err = validateConfig(cfg, objectAPI.SetDriveCounts()); err != nil {
 		writeCustomErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAdminConfigBadJSON), err.Error(), r.URL)
 		return
 	}
@@ -287,9 +297,11 @@ func (a adminAPIHandlers) RestoreConfigHistoryKVHandler(w http.ResponseWriter, r
 
 // ListConfigHistoryKVHandler - lists all the KV ids.
 func (a adminAPIHandlers) ListConfigHistoryKVHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "ListConfigHistoryKVHandler")
+	ctx := newContext(r, w, "ListConfigHistoryKV")
 
-	objectAPI := validateAdminReqConfigKV(ctx, w, r)
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+
+	cred, objectAPI := validateAdminReqConfigKV(ctx, w, r)
 	if objectAPI == nil {
 		return
 	}
@@ -313,7 +325,7 @@ func (a adminAPIHandlers) ListConfigHistoryKVHandler(w http.ResponseWriter, r *h
 		return
 	}
 
-	password := globalActiveCred.SecretKey
+	password := cred.SecretKey
 	econfigData, err := madmin.EncryptData(password, data)
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
@@ -323,11 +335,13 @@ func (a adminAPIHandlers) ListConfigHistoryKVHandler(w http.ResponseWriter, r *h
 	writeSuccessResponseJSON(w, econfigData)
 }
 
-// HelpConfigKVHandler - GET /minio/admin/v2/help-config-kv?subSys={subSys}&key={key}
+// HelpConfigKVHandler - GET /minio/admin/v3/help-config-kv?subSys={subSys}&key={key}
 func (a adminAPIHandlers) HelpConfigKVHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "HelpConfigKVHandler")
+	ctx := newContext(r, w, "HelpConfigKV")
 
-	objectAPI := validateAdminReqConfigKV(ctx, w, r)
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+
+	_, objectAPI := validateAdminReqConfigKV(ctx, w, r)
 	if objectAPI == nil {
 		return
 	}
@@ -349,18 +363,14 @@ func (a adminAPIHandlers) HelpConfigKVHandler(w http.ResponseWriter, r *http.Req
 	w.(http.Flusher).Flush()
 }
 
-// SetConfigHandler - PUT /minio/admin/v2/config
+// SetConfigHandler - PUT /minio/admin/v3/config
 func (a adminAPIHandlers) SetConfigHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "SetConfigHandler")
+	ctx := newContext(r, w, "SetConfig")
 
-	objectAPI := validateAdminReqConfigKV(ctx, w, r)
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+
+	cred, objectAPI := validateAdminReqConfigKV(ctx, w, r)
 	if objectAPI == nil {
-		return
-	}
-
-	// Deny if WORM is enabled
-	if globalWORMEnabled {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrMethodNotAllowed), r.URL)
 		return
 	}
 
@@ -370,7 +380,7 @@ func (a adminAPIHandlers) SetConfigHandler(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	password := globalActiveCred.SecretKey
+	password := cred.SecretKey
 	kvBytes, err := madmin.DecryptData(password, io.LimitReader(r.Body, r.ContentLength))
 	if err != nil {
 		logger.LogIf(ctx, err, logger.Application)
@@ -379,12 +389,12 @@ func (a adminAPIHandlers) SetConfigHandler(w http.ResponseWriter, r *http.Reques
 	}
 
 	cfg := newServerConfig()
-	if _, err = cfg.ReadFrom(bytes.NewReader(kvBytes)); err != nil {
+	if _, err = cfg.ReadConfig(bytes.NewReader(kvBytes)); err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
 
-	if err = validateConfig(cfg); err != nil {
+	if err = validateConfig(cfg, objectAPI.SetDriveCounts()); err != nil {
 		writeCustomErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAdminConfigBadJSON), err.Error(), r.URL)
 		return
 	}
@@ -403,18 +413,20 @@ func (a adminAPIHandlers) SetConfigHandler(w http.ResponseWriter, r *http.Reques
 
 	// Make sure to write backend is encrypted
 	if globalConfigEncrypted {
-		saveConfig(context.Background(), objectAPI, backendEncryptedFile, backendEncryptedMigrationComplete)
+		saveConfig(GlobalContext, objectAPI, backendEncryptedFile, backendEncryptedMigrationComplete)
 	}
 
 	writeSuccessResponseHeadersOnly(w)
 }
 
-// GetConfigHandler - GET /minio/admin/v2/config
+// GetConfigHandler - GET /minio/admin/v3/config
 // Get config.json of this minio setup.
 func (a adminAPIHandlers) GetConfigHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "GetConfigHandler")
+	ctx := newContext(r, w, "GetConfig")
 
-	objectAPI := validateAdminReqConfigKV(ctx, w, r)
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+
+	cred, objectAPI := validateAdminReqConfigKV(ctx, w, r)
 	if objectAPI == nil {
 		return
 	}
@@ -471,7 +483,7 @@ func (a adminAPIHandlers) GetConfigHandler(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
-	password := globalActiveCred.SecretKey
+	password := cred.SecretKey
 	econfigData, err := madmin.EncryptData(password, []byte(s.String()))
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)

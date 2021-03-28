@@ -1,5 +1,5 @@
 /*
- * MinIO Cloud Storage, (C) 2017, 2018 MinIO, Inc.
+ * MinIO Cloud Storage, (C) 2017-2020 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,9 +18,9 @@ package cmd
 
 import (
 	"bufio"
-	"context"
 	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/binary"
 	"encoding/hex"
@@ -29,11 +29,11 @@ import (
 	"net/http"
 	"path"
 	"strconv"
+	"strings"
 
-	"github.com/minio/minio-go/v6/pkg/encrypt"
 	"github.com/minio/minio/cmd/crypto"
+	xhttp "github.com/minio/minio/cmd/http"
 	"github.com/minio/minio/cmd/logger"
-	sha256 "github.com/minio/sha256-simd"
 	"github.com/minio/sio"
 )
 
@@ -81,7 +81,7 @@ func isEncryptedMultipart(objInfo ObjectInfo) bool {
 		}
 	}
 	// Further check if this object is uploaded using multipart mechanism
-	// by the user and it is not about XL internally splitting the
+	// by the user and it is not about Erasure internally splitting the
 	// object into parts in PutObject()
 	return !(objInfo.backendType == BackendErasure && len(objInfo.ETag) == 32)
 }
@@ -158,49 +158,49 @@ func rotateKey(oldKey []byte, newKey []byte, bucket, object string, metadata map
 			return err
 		}
 
-		newKey, encKey, err := GlobalKMS.GenerateKey(GlobalKMS.KeyID(), crypto.Context{bucket: path.Join(bucket, object)})
+		newKey, encKey, err := GlobalKMS.GenerateKey(GlobalKMS.DefaultKeyID(), crypto.Context{bucket: path.Join(bucket, object)})
 		if err != nil {
 			return err
 		}
 		sealedKey = objectKey.Seal(newKey, crypto.GenerateIV(rand.Reader), crypto.S3.String(), bucket, object)
-		crypto.S3.CreateMetadata(metadata, GlobalKMS.KeyID(), encKey, sealedKey)
+		crypto.S3.CreateMetadata(metadata, GlobalKMS.DefaultKeyID(), encKey, sealedKey)
 		return nil
 	}
 }
 
-func newEncryptMetadata(key []byte, bucket, object string, metadata map[string]string, sseS3 bool) ([]byte, error) {
+func newEncryptMetadata(key []byte, bucket, object string, metadata map[string]string, sseS3 bool) (crypto.ObjectKey, error) {
 	var sealedKey crypto.SealedKey
 	if sseS3 {
 		if GlobalKMS == nil {
-			return nil, errKMSNotConfigured
+			return crypto.ObjectKey{}, errKMSNotConfigured
 		}
-		key, encKey, err := GlobalKMS.GenerateKey(GlobalKMS.KeyID(), crypto.Context{bucket: path.Join(bucket, object)})
+		key, encKey, err := GlobalKMS.GenerateKey(GlobalKMS.DefaultKeyID(), crypto.Context{bucket: path.Join(bucket, object)})
 		if err != nil {
-			return nil, err
+			return crypto.ObjectKey{}, err
 		}
 
 		objectKey := crypto.GenerateKey(key, rand.Reader)
 		sealedKey = objectKey.Seal(key, crypto.GenerateIV(rand.Reader), crypto.S3.String(), bucket, object)
-		crypto.S3.CreateMetadata(metadata, GlobalKMS.KeyID(), encKey, sealedKey)
-		return objectKey[:], nil
+		crypto.S3.CreateMetadata(metadata, GlobalKMS.DefaultKeyID(), encKey, sealedKey)
+		return objectKey, nil
 	}
 	var extKey [32]byte
 	copy(extKey[:], key)
 	objectKey := crypto.GenerateKey(extKey, rand.Reader)
 	sealedKey = objectKey.Seal(extKey, crypto.GenerateIV(rand.Reader), crypto.SSEC.String(), bucket, object)
 	crypto.SSEC.CreateMetadata(metadata, sealedKey)
-	return objectKey[:], nil
+	return objectKey, nil
 }
 
-func newEncryptReader(content io.Reader, key []byte, bucket, object string, metadata map[string]string, sseS3 bool) (r io.Reader, encKey []byte, err error) {
+func newEncryptReader(content io.Reader, key []byte, bucket, object string, metadata map[string]string, sseS3 bool) (io.Reader, crypto.ObjectKey, error) {
 	objectEncryptionKey, err := newEncryptMetadata(key, bucket, object, metadata, sseS3)
 	if err != nil {
-		return nil, encKey, err
+		return nil, crypto.ObjectKey{}, err
 	}
 
 	reader, err := sio.EncryptReader(content, sio.Config{Key: objectEncryptionKey[:], MinVersion: sio.Version20})
 	if err != nil {
-		return nil, encKey, crypto.ErrInvalidCustomerKey
+		return nil, crypto.ObjectKey{}, crypto.ErrInvalidCustomerKey
 	}
 
 	return reader, objectEncryptionKey, nil
@@ -225,120 +225,68 @@ func setEncryptionMetadata(r *http.Request, bucket, object string, metadata map[
 // EncryptRequest takes the client provided content and encrypts the data
 // with the client provided key. It also marks the object as client-side-encrypted
 // and sets the correct headers.
-func EncryptRequest(content io.Reader, r *http.Request, bucket, object string, metadata map[string]string) (reader io.Reader, objEncKey []byte, err error) {
-	var key []byte
-
+func EncryptRequest(content io.Reader, r *http.Request, bucket, object string, metadata map[string]string) (io.Reader, crypto.ObjectKey, error) {
 	if crypto.S3.IsRequested(r.Header) && crypto.SSEC.IsRequested(r.Header) {
-		return nil, objEncKey, crypto.ErrIncompatibleEncryptionMethod
-	}
-	if crypto.SSEC.IsRequested(r.Header) {
-		key, err = ParseSSECustomerRequest(r)
-		if err != nil {
-			return nil, objEncKey, err
-		}
+		return nil, crypto.ObjectKey{}, crypto.ErrIncompatibleEncryptionMethod
 	}
 	if r.ContentLength > encryptBufferThreshold {
 		// The encryption reads in blocks of 64KB.
 		// We add a buffer on bigger files to reduce the number of syscalls upstream.
 		content = bufio.NewReaderSize(content, encryptBufferSize)
 	}
+
+	var key []byte
+	if crypto.SSEC.IsRequested(r.Header) {
+		var err error
+		key, err = ParseSSECustomerRequest(r)
+		if err != nil {
+			return nil, crypto.ObjectKey{}, err
+		}
+	}
 	return newEncryptReader(content, key, bucket, object, metadata, crypto.S3.IsRequested(r.Header))
 }
 
-// DecryptCopyRequest decrypts the object with the client provided key. It also removes
-// the client-side-encryption metadata from the object and sets the correct headers.
-func DecryptCopyRequest(client io.Writer, r *http.Request, bucket, object string, metadata map[string]string) (io.WriteCloser, error) {
-	var (
-		key []byte
-		err error
-	)
-	if crypto.SSECopy.IsRequested(r.Header) {
-		key, err = ParseSSECopyCustomerRequest(r.Header, metadata)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return newDecryptWriter(client, key, bucket, object, 0, metadata)
-}
-
 func decryptObjectInfo(key []byte, bucket, object string, metadata map[string]string) ([]byte, error) {
-	switch {
-	default:
-		return nil, errObjectTampered
-	case crypto.S3.IsEncrypted(metadata) && isCacheEncrypted(metadata):
-		if globalCacheKMS == nil {
+	switch kind, _ := crypto.IsEncrypted(metadata); kind {
+	case crypto.S3:
+		var KMS crypto.KMS = GlobalKMS
+		if isCacheEncrypted(metadata) {
+			KMS = globalCacheKMS
+		}
+		if KMS == nil {
 			return nil, errKMSNotConfigured
 		}
-		keyID, kmsKey, sealedKey, err := crypto.S3.ParseMetadata(metadata)
+		objectKey, err := crypto.S3.UnsealObjectKey(KMS, metadata, bucket, object)
 		if err != nil {
-			return nil, err
-		}
-		extKey, err := globalCacheKMS.UnsealKey(keyID, kmsKey, crypto.Context{bucket: path.Join(bucket, object)})
-		if err != nil {
-			return nil, err
-		}
-		var objectKey crypto.ObjectKey
-		if err = objectKey.Unseal(extKey, sealedKey, crypto.S3.String(), bucket, object); err != nil {
 			return nil, err
 		}
 		return objectKey[:], nil
-	case crypto.S3.IsEncrypted(metadata):
+	case crypto.S3KMS:
 		if GlobalKMS == nil {
 			return nil, errKMSNotConfigured
 		}
-		keyID, kmsKey, sealedKey, err := crypto.S3.ParseMetadata(metadata)
-
+		objectKey, err := crypto.S3KMS.UnsealObjectKey(GlobalKMS, metadata, bucket, object)
 		if err != nil {
-			return nil, err
-		}
-		extKey, err := GlobalKMS.UnsealKey(keyID, kmsKey, crypto.Context{bucket: path.Join(bucket, object)})
-		if err != nil {
-			return nil, err
-		}
-		var objectKey crypto.ObjectKey
-		if err = objectKey.Unseal(extKey, sealedKey, crypto.S3.String(), bucket, object); err != nil {
 			return nil, err
 		}
 		return objectKey[:], nil
-	case crypto.SSEC.IsEncrypted(metadata):
-		var extKey [32]byte
-		copy(extKey[:], key)
+	case crypto.SSEC:
 		sealedKey, err := crypto.SSEC.ParseMetadata(metadata)
 		if err != nil {
 			return nil, err
 		}
-		var objectKey crypto.ObjectKey
+		var (
+			objectKey crypto.ObjectKey
+			extKey    [32]byte
+		)
+		copy(extKey[:], key)
 		if err = objectKey.Unseal(extKey, sealedKey, crypto.SSEC.String(), bucket, object); err != nil {
 			return nil, err
 		}
 		return objectKey[:], nil
+	default:
+		return nil, errObjectTampered
 	}
-}
-
-func newDecryptWriter(client io.Writer, key []byte, bucket, object string, seqNumber uint32, metadata map[string]string) (io.WriteCloser, error) {
-	objectEncryptionKey, err := decryptObjectInfo(key, bucket, object, metadata)
-	if err != nil {
-		return nil, err
-	}
-	return newDecryptWriterWithObjectKey(client, objectEncryptionKey, seqNumber, metadata)
-}
-
-func newDecryptWriterWithObjectKey(client io.Writer, objectEncryptionKey []byte, seqNumber uint32, metadata map[string]string) (io.WriteCloser, error) {
-	writer, err := sio.DecryptWriter(client, sio.Config{
-		Key:            objectEncryptionKey,
-		SequenceNumber: seqNumber,
-	})
-	if err != nil {
-		return nil, crypto.ErrInvalidCustomerKey
-	}
-	delete(metadata, crypto.SSEIV)
-	delete(metadata, crypto.SSESealAlgorithm)
-	delete(metadata, crypto.SSECSealedKey)
-	delete(metadata, crypto.SSEMultipart)
-	delete(metadata, crypto.S3SealedKey)
-	delete(metadata, crypto.S3KMSSealedKey)
-	delete(metadata, crypto.S3KMSKeyID)
-	return writer, nil
 }
 
 // Adding support for reader based interface
@@ -394,9 +342,7 @@ func newDecryptReaderWithObjectKey(client io.Reader, objectEncryptionKey []byte,
 
 // DecryptBlocksRequestR - same as DecryptBlocksRequest but with a
 // reader
-func DecryptBlocksRequestR(inputReader io.Reader, h http.Header, offset,
-	length int64, seqNumber uint32, partStart int, oi ObjectInfo, copySource bool) (
-	io.Reader, error) {
+func DecryptBlocksRequestR(inputReader io.Reader, h http.Header, seqNumber uint32, partStart int, oi ObjectInfo, copySource bool) (io.Reader, error) {
 
 	bucket, object := oi.Bucket, oi.Name
 	// Single part case
@@ -427,18 +373,13 @@ func DecryptBlocksRequestR(inputReader io.Reader, h http.Header, offset,
 		header:            h,
 		bucket:            bucket,
 		object:            object,
-		customerKeyHeader: h.Get(crypto.SSECKey),
+		customerKeyHeader: h.Get(xhttp.AmzServerSideEncryptionCustomerKey),
 		copySource:        copySource,
-	}
-
-	w.metadata = map[string]string{}
-	// Copy encryption metadata for internal use.
-	for k, v := range oi.UserDefined {
-		w.metadata[k] = v
+		metadata:          cloneMSS(oi.UserDefined),
 	}
 
 	if w.copySource {
-		w.customerKeyHeader = h.Get(crypto.SSECopyKey)
+		w.customerKeyHeader = h.Get(xhttp.AmzServerSideEncryptionCopyCustomerKey)
 	}
 
 	if err := w.buildDecrypter(w.parts[w.partIndex].Number); err != nil {
@@ -446,26 +387,6 @@ func DecryptBlocksRequestR(inputReader io.Reader, h http.Header, offset,
 	}
 
 	return w, nil
-}
-
-// DecryptRequestWithSequenceNumber decrypts the object with the client provided key. It also removes
-// the client-side-encryption metadata from the object and sets the correct headers.
-func DecryptRequestWithSequenceNumber(client io.Writer, r *http.Request, bucket, object string, seqNumber uint32, metadata map[string]string) (io.WriteCloser, error) {
-	if crypto.S3.IsEncrypted(metadata) {
-		return newDecryptWriter(client, nil, bucket, object, seqNumber, metadata)
-	}
-
-	key, err := ParseSSECustomerRequest(r)
-	if err != nil {
-		return nil, err
-	}
-	return newDecryptWriter(client, key, bucket, object, seqNumber, metadata)
-}
-
-// DecryptRequest decrypts the object with client provided key for SSE-C and SSE-S3. It also removes
-// the encryption metadata from the object and sets the correct headers.
-func DecryptRequest(client io.Writer, r *http.Request, bucket, object string, metadata map[string]string) (io.WriteCloser, error) {
-	return DecryptRequestWithSequenceNumber(client, r, bucket, object, 0, metadata)
 }
 
 // DecryptBlocksReader - decrypts multipart parts, while implementing
@@ -493,22 +414,19 @@ type DecryptBlocksReader struct {
 }
 
 func (d *DecryptBlocksReader) buildDecrypter(partID int) error {
-	m := make(map[string]string)
-	for k, v := range d.metadata {
-		m[k] = v
-	}
+	m := cloneMSS(d.metadata)
 	// Initialize the first decrypter; new decrypters will be
 	// initialized in Read() operation as needed.
 	var key []byte
 	var err error
 	if d.copySource {
 		if crypto.SSEC.IsEncrypted(d.metadata) {
-			d.header.Set(crypto.SSECopyKey, d.customerKeyHeader)
+			d.header.Set(xhttp.AmzServerSideEncryptionCopyCustomerKey, d.customerKeyHeader)
 			key, err = ParseSSECopyCustomerRequest(d.header, d.metadata)
 		}
 	} else {
 		if crypto.SSEC.IsEncrypted(d.metadata) {
-			d.header.Set(crypto.SSECKey, d.customerKeyHeader)
+			d.header.Set(xhttp.AmzServerSideEncryptionCustomerKey, d.customerKeyHeader)
 			key, err = ParseSSECustomerHeader(d.header)
 		}
 	}
@@ -583,36 +501,11 @@ func (d *DecryptBlocksReader) Read(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// getEncryptedSinglePartOffsetLength - fetch sequence number, encrypted start offset and encrypted length.
-func getEncryptedSinglePartOffsetLength(offset, length int64, objInfo ObjectInfo) (seqNumber uint32, encOffset int64, encLength int64) {
-	onePkgSize := int64(SSEDAREPackageBlockSize + SSEDAREPackageMetaSize)
-
-	seqNumber = uint32(offset / SSEDAREPackageBlockSize)
-	encOffset = int64(seqNumber) * onePkgSize
-	// The math to compute the encrypted length is always
-	// originalLength i.e (offset+length-1) to be divided under
-	// 64KiB blocks which is the payload size for each encrypted
-	// block. This is then multiplied by final package size which
-	// is basically 64KiB + 32. Finally negate the encrypted offset
-	// to get the final encrypted length on disk.
-	encLength = ((offset+length)/SSEDAREPackageBlockSize)*onePkgSize - encOffset
-
-	// Check for the remainder, to figure if we need one extract package to read from.
-	if (offset+length)%SSEDAREPackageBlockSize > 0 {
-		encLength += onePkgSize
-	}
-
-	if encLength+encOffset > objInfo.EncryptedSize() {
-		encLength = objInfo.EncryptedSize() - encOffset
-	}
-	return seqNumber, encOffset, encLength
-}
-
 // DecryptedSize returns the size of the object after decryption in bytes.
 // It returns an error if the object is not encrypted or marked as encrypted
 // but has an invalid size.
 func (o *ObjectInfo) DecryptedSize() (int64, error) {
-	if !crypto.IsEncrypted(o.UserDefined) {
+	if _, ok := crypto.IsEncrypted(o.UserDefined); !ok {
 		return 0, errors.New("Cannot compute decrypted size of an unencrypted object")
 	}
 	if !isEncryptedMultipart(*o) {
@@ -634,6 +527,47 @@ func (o *ObjectInfo) DecryptedSize() (int64, error) {
 	return size, nil
 }
 
+// DecryptETag decrypts the ETag that is part of given object
+// with the given object encryption key.
+//
+// However, DecryptETag does not try to decrypt the ETag if
+// it consists of a 128 bit hex value (32 hex chars) and exactly
+// one '-' followed by a 32-bit number.
+// This special case adresses randomly-generated ETags generated
+// by the MinIO server when running in non-compat mode. These
+// random ETags are not encrypt.
+//
+// Calling DecryptETag with a non-randomly generated ETag will
+// fail.
+func DecryptETag(key crypto.ObjectKey, object ObjectInfo) (string, error) {
+	if n := strings.Count(object.ETag, "-"); n > 0 {
+		if n != 1 {
+			return "", errObjectTampered
+		}
+		i := strings.IndexByte(object.ETag, '-')
+		if len(object.ETag[:i]) != 32 {
+			return "", errObjectTampered
+		}
+		if _, err := hex.DecodeString(object.ETag[:32]); err != nil {
+			return "", errObjectTampered
+		}
+		if _, err := strconv.ParseInt(object.ETag[i+1:], 10, 32); err != nil {
+			return "", errObjectTampered
+		}
+		return object.ETag, nil
+	}
+
+	etag, err := hex.DecodeString(object.ETag)
+	if err != nil {
+		return "", err
+	}
+	etag, err = key.UnsealETag(etag)
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(etag), nil
+}
+
 // For encrypted objects, the ETag sent by client if available
 // is stored in encrypted form in the backend. Decrypt the ETag
 // if ETag was previously encrypted.
@@ -650,16 +584,18 @@ func getDecryptedETag(headers http.Header, objInfo ObjectInfo, copySource bool) 
 	if crypto.IsMultiPart(objInfo.UserDefined) {
 		return objInfo.ETag
 	}
+
 	if crypto.SSECopy.IsRequested(headers) {
 		key, err = crypto.SSECopy.ParseHTTP(headers)
 		if err != nil {
 			return objInfo.ETag
 		}
 	}
+
 	// As per AWS S3 Spec, ETag for SSE-C encrypted objects need not be MD5Sum of the data.
 	// Since server side copy with same source and dest just replaces the ETag, we save
 	// encrypted content MD5Sum as ETag for both SSE-C and SSE-S3, we standardize the ETag
-	//encryption across SSE-C and SSE-S3, and only return last 32 bytes for SSE-C
+	// encryption across SSE-C and SSE-S3, and only return last 32 bytes for SSE-C
 	if crypto.SSEC.IsEncrypted(objInfo.UserDefined) && !copySource {
 		return objInfo.ETag[len(objInfo.ETag)-32:]
 	}
@@ -702,14 +638,14 @@ func tryDecryptETag(key []byte, encryptedETag string, ssec bool) string {
 // requested range starts, along with the DARE sequence number within
 // that part. For single part objects, the partStart will be 0.
 func (o *ObjectInfo) GetDecryptedRange(rs *HTTPRangeSpec) (encOff, encLength, skipLen int64, seqNumber uint32, partStart int, err error) {
-	if !crypto.IsEncrypted(o.UserDefined) {
+	if _, ok := crypto.IsEncrypted(o.UserDefined); !ok {
 		err = errors.New("Object is not encrypted")
 		return
 	}
 
 	if rs == nil {
 		// No range, so offsets refer to the whole object.
-		return 0, int64(o.Size), 0, 0, 0, nil
+		return 0, o.Size, 0, 0, 0, nil
 	}
 
 	// Assemble slice of (decrypted) part sizes in `sizes`
@@ -817,38 +753,10 @@ func (o *ObjectInfo) EncryptedSize() int64 {
 		// This cannot happen since AWS S3 allows parts to be 5GB at most
 		// sio max. size is 256 TB
 		reqInfo := (&logger.ReqInfo{}).AppendTags("size", strconv.FormatUint(size, 10))
-		ctx := logger.SetReqInfo(context.Background(), reqInfo)
+		ctx := logger.SetReqInfo(GlobalContext, reqInfo)
 		logger.CriticalIf(ctx, err)
 	}
 	return int64(size)
-}
-
-// DecryptCopyObjectInfo tries to decrypt the provided object if it is encrypted.
-// It fails if the object is encrypted and the HTTP headers don't contain
-// SSE-C headers or the object is not encrypted but SSE-C headers are provided. (AWS behavior)
-// DecryptObjectInfo returns 'ErrNone' if the object is not encrypted or the
-// decryption succeeded.
-//
-// DecryptCopyObjectInfo also returns whether the object is encrypted or not.
-func DecryptCopyObjectInfo(info *ObjectInfo, headers http.Header) (errCode APIErrorCode, encrypted bool) {
-	// Directories are never encrypted.
-	if info.IsDir {
-		return ErrNone, false
-	}
-	if errCode, encrypted = ErrNone, crypto.IsEncrypted(info.UserDefined); !encrypted && crypto.SSECopy.IsRequested(headers) {
-		errCode = ErrInvalidEncryptionParameters
-	} else if encrypted {
-		if (!crypto.SSECopy.IsRequested(headers) && crypto.SSEC.IsEncrypted(info.UserDefined)) ||
-			(crypto.SSECopy.IsRequested(headers) && crypto.S3.IsEncrypted(info.UserDefined)) {
-			errCode = ErrSSEEncryptedObject
-			return
-		}
-		var err error
-		if info.Size, err = info.DecryptedSize(); err != nil {
-			errCode = toAPIErrorCode(context.Background(), err)
-		}
-	}
-	return
 }
 
 // DecryptObjectInfo tries to decrypt the provided object if it is encrypted.
@@ -858,32 +766,53 @@ func DecryptCopyObjectInfo(info *ObjectInfo, headers http.Header) (errCode APIEr
 // decryption succeeded.
 //
 // DecryptObjectInfo also returns whether the object is encrypted or not.
-func DecryptObjectInfo(info *ObjectInfo, headers http.Header) (encrypted bool, err error) {
+func DecryptObjectInfo(info *ObjectInfo, r *http.Request) (encrypted bool, err error) {
 	// Directories are never encrypted.
 	if info.IsDir {
 		return false, nil
 	}
-	// disallow X-Amz-Server-Side-Encryption header on HEAD and GET
-	if crypto.S3.IsRequested(headers) {
-		err = errInvalidEncryptionParameters
-		return
+	if r == nil {
+		return false, errInvalidArgument
 	}
-	if err, encrypted = nil, crypto.IsEncrypted(info.UserDefined); !encrypted && crypto.SSEC.IsRequested(headers) {
-		err = errInvalidEncryptionParameters
-	} else if encrypted {
-		if (crypto.SSEC.IsEncrypted(info.UserDefined) && !crypto.SSEC.IsRequested(headers)) ||
-			(crypto.S3.IsEncrypted(info.UserDefined) && crypto.SSEC.IsRequested(headers)) {
-			err = errEncryptedObject
-			return
-		}
-		_, err = info.DecryptedSize()
 
-		if crypto.IsEncrypted(info.UserDefined) && !crypto.IsMultiPart(info.UserDefined) {
+	headers := r.Header
+
+	// disallow X-Amz-Server-Side-Encryption header on HEAD and GET
+	switch r.Method {
+	case http.MethodGet, http.MethodHead:
+		if crypto.S3.IsRequested(headers) {
+			return false, errInvalidEncryptionParameters
+		}
+	}
+
+	_, encrypted = crypto.IsEncrypted(info.UserDefined)
+	if !encrypted && crypto.SSEC.IsRequested(headers) && r.Header.Get(xhttp.AmzCopySource) == "" {
+		return false, errInvalidEncryptionParameters
+	}
+
+	if encrypted {
+		if crypto.SSEC.IsEncrypted(info.UserDefined) {
+			if !(crypto.SSEC.IsRequested(headers) || crypto.SSECopy.IsRequested(headers)) {
+				return encrypted, errEncryptedObject
+			}
+		}
+
+		if crypto.S3.IsEncrypted(info.UserDefined) && r.Header.Get(xhttp.AmzCopySource) == "" {
+			if crypto.SSEC.IsRequested(headers) || crypto.SSECopy.IsRequested(headers) {
+				return encrypted, errEncryptedObject
+			}
+		}
+
+		if _, err = info.DecryptedSize(); err != nil {
+			return encrypted, err
+		}
+
+		if _, ok := crypto.IsEncrypted(info.UserDefined); ok && !crypto.IsMultiPart(info.UserDefined) {
 			info.ETag = getDecryptedETag(headers, *info, false)
 		}
-
 	}
-	return
+
+	return encrypted, nil
 }
 
 // The customer key in the header is used by the gateway for encryption in the case of
@@ -896,115 +825,4 @@ func deriveClientKey(clientKey [32]byte, bucket, object string) [32]byte {
 	mac.Write([]byte(path.Join(bucket, object)))
 	mac.Sum(key[:0])
 	return key
-}
-
-// set encryption options for pass through to backend in the case of gateway and UserDefined metadata
-func getDefaultOpts(header http.Header, copySource bool, metadata map[string]string) (opts ObjectOptions, err error) {
-	var clientKey [32]byte
-	var sse encrypt.ServerSide
-
-	if copySource {
-		if crypto.SSECopy.IsRequested(header) {
-			clientKey, err = crypto.SSECopy.ParseHTTP(header)
-			if err != nil {
-				return
-			}
-			if sse, err = encrypt.NewSSEC(clientKey[:]); err != nil {
-				return
-			}
-			return ObjectOptions{ServerSideEncryption: encrypt.SSECopy(sse), UserDefined: metadata}, nil
-		}
-		return
-	}
-
-	if crypto.SSEC.IsRequested(header) {
-		clientKey, err = crypto.SSEC.ParseHTTP(header)
-		if err != nil {
-			return
-		}
-		if sse, err = encrypt.NewSSEC(clientKey[:]); err != nil {
-			return
-		}
-		return ObjectOptions{ServerSideEncryption: sse, UserDefined: metadata}, nil
-	}
-	if crypto.S3.IsRequested(header) || (metadata != nil && crypto.S3.IsEncrypted(metadata)) {
-		return ObjectOptions{ServerSideEncryption: encrypt.NewSSE(), UserDefined: metadata}, nil
-	}
-	return ObjectOptions{UserDefined: metadata}, nil
-}
-
-// get ObjectOptions for GET calls from encryption headers
-func getOpts(ctx context.Context, r *http.Request, bucket, object string) (ObjectOptions, error) {
-	var (
-		encryption encrypt.ServerSide
-		opts       ObjectOptions
-	)
-	if GlobalGatewaySSE.SSEC() && crypto.SSEC.IsRequested(r.Header) {
-		key, err := crypto.SSEC.ParseHTTP(r.Header)
-		if err != nil {
-			return opts, err
-		}
-		derivedKey := deriveClientKey(key, bucket, object)
-		encryption, err = encrypt.NewSSEC(derivedKey[:])
-		logger.CriticalIf(ctx, err)
-		return ObjectOptions{ServerSideEncryption: encryption}, nil
-	}
-	// default case of passing encryption headers to backend
-	return getDefaultOpts(r.Header, false, nil)
-}
-
-// get ObjectOptions for PUT calls from encryption headers and metadata
-func putOpts(ctx context.Context, r *http.Request, bucket, object string, metadata map[string]string) (opts ObjectOptions, err error) {
-	// In the case of multipart custom format, the metadata needs to be checked in addition to header to see if it
-	// is SSE-S3 encrypted, primarily because S3 protocol does not require SSE-S3 headers in PutObjectPart calls
-	if GlobalGatewaySSE.SSES3() && (crypto.S3.IsRequested(r.Header) || crypto.S3.IsEncrypted(metadata)) {
-		return ObjectOptions{ServerSideEncryption: encrypt.NewSSE(), UserDefined: metadata}, nil
-	}
-	if GlobalGatewaySSE.SSEC() && crypto.SSEC.IsRequested(r.Header) {
-		opts, err = getOpts(ctx, r, bucket, object)
-		opts.UserDefined = metadata
-		return
-	}
-	if crypto.S3KMS.IsRequested(r.Header) {
-		keyID, context, err := crypto.S3KMS.ParseHTTP(r.Header)
-		if err != nil {
-			return ObjectOptions{}, err
-		}
-		sseKms, err := encrypt.NewSSEKMS(keyID, context)
-		if err != nil {
-			return ObjectOptions{}, err
-		}
-		return ObjectOptions{ServerSideEncryption: sseKms, UserDefined: metadata}, nil
-	}
-	// default case of passing encryption headers and UserDefined metadata to backend
-	return getDefaultOpts(r.Header, false, metadata)
-}
-
-// get ObjectOptions for Copy calls with encryption headers provided on the target side and source side metadata
-func copyDstOpts(ctx context.Context, r *http.Request, bucket, object string, metadata map[string]string) (opts ObjectOptions, err error) {
-	return putOpts(ctx, r, bucket, object, metadata)
-}
-
-// get ObjectOptions for Copy calls with encryption headers provided on the source side
-func copySrcOpts(ctx context.Context, r *http.Request, bucket, object string) (ObjectOptions, error) {
-	var (
-		ssec encrypt.ServerSide
-		opts ObjectOptions
-	)
-
-	if GlobalGatewaySSE.SSEC() && crypto.SSECopy.IsRequested(r.Header) {
-		key, err := crypto.SSECopy.ParseHTTP(r.Header)
-		if err != nil {
-			return opts, err
-		}
-		derivedKey := deriveClientKey(key, bucket, object)
-		ssec, err = encrypt.NewSSEC(derivedKey[:])
-		if err != nil {
-			return opts, err
-		}
-		return ObjectOptions{ServerSideEncryption: encrypt.SSECopy(ssec)}, nil
-	}
-
-	// default case of passing encryption headers to backend
-	return getDefaultOpts(r.Header, true, nil)
 }

@@ -1,3 +1,19 @@
+/*
+ * MinIO Cloud Storage, (C) 2019 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package notify
 
 import (
@@ -185,6 +201,14 @@ func SetNotifyES(s config.Config, esName string, cfg target.ElasticsearchArgs) e
 			Key:   target.ElasticQueueLimit,
 			Value: strconv.Itoa(int(cfg.QueueLimit)),
 		},
+		config.KV{
+			Key:   target.ElasticUsername,
+			Value: cfg.Username,
+		},
+		config.KV{
+			Key:   target.ElasticPassword,
+			Value: cfg.Password,
+		},
 	}
 
 	return nil
@@ -265,6 +289,14 @@ func SetNotifyWebhook(s config.Config, whName string, cfg target.WebhookArgs) er
 			Key:   target.WebhookQueueLimit,
 			Value: strconv.Itoa(int(cfg.QueueLimit)),
 		},
+		config.KV{
+			Key:   target.WebhookClientCert,
+			Value: cfg.ClientCert,
+		},
+		config.KV{
+			Key:   target.WebhookClientKey,
+			Value: cfg.ClientKey,
+		},
 	}
 
 	return nil
@@ -307,7 +339,7 @@ func SetNotifyPostgres(s config.Config, psqName string, cfg target.PostgreSQLArg
 		},
 		config.KV{
 			Key:   target.PostgresUsername,
-			Value: cfg.User,
+			Value: cfg.Username,
 		},
 		config.KV{
 			Key:   target.PostgresPassword,
@@ -324,6 +356,10 @@ func SetNotifyPostgres(s config.Config, psqName string, cfg target.PostgreSQLArg
 		config.KV{
 			Key:   target.PostgresQueueLimit,
 			Value: strconv.Itoa(int(cfg.QueueLimit)),
+		},
+		config.KV{
+			Key:   target.PostgresMaxOpenConnections,
+			Value: strconv.Itoa(cfg.MaxOpenConnections),
 		},
 	}
 
@@ -521,6 +557,10 @@ func SetNotifyMySQL(s config.Config, sqlName string, cfg target.MySQLArgs) error
 		config.KV{
 			Key:   target.MySQLQueueLimit,
 			Value: strconv.Itoa(int(cfg.QueueLimit)),
+		},
+		config.KV{
+			Key:   target.MySQLMaxOpenConnections,
+			Value: strconv.Itoa(cfg.MaxOpenConnections),
 		},
 	}
 

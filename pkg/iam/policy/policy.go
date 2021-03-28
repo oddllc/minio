@@ -19,8 +19,10 @@ package iampolicy
 import (
 	"encoding/json"
 	"io"
+	"strings"
 
-	"github.com/minio/minio/pkg/policy"
+	"github.com/minio/minio-go/v7/pkg/set"
+	"github.com/minio/minio/pkg/bucket/policy"
 )
 
 // DefaultVersion - default policy version as per AWS S3 specification.
@@ -29,12 +31,62 @@ const DefaultVersion = "2012-10-17"
 // Args - arguments to policy to check whether it is allowed
 type Args struct {
 	AccountName     string                 `json:"account"`
+	Groups          []string               `json:"groups"`
 	Action          Action                 `json:"action"`
 	BucketName      string                 `json:"bucket"`
 	ConditionValues map[string][]string    `json:"conditions"`
 	IsOwner         bool                   `json:"owner"`
 	ObjectName      string                 `json:"object"`
 	Claims          map[string]interface{} `json:"claims"`
+	DenyOnly        bool                   `json:"denyOnly"` // only applies deny
+}
+
+// GetPoliciesFromClaims returns the list of policies to be applied for this
+// incoming request, extracting the information from input JWT claims.
+func GetPoliciesFromClaims(claims map[string]interface{}, policyClaimName string) (set.StringSet, bool) {
+	s := set.NewStringSet()
+	pname, ok := claims[policyClaimName]
+	if !ok {
+		return s, false
+	}
+	pnames, ok := pname.([]interface{})
+	if !ok {
+		pnameStr, ok := pname.(string)
+		if ok {
+			for _, pname := range strings.Split(pnameStr, ",") {
+				pname = strings.TrimSpace(pname)
+				if pname == "" {
+					// ignore any empty strings, considerate
+					// towards some user errors.
+					continue
+				}
+				s.Add(pname)
+			}
+			return s, true
+		}
+		return s, false
+	}
+	for _, pname := range pnames {
+		pnameStr, ok := pname.(string)
+		if ok {
+			for _, pnameStr := range strings.Split(pnameStr, ",") {
+				pnameStr = strings.TrimSpace(pnameStr)
+				if pnameStr == "" {
+					// ignore any empty strings, considerate
+					// towards some user errors.
+					continue
+				}
+				s.Add(pnameStr)
+			}
+		}
+	}
+	return s, true
+}
+
+// GetPolicies returns the list of policies to be applied for this
+// incoming request, extracting the information from JWT claims.
+func (a Args) GetPolicies(policyClaimName string) (set.StringSet, bool) {
+	return GetPoliciesFromClaims(a.Claims, policyClaimName)
 }
 
 // Policy - iam bucket iamp.
@@ -53,6 +105,15 @@ func (iamp Policy) IsAllowed(args Args) bool {
 				return false
 			}
 		}
+	}
+
+	// Applied any 'Deny' only policies, if we have
+	// reached here it means that there were no 'Deny'
+	// policies - this function mainly used for
+	// specific scenarios where we only want to validate
+	// 'Deny' only policies.
+	if args.DenyOnly {
+		return true
 	}
 
 	// For owner, its allowed by default.
@@ -88,40 +149,39 @@ func (iamp Policy) isValid() error {
 			return err
 		}
 	}
-
-	for i := range iamp.Statements {
-		for _, statement := range iamp.Statements[i+1:] {
-			actions := iamp.Statements[i].Actions.Intersection(statement.Actions)
-			if len(actions) == 0 {
-				continue
-			}
-
-			resources := iamp.Statements[i].Resources.Intersection(statement.Resources)
-			if len(resources) == 0 {
-				continue
-			}
-
-			if iamp.Statements[i].Conditions.String() != statement.Conditions.String() {
-				continue
-			}
-
-			return Errorf("duplicate actions %v, resources %v found in statements %v, %v",
-				actions, resources, iamp.Statements[i], statement)
-		}
-	}
-
 	return nil
 }
 
-// MarshalJSON - encodes Policy to JSON data.
-func (iamp Policy) MarshalJSON() ([]byte, error) {
-	if err := iamp.isValid(); err != nil {
-		return nil, err
+// Merge merges two policies documents and drop
+// duplicate statements if any.
+func (iamp Policy) Merge(input Policy) Policy {
+	var mergedPolicy Policy
+	if iamp.Version != "" {
+		mergedPolicy.Version = iamp.Version
+	} else {
+		mergedPolicy.Version = input.Version
 	}
+	for _, st := range iamp.Statements {
+		mergedPolicy.Statements = append(mergedPolicy.Statements, st.Clone())
+	}
+	for _, st := range input.Statements {
+		mergedPolicy.Statements = append(mergedPolicy.Statements, st.Clone())
+	}
+	mergedPolicy.dropDuplicateStatements()
+	return mergedPolicy
+}
 
-	// subtype to avoid recursive call to MarshalJSON()
-	type subPolicy Policy
-	return json.Marshal(subPolicy(iamp))
+func (iamp *Policy) dropDuplicateStatements() {
+redo:
+	for i := range iamp.Statements {
+		for j, statement := range iamp.Statements[i+1:] {
+			if !iamp.Statements[i].Equals(statement) {
+				continue
+			}
+			iamp.Statements = append(iamp.Statements[:j], iamp.Statements[j+1:]...)
+			goto redo
+		}
+	}
 }
 
 // UnmarshalJSON - decodes JSON data to Iamp.
@@ -134,28 +194,14 @@ func (iamp *Policy) UnmarshalJSON(data []byte) error {
 	}
 
 	p := Policy(sp)
-	if err := p.isValid(); err != nil {
-		return err
-	}
-
+	p.dropDuplicateStatements()
 	*iamp = p
-
 	return nil
 }
 
 // Validate - validates all statements are for given bucket or not.
 func (iamp Policy) Validate() error {
-	if err := iamp.isValid(); err != nil {
-		return err
-	}
-
-	for _, statement := range iamp.Statements {
-		if err := statement.Validate(); err != nil {
-			return err
-		}
-	}
-
-	return nil
+	return iamp.isValid()
 }
 
 // ParseConfig - parses data in given reader to Iamp.
@@ -165,7 +211,7 @@ func ParseConfig(reader io.Reader) (*Policy, error) {
 	decoder := json.NewDecoder(reader)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&iamp); err != nil {
-		return nil, err
+		return nil, Errorf("%w", err)
 	}
 
 	return &iamp, iamp.Validate()

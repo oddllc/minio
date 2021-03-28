@@ -17,8 +17,10 @@
 package notify
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -34,23 +36,32 @@ import (
 
 const (
 	formatNamespace = "namespace"
-	formatAccess    = "access"
 )
+
+// ErrTargetsOffline - Indicates single/multiple target failures.
+var ErrTargetsOffline = errors.New("one or more targets are offline. Please use `mc admin info --json` to check the offline targets")
 
 // TestNotificationTargets is similar to GetNotificationTargets()
 // avoids explicit registration.
-func TestNotificationTargets(cfg config.Config, doneCh <-chan struct{}, transport *http.Transport,
-	targetIDs []event.TargetID) error {
+func TestNotificationTargets(ctx context.Context, cfg config.Config, transport *http.Transport, targetIDs []event.TargetID) error {
 	test := true
-	_, err := RegisterNotificationTargets(cfg, doneCh, transport, targetIDs, test)
+	returnOnTargetError := true
+	targets, err := RegisterNotificationTargets(ctx, cfg, transport, targetIDs, test, returnOnTargetError)
+	if err == nil {
+		// Close all targets since we are only testing connections.
+		for _, t := range targets.TargetMap() {
+			_ = t.Close()
+		}
+	}
+
 	return err
 }
 
 // GetNotificationTargets registers and initializes all notification
 // targets, returns error if any.
-func GetNotificationTargets(cfg config.Config, doneCh <-chan struct{}, transport *http.Transport) (*event.TargetList, error) {
-	test := false
-	return RegisterNotificationTargets(cfg, doneCh, transport, nil, test)
+func GetNotificationTargets(ctx context.Context, cfg config.Config, transport *http.Transport, test bool) (*event.TargetList, error) {
+	returnOnTargetError := false
+	return RegisterNotificationTargets(ctx, cfg, transport, nil, test, returnOnTargetError)
 }
 
 // RegisterNotificationTargets - returns TargetList which contains enabled targets in serverConfig.
@@ -58,9 +69,46 @@ func GetNotificationTargets(cfg config.Config, doneCh <-chan struct{}, transport
 // * Add a new target in pkg/event/target package.
 // * Add newly added target configuration to serverConfig.Notify.<TARGET_NAME>.
 // * Handle the configuration in this function to create/add into TargetList.
-func RegisterNotificationTargets(cfg config.Config, doneCh <-chan struct{}, transport *http.Transport, targetIDs []event.TargetID, test bool) (*event.TargetList, error) {
+func RegisterNotificationTargets(ctx context.Context, cfg config.Config, transport *http.Transport, targetIDs []event.TargetID, test bool, returnOnTargetError bool) (*event.TargetList, error) {
+	targetList, err := FetchRegisteredTargets(ctx, cfg, transport, test, returnOnTargetError)
+	if err != nil {
+		return targetList, err
+	}
+
+	if test {
+		// Verify if user is trying to disable already configured
+		// notification targets, based on their target IDs
+		for _, targetID := range targetIDs {
+			if !targetList.Exists(targetID) {
+				return nil, config.Errorf(
+					"Unable to disable configured targets '%v'",
+					targetID)
+			}
+		}
+	}
+
+	return targetList, nil
+}
+
+// FetchRegisteredTargets - Returns a set of configured TargetList
+// If `returnOnTargetError` is set to true, The function returns when a target initialization fails
+// Else, the function will return a complete TargetList irrespective of errors
+func FetchRegisteredTargets(ctx context.Context, cfg config.Config, transport *http.Transport, test bool, returnOnTargetError bool) (_ *event.TargetList, err error) {
 	targetList := event.NewTargetList()
-	if err := checkValidNotificationKeys(cfg); err != nil {
+	var targetsOffline bool
+
+	defer func() {
+		// Automatically close all connections to targets when an error occur.
+		// Close all the targets if returnOnTargetError is set
+		// Else, close only the failed targets
+		if err != nil && returnOnTargetError {
+			for _, t := range targetList.TargetMap() {
+				_ = t.Close()
+			}
+		}
+	}()
+
+	if err = checkValidNotificationKeys(cfg); err != nil {
 		return nil, err
 	}
 
@@ -69,7 +117,7 @@ func RegisterNotificationTargets(cfg config.Config, doneCh <-chan struct{}, tran
 		return nil, err
 	}
 
-	esTargets, err := GetNotifyES(cfg[config.NotifyESSubSys])
+	esTargets, err := GetNotifyES(cfg[config.NotifyESSubSys], transport)
 	if err != nil {
 		return nil, err
 	}
@@ -118,15 +166,20 @@ func RegisterNotificationTargets(cfg config.Config, doneCh <-chan struct{}, tran
 		if !args.Enable {
 			continue
 		}
-		newTarget, err := target.NewAMQPTarget(id, args, doneCh, logger.LogOnceIf)
+		newTarget, err := target.NewAMQPTarget(id, args, ctx.Done(), logger.LogOnceIf, test)
 		if err != nil {
-			return nil, err
+			targetsOffline = true
+			if returnOnTargetError {
+				return nil, err
+			}
+			_ = newTarget.Close()
 		}
+
 		if err = targetList.Add(newTarget); err != nil {
-			return nil, err
-		}
-		if test {
-			newTarget.Close()
+			logger.LogIf(context.Background(), err)
+			if returnOnTargetError {
+				return nil, err
+			}
 		}
 	}
 
@@ -134,16 +187,19 @@ func RegisterNotificationTargets(cfg config.Config, doneCh <-chan struct{}, tran
 		if !args.Enable {
 			continue
 		}
-		newTarget, err := target.NewElasticsearchTarget(id, args, doneCh, logger.LogOnceIf)
+		newTarget, err := target.NewElasticsearchTarget(id, args, ctx.Done(), logger.LogOnceIf, test)
 		if err != nil {
-			return nil, err
-
+			targetsOffline = true
+			if returnOnTargetError {
+				return nil, err
+			}
+			_ = newTarget.Close()
 		}
 		if err = targetList.Add(newTarget); err != nil {
-			return nil, err
-		}
-		if test {
-			newTarget.Close()
+			logger.LogIf(context.Background(), err)
+			if returnOnTargetError {
+				return nil, err
+			}
 		}
 	}
 
@@ -152,15 +208,19 @@ func RegisterNotificationTargets(cfg config.Config, doneCh <-chan struct{}, tran
 			continue
 		}
 		args.TLS.RootCAs = transport.TLSClientConfig.RootCAs
-		newTarget, err := target.NewKafkaTarget(id, args, doneCh, logger.LogOnceIf)
+		newTarget, err := target.NewKafkaTarget(id, args, ctx.Done(), logger.LogOnceIf, test)
 		if err != nil {
-			return nil, err
+			targetsOffline = true
+			if returnOnTargetError {
+				return nil, err
+			}
+			_ = newTarget.Close()
 		}
 		if err = targetList.Add(newTarget); err != nil {
-			return nil, err
-		}
-		if test {
-			newTarget.Close()
+			logger.LogIf(context.Background(), err)
+			if returnOnTargetError {
+				return nil, err
+			}
 		}
 	}
 
@@ -169,15 +229,19 @@ func RegisterNotificationTargets(cfg config.Config, doneCh <-chan struct{}, tran
 			continue
 		}
 		args.RootCAs = transport.TLSClientConfig.RootCAs
-		newTarget, err := target.NewMQTTTarget(id, args, doneCh, logger.LogOnceIf)
+		newTarget, err := target.NewMQTTTarget(id, args, ctx.Done(), logger.LogOnceIf, test)
 		if err != nil {
-			return nil, err
+			targetsOffline = true
+			if returnOnTargetError {
+				return nil, err
+			}
+			_ = newTarget.Close()
 		}
 		if err = targetList.Add(newTarget); err != nil {
-			return nil, err
-		}
-		if test {
-			newTarget.Close()
+			logger.LogIf(context.Background(), err)
+			if returnOnTargetError {
+				return nil, err
+			}
 		}
 	}
 
@@ -185,15 +249,19 @@ func RegisterNotificationTargets(cfg config.Config, doneCh <-chan struct{}, tran
 		if !args.Enable {
 			continue
 		}
-		newTarget, err := target.NewMySQLTarget(id, args, doneCh, logger.LogOnceIf)
+		newTarget, err := target.NewMySQLTarget(id, args, ctx.Done(), logger.LogOnceIf, test)
 		if err != nil {
-			return nil, err
+			targetsOffline = true
+			if returnOnTargetError {
+				return nil, err
+			}
+			_ = newTarget.Close()
 		}
 		if err = targetList.Add(newTarget); err != nil {
-			return nil, err
-		}
-		if test {
-			newTarget.Close()
+			logger.LogIf(context.Background(), err)
+			if returnOnTargetError {
+				return nil, err
+			}
 		}
 	}
 
@@ -201,15 +269,19 @@ func RegisterNotificationTargets(cfg config.Config, doneCh <-chan struct{}, tran
 		if !args.Enable {
 			continue
 		}
-		newTarget, err := target.NewNATSTarget(id, args, doneCh, logger.LogOnceIf)
+		newTarget, err := target.NewNATSTarget(id, args, ctx.Done(), logger.LogOnceIf, test)
 		if err != nil {
-			return nil, err
+			targetsOffline = true
+			if returnOnTargetError {
+				return nil, err
+			}
+			_ = newTarget.Close()
 		}
 		if err = targetList.Add(newTarget); err != nil {
-			return nil, err
-		}
-		if test {
-			newTarget.Close()
+			logger.LogIf(context.Background(), err)
+			if returnOnTargetError {
+				return nil, err
+			}
 		}
 	}
 
@@ -217,15 +289,19 @@ func RegisterNotificationTargets(cfg config.Config, doneCh <-chan struct{}, tran
 		if !args.Enable {
 			continue
 		}
-		newTarget, err := target.NewNSQTarget(id, args, doneCh, logger.LogOnceIf)
+		newTarget, err := target.NewNSQTarget(id, args, ctx.Done(), logger.LogOnceIf, test)
 		if err != nil {
-			return nil, err
+			targetsOffline = true
+			if returnOnTargetError {
+				return nil, err
+			}
+			_ = newTarget.Close()
 		}
 		if err = targetList.Add(newTarget); err != nil {
-			return nil, err
-		}
-		if test {
-			newTarget.Close()
+			logger.LogIf(context.Background(), err)
+			if returnOnTargetError {
+				return nil, err
+			}
 		}
 	}
 
@@ -233,15 +309,19 @@ func RegisterNotificationTargets(cfg config.Config, doneCh <-chan struct{}, tran
 		if !args.Enable {
 			continue
 		}
-		newTarget, err := target.NewPostgreSQLTarget(id, args, doneCh, logger.LogOnceIf)
+		newTarget, err := target.NewPostgreSQLTarget(id, args, ctx.Done(), logger.LogOnceIf, test)
 		if err != nil {
-			return nil, err
+			targetsOffline = true
+			if returnOnTargetError {
+				return nil, err
+			}
+			_ = newTarget.Close()
 		}
 		if err = targetList.Add(newTarget); err != nil {
-			return nil, err
-		}
-		if test {
-			newTarget.Close()
+			logger.LogIf(context.Background(), err)
+			if returnOnTargetError {
+				return nil, err
+			}
 		}
 	}
 
@@ -249,15 +329,19 @@ func RegisterNotificationTargets(cfg config.Config, doneCh <-chan struct{}, tran
 		if !args.Enable {
 			continue
 		}
-		newTarget, err := target.NewRedisTarget(id, args, doneCh, logger.LogOnceIf)
+		newTarget, err := target.NewRedisTarget(id, args, ctx.Done(), logger.LogOnceIf, test)
 		if err != nil {
-			return nil, err
+			targetsOffline = true
+			if returnOnTargetError {
+				return nil, err
+			}
+			_ = newTarget.Close()
 		}
 		if err = targetList.Add(newTarget); err != nil {
-			return nil, err
-		}
-		if test {
-			newTarget.Close()
+			logger.LogIf(context.Background(), err)
+			if returnOnTargetError {
+				return nil, err
+			}
 		}
 	}
 
@@ -265,29 +349,24 @@ func RegisterNotificationTargets(cfg config.Config, doneCh <-chan struct{}, tran
 		if !args.Enable {
 			continue
 		}
-		newTarget, err := target.NewWebhookTarget(id, args, doneCh, logger.LogOnceIf, transport)
+		newTarget, err := target.NewWebhookTarget(ctx, id, args, logger.LogOnceIf, transport, test)
 		if err != nil {
-			return nil, err
+			targetsOffline = true
+			if returnOnTargetError {
+				return nil, err
+			}
+			_ = newTarget.Close()
 		}
-		if err := targetList.Add(newTarget); err != nil {
-			return nil, err
-		}
-		if test {
-			newTarget.Close()
-			continue
+		if err = targetList.Add(newTarget); err != nil {
+			logger.LogIf(context.Background(), err)
+			if returnOnTargetError {
+				return nil, err
+			}
 		}
 	}
 
-	if test {
-		// Verify if user is trying to disable already configured
-		// notification targets, based on their target IDs
-		for _, targetID := range targetIDs {
-			if !targetList.Exists(targetID) {
-				return nil, config.Errorf(
-					"Unable to disable configured targets '%v'",
-					targetID)
-			}
-		}
+	if targetsOffline {
+		return targetList, ErrTargetsOffline
 	}
 
 	return targetList, nil
@@ -320,8 +399,10 @@ func checkValidNotificationKeys(cfg config.Config) error {
 			if tname != config.Default {
 				subSysTarget = subSys + config.SubSystemSeparator + tname
 			}
-			if err := config.CheckValidKeys(subSysTarget, kv, validKVS); err != nil {
-				return err
+			if v, ok := kv.Lookup(config.Enable); ok && v == config.EnableOn {
+				if err := config.CheckValidKeys(subSysTarget, kv, validKVS); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -367,6 +448,10 @@ var (
 			Value: "",
 		},
 		config.KV{
+			Key:   target.KafkaSASLMechanism,
+			Value: "plain",
+		},
+		config.KV{
 			Key:   target.KafkaClientTLSCert,
 			Value: "",
 		},
@@ -396,6 +481,10 @@ var (
 		},
 		config.KV{
 			Key:   target.KafkaQueueDir,
+			Value: "",
+		},
+		config.KV{
+			Key:   target.KafkaVersion,
 			Value: "",
 		},
 	}
@@ -465,12 +554,18 @@ func GetNotifyKafka(kafkaKVS map[string]config.KVS) (map[string]target.KafkaArgs
 			queueDirEnv = queueDirEnv + config.Default + k
 		}
 
+		versionEnv := target.EnvKafkaVersion
+		if k != config.Default {
+			versionEnv = versionEnv + config.Default + k
+		}
+
 		kafkaArgs := target.KafkaArgs{
 			Enable:     enabled,
 			Brokers:    brokers,
 			Topic:      env.Get(topicEnv, kv.Get(target.KafkaTopic)),
 			QueueDir:   env.Get(queueDirEnv, kv.Get(target.KafkaQueueDir)),
 			QueueLimit: queueLimit,
+			Version:    env.Get(versionEnv, kv.Get(target.KafkaVersion)),
 		}
 
 		tlsEnableEnv := target.EnvKafkaTLS
@@ -511,9 +606,14 @@ func GetNotifyKafka(kafkaKVS map[string]config.KVS) (map[string]target.KafkaArgs
 		if k != config.Default {
 			saslPasswordEnv = saslPasswordEnv + config.Default + k
 		}
+		saslMechanismEnv := target.EnvKafkaSASLMechanism
+		if k != config.Default {
+			saslMechanismEnv = saslMechanismEnv + config.Default + k
+		}
 		kafkaArgs.SASL.Enable = env.Get(saslEnableEnv, kv.Get(target.KafkaSASL)) == config.EnableOn
 		kafkaArgs.SASL.User = env.Get(saslUsernameEnv, kv.Get(target.KafkaSASLUsername))
 		kafkaArgs.SASL.Password = env.Get(saslPasswordEnv, kv.Get(target.KafkaSASLPassword))
+		kafkaArgs.SASL.Mechanism = env.Get(saslMechanismEnv, kv.Get(target.KafkaSASLMechanism))
 
 		if err = kafkaArgs.Validate(); err != nil {
 			return nil, err
@@ -692,26 +792,6 @@ var (
 			Value: formatNamespace,
 		},
 		config.KV{
-			Key:   target.MySQLHost,
-			Value: "",
-		},
-		config.KV{
-			Key:   target.MySQLPort,
-			Value: "",
-		},
-		config.KV{
-			Key:   target.MySQLUsername,
-			Value: "",
-		},
-		config.KV{
-			Key:   target.MySQLPassword,
-			Value: "",
-		},
-		config.KV{
-			Key:   target.MySQLDatabase,
-			Value: "",
-		},
-		config.KV{
 			Key:   target.MySQLDSNString,
 			Value: "",
 		},
@@ -726,6 +806,10 @@ var (
 		config.KV{
 			Key:   target.MySQLQueueLimit,
 			Value: "0",
+		},
+		config.KV{
+			Key:   target.MySQLMaxOpenConnections,
+			Value: "2",
 		},
 	}
 )
@@ -747,16 +831,6 @@ func GetNotifyMySQL(mysqlKVS map[string]config.KVS) (map[string]target.MySQLArgs
 			continue
 		}
 
-		hostEnv := target.EnvMySQLHost
-		if k != config.Default {
-			hostEnv = hostEnv + config.Default + k
-		}
-
-		host, err := xnet.ParseURL(env.Get(hostEnv, kv.Get(target.MySQLHost)))
-		if err != nil {
-			return nil, err
-		}
-
 		queueLimitEnv := target.EnvMySQLQueueLimit
 		if k != config.Default {
 			queueLimitEnv = queueLimitEnv + config.Default + k
@@ -770,46 +844,40 @@ func GetNotifyMySQL(mysqlKVS map[string]config.KVS) (map[string]target.MySQLArgs
 		if k != config.Default {
 			formatEnv = formatEnv + config.Default + k
 		}
+
 		dsnStringEnv := target.EnvMySQLDSNString
 		if k != config.Default {
 			dsnStringEnv = dsnStringEnv + config.Default + k
 		}
+
 		tableEnv := target.EnvMySQLTable
 		if k != config.Default {
 			tableEnv = tableEnv + config.Default + k
 		}
-		portEnv := target.EnvMySQLPort
-		if k != config.Default {
-			portEnv = portEnv + config.Default + k
-		}
-		usernameEnv := target.EnvMySQLUsername
-		if k != config.Default {
-			usernameEnv = usernameEnv + config.Default + k
-		}
-		passwordEnv := target.EnvMySQLPassword
-		if k != config.Default {
-			passwordEnv = passwordEnv + config.Default + k
-		}
-		databaseEnv := target.EnvMySQLDatabase
-		if k != config.Default {
-			databaseEnv = databaseEnv + config.Default + k
-		}
+
 		queueDirEnv := target.EnvMySQLQueueDir
 		if k != config.Default {
 			queueDirEnv = queueDirEnv + config.Default + k
 		}
+
+		maxOpenConnectionsEnv := target.EnvMySQLMaxOpenConnections
+		if k != config.Default {
+			maxOpenConnectionsEnv = maxOpenConnectionsEnv + config.Default + k
+		}
+
+		maxOpenConnections, cErr := strconv.Atoi(env.Get(maxOpenConnectionsEnv, kv.Get(target.MySQLMaxOpenConnections)))
+		if cErr != nil {
+			return nil, cErr
+		}
+
 		mysqlArgs := target.MySQLArgs{
-			Enable:     enabled,
-			Format:     env.Get(formatEnv, kv.Get(target.MySQLFormat)),
-			DSN:        env.Get(dsnStringEnv, kv.Get(target.MySQLDSNString)),
-			Table:      env.Get(tableEnv, kv.Get(target.MySQLTable)),
-			Host:       *host,
-			Port:       env.Get(portEnv, kv.Get(target.MySQLPort)),
-			User:       env.Get(usernameEnv, kv.Get(target.MySQLUsername)),
-			Password:   env.Get(passwordEnv, kv.Get(target.MySQLPassword)),
-			Database:   env.Get(databaseEnv, kv.Get(target.MySQLDatabase)),
-			QueueDir:   env.Get(queueDirEnv, kv.Get(target.MySQLQueueDir)),
-			QueueLimit: queueLimit,
+			Enable:             enabled,
+			Format:             env.Get(formatEnv, kv.Get(target.MySQLFormat)),
+			DSN:                env.Get(dsnStringEnv, kv.Get(target.MySQLDSNString)),
+			Table:              env.Get(tableEnv, kv.Get(target.MySQLTable)),
+			QueueDir:           env.Get(queueDirEnv, kv.Get(target.MySQLQueueDir)),
+			QueueLimit:         queueLimit,
+			MaxOpenConnections: maxOpenConnections,
 		}
 		if err = mysqlArgs.Validate(); err != nil {
 			return nil, err
@@ -1176,32 +1244,16 @@ var (
 			Value: "",
 		},
 		config.KV{
-			Key:   target.PostgresHost,
-			Value: "",
-		},
-		config.KV{
-			Key:   target.PostgresPort,
-			Value: "",
-		},
-		config.KV{
-			Key:   target.PostgresUsername,
-			Value: "",
-		},
-		config.KV{
-			Key:   target.PostgresPassword,
-			Value: "",
-		},
-		config.KV{
-			Key:   target.PostgresDatabase,
-			Value: "",
-		},
-		config.KV{
 			Key:   target.PostgresQueueDir,
 			Value: "",
 		},
 		config.KV{
 			Key:   target.PostgresQueueLimit,
 			Value: "0",
+		},
+		config.KV{
+			Key:   target.PostgresMaxOpenConnections,
+			Value: "2",
 		},
 	}
 )
@@ -1221,16 +1273,6 @@ func GetNotifyPostgres(postgresKVS map[string]config.KVS) (map[string]target.Pos
 		}
 		if !enabled {
 			continue
-		}
-
-		hostEnv := target.EnvPostgresHost
-		if k != config.Default {
-			hostEnv = hostEnv + config.Default + k
-		}
-
-		host, err := xnet.ParseHost(env.Get(hostEnv, kv.Get(target.PostgresHost)))
-		if err != nil {
-			return nil, err
 		}
 
 		queueLimitEnv := target.EnvPostgresQueueLimit
@@ -1258,43 +1300,29 @@ func GetNotifyPostgres(postgresKVS map[string]config.KVS) (map[string]target.Pos
 			tableEnv = tableEnv + config.Default + k
 		}
 
-		portEnv := target.EnvPostgresPort
-		if k != config.Default {
-			portEnv = portEnv + config.Default + k
-		}
-
-		usernameEnv := target.EnvPostgresUsername
-		if k != config.Default {
-			usernameEnv = usernameEnv + config.Default + k
-		}
-
-		passwordEnv := target.EnvPostgresPassword
-		if k != config.Default {
-			passwordEnv = passwordEnv + config.Default + k
-		}
-
-		databaseEnv := target.EnvPostgresDatabase
-		if k != config.Default {
-			databaseEnv = databaseEnv + config.Default + k
-		}
-
 		queueDirEnv := target.EnvPostgresQueueDir
 		if k != config.Default {
 			queueDirEnv = queueDirEnv + config.Default + k
 		}
 
+		maxOpenConnectionsEnv := target.EnvPostgresMaxOpenConnections
+		if k != config.Default {
+			maxOpenConnectionsEnv = maxOpenConnectionsEnv + config.Default + k
+		}
+
+		maxOpenConnections, cErr := strconv.Atoi(env.Get(maxOpenConnectionsEnv, kv.Get(target.PostgresMaxOpenConnections)))
+		if cErr != nil {
+			return nil, cErr
+		}
+
 		psqlArgs := target.PostgreSQLArgs{
-			Enable:           enabled,
-			Format:           env.Get(formatEnv, kv.Get(target.PostgresFormat)),
-			ConnectionString: env.Get(connectionStringEnv, kv.Get(target.PostgresConnectionString)),
-			Table:            env.Get(tableEnv, kv.Get(target.PostgresTable)),
-			Host:             *host,
-			Port:             env.Get(portEnv, kv.Get(target.PostgresPort)),
-			User:             env.Get(usernameEnv, kv.Get(target.PostgresUsername)),
-			Password:         env.Get(passwordEnv, kv.Get(target.PostgresPassword)),
-			Database:         env.Get(databaseEnv, kv.Get(target.PostgresDatabase)),
-			QueueDir:         env.Get(queueDirEnv, kv.Get(target.PostgresQueueDir)),
-			QueueLimit:       uint64(queueLimit),
+			Enable:             enabled,
+			Format:             env.Get(formatEnv, kv.Get(target.PostgresFormat)),
+			ConnectionString:   env.Get(connectionStringEnv, kv.Get(target.PostgresConnectionString)),
+			Table:              env.Get(tableEnv, kv.Get(target.PostgresTable)),
+			QueueDir:           env.Get(queueDirEnv, kv.Get(target.PostgresQueueDir)),
+			QueueLimit:         uint64(queueLimit),
+			MaxOpenConnections: maxOpenConnections,
 		}
 		if err = psqlArgs.Validate(); err != nil {
 			return nil, err
@@ -1428,6 +1456,14 @@ var (
 			Key:   target.WebhookQueueDir,
 			Value: "",
 		},
+		config.KV{
+			Key:   target.WebhookClientCert,
+			Value: "",
+		},
+		config.KV{
+			Key:   target.WebhookClientKey,
+			Value: "",
+		},
 	}
 )
 
@@ -1471,6 +1507,15 @@ func GetNotifyWebhook(webhookKVS map[string]config.KVS, transport *http.Transpor
 		if k != config.Default {
 			authEnv = authEnv + config.Default + k
 		}
+		clientCertEnv := target.EnvWebhookClientCert
+		if k != config.Default {
+			clientCertEnv = clientCertEnv + config.Default + k
+		}
+
+		clientKeyEnv := target.EnvWebhookClientKey
+		if k != config.Default {
+			clientKeyEnv = clientKeyEnv + config.Default + k
+		}
 
 		webhookArgs := target.WebhookArgs{
 			Enable:     enabled,
@@ -1479,6 +1524,8 @@ func GetNotifyWebhook(webhookKVS map[string]config.KVS, transport *http.Transpor
 			AuthToken:  env.Get(authEnv, kv.Get(target.WebhookAuthToken)),
 			QueueDir:   env.Get(queueDirEnv, kv.Get(target.WebhookQueueDir)),
 			QueueLimit: uint64(queueLimit),
+			ClientCert: env.Get(clientCertEnv, kv.Get(target.WebhookClientCert)),
+			ClientKey:  env.Get(clientKeyEnv, kv.Get(target.WebhookClientKey)),
 		}
 		if err = webhookArgs.Validate(); err != nil {
 			return nil, err
@@ -1515,11 +1562,19 @@ var (
 			Key:   target.ElasticQueueLimit,
 			Value: "0",
 		},
+		config.KV{
+			Key:   target.ElasticUsername,
+			Value: "",
+		},
+		config.KV{
+			Key:   target.ElasticPassword,
+			Value: "",
+		},
 	}
 )
 
 // GetNotifyES - returns a map of registered notification 'elasticsearch' targets
-func GetNotifyES(esKVS map[string]config.KVS) (map[string]target.ElasticsearchArgs, error) {
+func GetNotifyES(esKVS map[string]config.KVS, transport *http.Transport) (map[string]target.ElasticsearchArgs, error) {
 	esTargets := make(map[string]target.ElasticsearchArgs)
 	for k, kv := range mergeTargets(esKVS, target.EnvElasticEnable, DefaultESKVS) {
 		enableEnv := target.EnvElasticEnable
@@ -1569,6 +1624,16 @@ func GetNotifyES(esKVS map[string]config.KVS) (map[string]target.ElasticsearchAr
 			queueDirEnv = queueDirEnv + config.Default + k
 		}
 
+		usernameEnv := target.EnvElasticUsername
+		if k != config.Default {
+			usernameEnv = usernameEnv + config.Default + k
+		}
+
+		passwordEnv := target.EnvElasticPassword
+		if k != config.Default {
+			passwordEnv = passwordEnv + config.Default + k
+		}
+
 		esArgs := target.ElasticsearchArgs{
 			Enable:     enabled,
 			Format:     env.Get(formatEnv, kv.Get(target.ElasticFormat)),
@@ -1576,6 +1641,9 @@ func GetNotifyES(esKVS map[string]config.KVS) (map[string]target.ElasticsearchAr
 			Index:      env.Get(indexEnv, kv.Get(target.ElasticIndex)),
 			QueueDir:   env.Get(queueDirEnv, kv.Get(target.ElasticQueueDir)),
 			QueueLimit: uint64(queueLimit),
+			Transport:  transport,
+			Username:   env.Get(usernameEnv, kv.Get(target.ElasticUsername)),
+			Password:   env.Get(passwordEnv, kv.Get(target.ElasticPassword)),
 		}
 		if err = esArgs.Validate(); err != nil {
 			return nil, err

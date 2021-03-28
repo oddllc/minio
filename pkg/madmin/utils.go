@@ -25,23 +25,15 @@ import (
 	"net/url"
 	"strings"
 
-	sha256 "github.com/minio/sha256-simd"
-
-	"github.com/minio/minio-go/v6/pkg/s3utils"
+	"github.com/minio/minio-go/v7/pkg/s3utils"
 )
 
+// AdminAPIVersion - admin api version used in the request.
 const (
-	// AdminAPIVersion - admin api version used in the request.
-	AdminAPIVersion = "v2"
-	adminAPIPrefix  = "/" + AdminAPIVersion
+	AdminAPIVersion   = "v3"
+	AdminAPIVersionV2 = "v2"
+	adminAPIPrefix    = "/" + AdminAPIVersion
 )
-
-// sum256 calculate sha256 sum for an input byte array.
-func sum256(data []byte) []byte {
-	hash := sha256.New()
-	hash.Write(data)
-	return hash.Sum(nil)
-}
 
 // jsonDecoder decode json to go type.
 func jsonDecoder(body io.Reader, v interface{}) error {
@@ -66,10 +58,20 @@ func getEndpointURL(endpoint string, secure bool) (*url.URL, error) {
 			return nil, ErrInvalidArgument(msg)
 		}
 	}
+
 	// If secure is false, use 'http' scheme.
 	scheme := "https"
 	if !secure {
 		scheme = "http"
+	}
+
+	// Strip the obvious :443 and :80 from the endpoint
+	// to avoid the signature mismatch error.
+	if secure && strings.HasSuffix(endpoint, ":443") {
+		endpoint = strings.TrimSuffix(endpoint, ":443")
+	}
+	if !secure && strings.HasSuffix(endpoint, ":80") {
+		endpoint = strings.TrimSuffix(endpoint, ":80")
 	}
 
 	// Construct a secured endpoint URL.

@@ -11,27 +11,54 @@ minio gateway <name> -h
   CACHE:
      MINIO_CACHE_DRIVES: List of mounted cache drives or directories delimited by ","
      MINIO_CACHE_EXCLUDE: List of cache exclusion patterns delimited by ","
-     MINIO_CACHE_EXPIRY: Cache expiry duration in days
      MINIO_CACHE_QUOTA: Maximum permitted usage of the cache in percentage (0-100).
+     MINIO_CACHE_AFTER: Minimum number of access before caching an object.
+     MINIO_CACHE_WATERMARK_LOW: % of cache quota at which cache eviction stops
+     MINIO_CACHE_WATERMARK_HIGH: % of cache quota at which cache eviction starts
+     MINIO_CACHE_RANGE: set to "on" or "off" caching of independent range requests per object, defaults to "on"
+
+
 ...
 ...
 
-  7. Start MinIO gateway to s3 with edge caching enabled on '/mnt/drive1', '/mnt/drive2' and '/mnt/export1 ... /mnt/export24',
-     exclude all objects under 'mybucket', exclude all objects with '.pdf' as extension
-     with expiry up to 40 days.
+  Start MinIO gateway to s3 with edge caching enabled on '/mnt/drive1', '/mnt/drive2' and '/mnt/export1 ... /mnt/export24',
+     exclude all objects under 'mybucket', exclude all objects with '.pdf' as extension. Cache only those objects accessed atleast 3 times. Garbage collection triggers in at high water mark (i.e. cache disk usage reaches 90% of cache quota) or at 72% and evicts oldest objects by access time until low watermark is reached ( 70% of cache quota) , i.e. 63% of disk usage.
      $ export MINIO_CACHE_DRIVES="/mnt/drive1,/mnt/drive2,/mnt/export{1..24}"
      $ export MINIO_CACHE_EXCLUDE="mybucket/*,*.pdf"
-     $ export MINIO_CACHE_EXPIRY=40
      $ export MINIO_CACHE_QUOTA=80
+     $ export MINIO_CACHE_AFTER=3
+     $ export MINIO_CACHE_WATERMARK_LOW=70
+     $ export MINIO_CACHE_WATERMARK_HIGH=90
+
      $ minio gateway s3
+```
+
+### Run MinIO gateway with cache on Docker Container
+### Stable
+Cache drives need to have `strictatime` or `relatime` enabled for disk caching feature. In this example, mount the xfs file system on /mnt/cache with `strictatime` or `relatime` enabled.
+
+```sh
+truncate -s 4G /tmp/data
+
+mkfs.xfs /tmp/data     # build xfs filesystem on /tmp/data
+
+sudo mkdir /mnt/cache  # create mount dir
+
+sudo mount -o relatime /tmp/data /mnt/cache # mount xfs on /mnt/cache with atime.
+
+docker pull minio/minio
+
+docker run --net=host -e MINIO_ROOT_USER={s3-access-key} -e MINIO_ROOT_PASSWORD={s3-secret-key} \
+    -e MINIO_CACHE_DRIVES=/cache -e MINIO_CACHE_QUOTA=99 -e MINIO_CACHE_AFTER=0 \
+    -e MINIO_CACHE_WATERMARK_LOW=90 -e MINIO_CACHE_WATERMARK_HIGH=95 \
+    -v /mnt/cache:/cache  minio/minio:latest gateway s3
 ```
 
 ## Assumptions
 
-- Disk cache size defaults to 80% of your drive capacity.
+- Disk cache quota defaults to 80% of your drive capacity.
 - The cache drives are required to be a filesystem mount point with [`atime`](http://kerolasa.github.io/filetimes.html) support to be enabled on the drive. Alternatively writable directories with atime support can be specified in MINIO_CACHE_DRIVES
-- Expiration of each cached entry takes user provided expiry as a hint, and defaults to 90 days if not provided.
-- Garbage collection sweep of the expired cache entries happens whenever cache usage is > 80% of drive capacity, GC continues until sufficient disk space is reclaimed.
+- Garbage collection sweep happens whenever cache disk usage reaches high watermark with respect to the configured cache quota , GC evicts least recently accessed objects until cache low watermark is reached with respect to the configured cache quota. Garbage collection runs a cache eviction sweep at 30 minute intervals.
 - An object is only cached when drive has sufficient disk space.
 
 ## Behavior
@@ -43,6 +70,7 @@ Disk caching caches objects for **downloaded** objects i.e
 - When an object is deleted, corresponding entry in cache if any is deleted as well.
 - Cache continues to work for read-only operations such as GET, HEAD when backend is offline.
 - Cache-Control and Expires headers can be used to control how long objects stay in the cache. ETag of cached objects are not validated with backend until expiry time as per the Cache-Control or Expires header is met.
+- All range GET requests are cached by default independently, this may be not desirable in all situations when cache storage is limited and where downloading an entire object at once might be more optimal. To optionally turn this feature off, and allow downloading entire object in the background `export MINIO_CACHE_RANGE=off`.
 - To ensure security guarantees, encrypted objects are normally not cached. However, if you wish to encrypt cached content on disk, you can set MINIO_CACHE_ENCRYPTION_MASTER_KEY environment variable to set a cache KMS
 master key to automatically encrypt all cached content.
 

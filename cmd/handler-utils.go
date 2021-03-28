@@ -1,5 +1,5 @@
 /*
- * MinIO Cloud Storage, (C) 2015, 2016, 2017 MinIO, Inc.
+ * MinIO Cloud Storage, (C) 2015-2020 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,12 +19,14 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"mime/multipart"
 	"net"
 	"net/http"
+	"net/textproto"
 	"net/url"
 	"regexp"
 	"strings"
@@ -36,6 +38,11 @@ import (
 	"github.com/minio/minio/pkg/madmin"
 )
 
+const (
+	copyDirective    = "COPY"
+	replaceDirective = "REPLACE"
+)
+
 // Parses location constraint from the incoming reader.
 func parseLocationConstraint(r *http.Request) (location string, s3Error APIErrorCode) {
 	// If the request has no body with content-length set to 0,
@@ -44,7 +51,7 @@ func parseLocationConstraint(r *http.Request) (location string, s3Error APIError
 	locationConstraint := createBucketLocationConfiguration{}
 	err := xmlDecoder(r.Body, &locationConstraint, r.ContentLength)
 	if err != nil && r.ContentLength != 0 {
-		logger.LogIf(context.Background(), err)
+		logger.LogIf(GlobalContext, err)
 		// Treat all other failures as XML parsing errors.
 		return "", ErrMalformedXML
 	} // else for both err as nil or io.EOF
@@ -68,56 +75,38 @@ var supportedHeaders = []string{
 	"content-language",
 	"content-encoding",
 	"content-disposition",
+	"x-amz-storage-class",
 	xhttp.AmzStorageClass,
+	xhttp.AmzObjectTagging,
 	"expires",
+	xhttp.AmzBucketReplicationStatus,
 	// Add more supported headers here.
 }
 
-// isMetadataDirectiveValid - check if metadata-directive is valid.
-func isMetadataDirectiveValid(h http.Header) bool {
-	_, ok := h[http.CanonicalHeaderKey(xhttp.AmzMetadataDirective)]
-	if ok {
-		// Check atleast set metadata-directive is valid.
-		return (isMetadataCopy(h) || isMetadataReplace(h))
-	}
-	// By default if x-amz-metadata-directive is not we
+// isDirectiveValid - check if tagging-directive is valid.
+func isDirectiveValid(v string) bool {
+	// Check if set metadata-directive is valid.
+	return isDirectiveCopy(v) || isDirectiveReplace(v)
+}
+
+// Check if the directive COPY is requested.
+func isDirectiveCopy(value string) bool {
+	// By default if directive is not set we
 	// treat it as 'COPY' this function returns true.
-	return true
+	return value == copyDirective || value == ""
 }
 
-// Check if the metadata COPY is requested.
-func isMetadataCopy(h http.Header) bool {
-	return h.Get(xhttp.AmzMetadataDirective) == "COPY"
-}
-
-// Check if the metadata REPLACE is requested.
-func isMetadataReplace(h http.Header) bool {
-	return h.Get(xhttp.AmzMetadataDirective) == "REPLACE"
-}
-
-// Splits an incoming path into bucket and object components.
-func path2BucketAndObject(path string) (bucket, object string) {
-	// Skip the first element if it is '/', split the rest.
-	path = strings.TrimPrefix(path, SlashSeparator)
-	pathComponents := strings.SplitN(path, SlashSeparator, 2)
-
-	// Save the bucket and object extracted from path.
-	switch len(pathComponents) {
-	case 1:
-		bucket = pathComponents[0]
-	case 2:
-		bucket = pathComponents[0]
-		object = pathComponents[1]
-	}
-	return bucket, object
+// Check if the directive REPLACE is requested.
+func isDirectiveReplace(value string) bool {
+	return value == replaceDirective
 }
 
 // userMetadataKeyPrefixes contains the prefixes of used-defined metadata keys.
 // All values stored with a key starting with one of the following prefixes
 // must be extracted from the header.
 var userMetadataKeyPrefixes = []string{
-	"X-Amz-Meta-",
-	"X-Minio-Meta-",
+	"x-amz-meta-",
+	"x-minio-meta-",
 }
 
 // extractMetadata extracts metadata from HTTP header and HTTP queryString.
@@ -126,45 +115,78 @@ func extractMetadata(ctx context.Context, r *http.Request) (metadata map[string]
 	header := r.Header
 	metadata = make(map[string]string)
 	// Extract all query values.
-	err = extractMetadataFromMap(ctx, query, metadata)
+	err = extractMetadataFromMime(ctx, textproto.MIMEHeader(query), metadata)
 	if err != nil {
 		return nil, err
 	}
 
 	// Extract all header values.
-	err = extractMetadataFromMap(ctx, header, metadata)
+	err = extractMetadataFromMime(ctx, textproto.MIMEHeader(header), metadata)
 	if err != nil {
 		return nil, err
 	}
 
 	// Set content-type to default value if it is not set.
-	if _, ok := metadata["content-type"]; !ok {
-		metadata["content-type"] = "application/octet-stream"
+	if _, ok := metadata[strings.ToLower(xhttp.ContentType)]; !ok {
+		metadata[strings.ToLower(xhttp.ContentType)] = "binary/octet-stream"
 	}
+
+	// https://github.com/google/security-research/security/advisories/GHSA-76wf-9vgp-pj7w
+	for k := range metadata {
+		if equals(k, xhttp.AmzMetaUnencryptedContentLength, xhttp.AmzMetaUnencryptedContentMD5) {
+			delete(metadata, k)
+		}
+	}
+
+	if contentEncoding, ok := metadata[strings.ToLower(xhttp.ContentEncoding)]; ok {
+		contentEncoding = trimAwsChunkedContentEncoding(contentEncoding)
+		if contentEncoding != "" {
+			// Make sure to trim and save the content-encoding
+			// parameter for a streaming signature which is set
+			// to a custom value for example: "aws-chunked,gzip".
+			metadata[strings.ToLower(xhttp.ContentEncoding)] = contentEncoding
+		} else {
+			// Trimmed content encoding is empty when the header
+			// value is set to "aws-chunked" only.
+
+			// Make sure to delete the content-encoding parameter
+			// for a streaming signature which is set to value
+			// for example: "aws-chunked"
+			delete(metadata, strings.ToLower(xhttp.ContentEncoding))
+		}
+	}
+
 	// Success.
 	return metadata, nil
 }
 
 // extractMetadata extracts metadata from map values.
-func extractMetadataFromMap(ctx context.Context, v map[string][]string, m map[string]string) error {
+func extractMetadataFromMime(ctx context.Context, v textproto.MIMEHeader, m map[string]string) error {
 	if v == nil {
 		logger.LogIf(ctx, errInvalidArgument)
 		return errInvalidArgument
 	}
+
+	nv := make(textproto.MIMEHeader, len(v))
+	for k, kv := range v {
+		// Canonicalize all headers, to remove any duplicates.
+		nv[http.CanonicalHeaderKey(k)] = kv
+	}
+
 	// Save all supported headers.
 	for _, supportedHeader := range supportedHeaders {
-		if value, ok := v[http.CanonicalHeaderKey(supportedHeader)]; ok {
-			m[supportedHeader] = value[0]
-		} else if value, ok := v[supportedHeader]; ok {
-			m[supportedHeader] = value[0]
+		value, ok := nv[http.CanonicalHeaderKey(supportedHeader)]
+		if ok {
+			m[supportedHeader] = strings.Join(value, ",")
 		}
 	}
+
 	for key := range v {
 		for _, prefix := range userMetadataKeyPrefixes {
 			if !strings.HasPrefix(strings.ToLower(key), strings.ToLower(prefix)) {
 				continue
 			}
-			value, ok := v[key]
+			value, ok := nv[http.CanonicalHeaderKey(key)]
 			if ok {
 				m[key] = strings.Join(value, ",")
 				break
@@ -195,7 +217,9 @@ func getReqAccessCred(r *http.Request, region string) (cred auth.Credentials) {
 		if owner {
 			return globalActiveCred
 		}
-		cred, _ = globalIAMSys.GetUser(claims.AccessKey())
+		if claims != nil {
+			cred, _ = globalIAMSys.GetUser(claims.AccessKey)
+		}
 	}
 	return cred
 }
@@ -210,17 +234,23 @@ func extractReqParams(r *http.Request) map[string]string {
 	cred := getReqAccessCred(r, region)
 
 	// Success.
-	return map[string]string{
+	m := map[string]string{
 		"region":          region,
 		"accessKey":       cred.AccessKey,
 		"sourceIPAddress": handlers.GetSourceIP(r),
 		// Add more fields here.
 	}
+	if _, ok := r.Header[xhttp.MinIOSourceReplicationRequest]; ok {
+		m[xhttp.MinIOSourceReplicationRequest] = ""
+	}
+	return m
 }
 
 // Extract response elements to be sent with event notifiation.
 func extractRespElements(w http.ResponseWriter) map[string]string {
-
+	if w == nil {
+		return map[string]string{}
+	}
 	return map[string]string{
 		"requestId":      w.Header().Get(xhttp.AmzRequestID),
 		"content-length": w.Header().Get(xhttp.ContentLength),
@@ -329,57 +359,37 @@ func extractPostPolicyFormValues(ctx context.Context, form *multipart.Form) (fil
 // Log headers and body.
 func httpTraceAll(f http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !globalHTTPTrace.HasSubscribers() {
+		if globalTrace.NumSubscribers() == 0 {
 			f.ServeHTTP(w, r)
 			return
 		}
 		trace := Trace(f, true, w, r)
-		globalHTTPTrace.Publish(trace)
+		globalTrace.Publish(trace)
 	}
 }
 
 // Log only the headers.
 func httpTraceHdrs(f http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !globalHTTPTrace.HasSubscribers() {
+		if globalTrace.NumSubscribers() == 0 {
 			f.ServeHTTP(w, r)
 			return
 		}
 		trace := Trace(f, false, w, r)
-		globalHTTPTrace.Publish(trace)
+		globalTrace.Publish(trace)
 	}
 }
 
 func collectAPIStats(api string, f http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		globalHTTPStats.currentS3Requests.Inc(api)
+		defer globalHTTPStats.currentS3Requests.Dec(api)
 
-		isS3Request := !strings.HasPrefix(r.URL.Path, minioReservedBucketPath)
-		apiStatsWriter := &recordAPIStats{w, UTCNow(), false, 0, isS3Request}
+		statsWriter := logger.NewResponseWriter(w)
 
-		// Time start before the call is about to start.
-		tBefore := UTCNow()
+		f.ServeHTTP(statsWriter, r)
 
-		if isS3Request {
-			globalHTTPStats.currentS3Requests.Inc(api)
-		}
-		// Execute the request
-		f.ServeHTTP(apiStatsWriter, r)
-
-		if isS3Request {
-			globalHTTPStats.currentS3Requests.Dec(api)
-		}
-
-		// Firstbyte read.
-		tAfter := apiStatsWriter.TTFB
-
-		// Time duration in secs since the call started.
-		//
-		// We don't need to do nanosecond precision in this
-		// simply for the fact that it is not human readable.
-		durationSecs := tAfter.Sub(tBefore).Seconds()
-
-		// Update http statistics
-		globalHTTPStats.updateStats(api, r, apiStatsWriter, durationSecs)
+		globalHTTPStats.updateStats(api, r, statsWriter)
 	}
 }
 
@@ -395,12 +405,15 @@ func getResource(path string, host string, domains []string) (string, error) {
 		if host, _, err = net.SplitHostPort(host); err != nil {
 			reqInfo := (&logger.ReqInfo{}).AppendTags("host", host)
 			reqInfo.AppendTags("path", path)
-			ctx := logger.SetReqInfo(context.Background(), reqInfo)
+			ctx := logger.SetReqInfo(GlobalContext, reqInfo)
 			logger.LogIf(ctx, err)
 			return "", err
 		}
 	}
 	for _, domain := range domains {
+		if host == minioReservedBucket+"."+domain {
+			continue
+		}
 		if !strings.HasSuffix(host, "."+domain) {
 			continue
 		}
@@ -410,39 +423,95 @@ func getResource(path string, host string, domains []string) (string, error) {
 	return path, nil
 }
 
-var regexVersion = regexp.MustCompile(`(\w\d+)`)
+var regexVersion = regexp.MustCompile(`^/minio.*/(v\d+)/.*`)
 
 func extractAPIVersion(r *http.Request) string {
-	return regexVersion.FindString(r.URL.Path)
+	if matches := regexVersion.FindStringSubmatch(r.URL.Path); len(matches) > 1 {
+		return matches[1]
+	}
+	return "unknown"
+}
+
+func methodNotAllowedHandler(api string) func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodOptions {
+			return
+		}
+		version := extractAPIVersion(r)
+		switch {
+		case strings.HasPrefix(r.URL.Path, peerRESTPrefix):
+			desc := fmt.Sprintf("Server expects 'peer' API version '%s', instead found '%s' - *rolling upgrade is not allowed* - please make sure all servers are running the same MinIO version (%s)", peerRESTVersion, version, ReleaseTag)
+			writeErrorResponseString(r.Context(), w, APIError{
+				Code:           "XMinioPeerVersionMismatch",
+				Description:    desc,
+				HTTPStatusCode: http.StatusUpgradeRequired,
+			}, r.URL)
+		case strings.HasPrefix(r.URL.Path, storageRESTPrefix):
+			desc := fmt.Sprintf("Server expects 'storage' API version '%s', instead found '%s' - *rolling upgrade is not allowed* - please make sure all servers are running the same MinIO version (%s)", storageRESTVersion, version, ReleaseTag)
+			writeErrorResponseString(r.Context(), w, APIError{
+				Code:           "XMinioStorageVersionMismatch",
+				Description:    desc,
+				HTTPStatusCode: http.StatusUpgradeRequired,
+			}, r.URL)
+		case strings.HasPrefix(r.URL.Path, lockRESTPrefix):
+			desc := fmt.Sprintf("Server expects 'lock' API version '%s', instead found '%s' - *rolling upgrade is not allowed* - please make sure all servers are running the same MinIO version (%s)", lockRESTVersion, version, ReleaseTag)
+			writeErrorResponseString(r.Context(), w, APIError{
+				Code:           "XMinioLockVersionMismatch",
+				Description:    desc,
+				HTTPStatusCode: http.StatusUpgradeRequired,
+			}, r.URL)
+		case strings.HasPrefix(r.URL.Path, adminPathPrefix):
+			var desc string
+			if version == "v1" {
+				desc = fmt.Sprintf("Server expects client requests with 'admin' API version '%s', found '%s', please upgrade the client to latest releases", madmin.AdminAPIVersion, version)
+			} else if version == madmin.AdminAPIVersion {
+				desc = fmt.Sprintf("This 'admin' API is not supported by server in '%s'", getMinioMode())
+			} else {
+				desc = fmt.Sprintf("Unexpected client 'admin' API version found '%s', expected '%s', please downgrade the client to older releases", version, madmin.AdminAPIVersion)
+			}
+			writeErrorResponseJSON(r.Context(), w, APIError{
+				Code:           "XMinioAdminVersionMismatch",
+				Description:    desc,
+				HTTPStatusCode: http.StatusUpgradeRequired,
+			}, r.URL)
+		default:
+			writeErrorResponse(r.Context(), w, APIError{
+				Code: "BadRequest",
+				Description: fmt.Sprintf("An error occurred when parsing the HTTP request %s at '%s'",
+					r.Method, r.URL.Path),
+				HTTPStatusCode: http.StatusBadRequest,
+			}, r.URL, guessIsBrowserReq(r))
+		}
+	}
 }
 
 // If none of the http routes match respond with appropriate errors
 func errorResponseHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		return
+	}
 	version := extractAPIVersion(r)
 	switch {
 	case strings.HasPrefix(r.URL.Path, peerRESTPrefix):
-		desc := fmt.Sprintf("Expected 'peer' API version '%s', instead found '%s', please upgrade the servers",
-			peerRESTVersion, version)
+		desc := fmt.Sprintf("Server expects 'peer' API version '%s', instead found '%s' - *rolling upgrade is not allowed* - please make sure all servers are running the same MinIO version (%s)", peerRESTVersion, version, ReleaseTag)
 		writeErrorResponseString(r.Context(), w, APIError{
 			Code:           "XMinioPeerVersionMismatch",
 			Description:    desc,
-			HTTPStatusCode: http.StatusBadRequest,
+			HTTPStatusCode: http.StatusUpgradeRequired,
 		}, r.URL)
 	case strings.HasPrefix(r.URL.Path, storageRESTPrefix):
-		desc := fmt.Sprintf("Expected 'storage' API version '%s', instead found '%s', please upgrade the servers",
-			storageRESTVersion, version)
+		desc := fmt.Sprintf("Server expects 'storage' API version '%s', instead found '%s' - *rolling upgrade is not allowed* - please make sure all servers are running the same MinIO version (%s)", storageRESTVersion, version, ReleaseTag)
 		writeErrorResponseString(r.Context(), w, APIError{
 			Code:           "XMinioStorageVersionMismatch",
 			Description:    desc,
-			HTTPStatusCode: http.StatusBadRequest,
+			HTTPStatusCode: http.StatusUpgradeRequired,
 		}, r.URL)
 	case strings.HasPrefix(r.URL.Path, lockRESTPrefix):
-		desc := fmt.Sprintf("Expected 'lock' API version '%s', instead found '%s', please upgrade the servers",
-			lockRESTVersion, version)
+		desc := fmt.Sprintf("Server expects 'lock' API version '%s', instead found '%s' - *rolling upgrade is not allowed* - please make sure all servers are running the same MinIO version (%s)", lockRESTVersion, version, ReleaseTag)
 		writeErrorResponseString(r.Context(), w, APIError{
 			Code:           "XMinioLockVersionMismatch",
 			Description:    desc,
-			HTTPStatusCode: http.StatusBadRequest,
+			HTTPStatusCode: http.StatusUpgradeRequired,
 		}, r.URL)
 	case strings.HasPrefix(r.URL.Path, adminPathPrefix):
 		var desc string
@@ -456,24 +525,56 @@ func errorResponseHandler(w http.ResponseWriter, r *http.Request) {
 		writeErrorResponseJSON(r.Context(), w, APIError{
 			Code:           "XMinioAdminVersionMismatch",
 			Description:    desc,
-			HTTPStatusCode: http.StatusBadRequest,
+			HTTPStatusCode: http.StatusUpgradeRequired,
 		}, r.URL)
 	default:
-		desc := fmt.Sprintf("Unknown API request at %s", r.URL.Path)
 		writeErrorResponse(r.Context(), w, APIError{
-			Code:           "XMinioUnknownAPIRequest",
-			Description:    desc,
+			Code: "BadRequest",
+			Description: fmt.Sprintf("An error occurred when parsing the HTTP request %s at '%s'",
+				r.Method, r.URL.Path),
 			HTTPStatusCode: http.StatusBadRequest,
 		}, r.URL, guessIsBrowserReq(r))
 	}
+
 }
 
 // gets host name for current node
 func getHostName(r *http.Request) (hostName string) {
-	if globalIsDistXL {
-		hostName = GetLocalPeer(globalEndpoints)
+	if globalIsDistErasure {
+		hostName = globalLocalNodeName
 	} else {
 		hostName = r.Host
 	}
+	return
+}
+
+// Proxy any request to an endpoint.
+func proxyRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, ep ProxyEndpoint) (success bool) {
+	success = true
+
+	// Make sure we remove any existing headers before
+	// proxying the request to another node.
+	for k := range w.Header() {
+		w.Header().Del(k)
+	}
+
+	f := handlers.NewForwarder(&handlers.Forwarder{
+		PassHost:     true,
+		RoundTripper: ep.Transport,
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			success = false
+			if err != nil && !errors.Is(err, context.Canceled) {
+				logger.LogIf(GlobalContext, err)
+			}
+		},
+	})
+
+	r.URL.Scheme = "http"
+	if globalIsTLS {
+		r.URL.Scheme = "https"
+	}
+
+	r.URL.Host = ep.Host
+	f.ServeHTTP(w, r)
 	return
 }

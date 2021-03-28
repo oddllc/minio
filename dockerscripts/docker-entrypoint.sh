@@ -22,10 +22,18 @@ if [ "${1}" != "minio" ]; then
     fi
 fi
 
-## Look for docker secrets in default documented location.
-docker_secrets_env() {
-    ACCESS_KEY_FILE="/run/secrets/$MINIO_ACCESS_KEY_FILE"
-    SECRET_KEY_FILE="/run/secrets/$MINIO_SECRET_KEY_FILE"
+## Look for docker secrets at given absolute path or in default documented location.
+docker_secrets_env_old() {
+    if [ -f "$MINIO_ACCESS_KEY_FILE" ]; then
+        ACCESS_KEY_FILE="$MINIO_ACCESS_KEY_FILE"
+    else
+        ACCESS_KEY_FILE="/run/secrets/$MINIO_ACCESS_KEY_FILE"
+    fi
+    if [ -f "$MINIO_SECRET_KEY_FILE" ]; then
+        SECRET_KEY_FILE="$MINIO_SECRET_KEY_FILE"
+    else
+        SECRET_KEY_FILE="/run/secrets/$MINIO_SECRET_KEY_FILE"
+    fi
 
     if [ -f "$ACCESS_KEY_FILE" ] && [ -f "$SECRET_KEY_FILE" ]; then
         if [ -f "$ACCESS_KEY_FILE" ]; then
@@ -39,14 +47,41 @@ docker_secrets_env() {
     fi
 }
 
+docker_secrets_env() {
+    if [ -f "$MINIO_ROOT_USER_FILE" ]; then
+        ROOT_USER_FILE="$MINIO_ROOT_USER_FILE"
+    else
+        ROOT_USER_FILE="/run/secrets/$MINIO_ROOT_USER_FILE"
+    fi
+    if [ -f "$MINIO_ROOT_PASSWORD_FILE" ]; then
+        SECRET_KEY_FILE="$MINIO_ROOT_PASSWORD_FILE"
+    else
+        SECRET_KEY_FILE="/run/secrets/$MINIO_ROOT_PASSWORD_FILE"
+    fi
+
+    if [ -f "$ROOT_USER_FILE" ] && [ -f "$SECRET_KEY_FILE" ]; then
+        if [ -f "$ROOT_USER_FILE" ]; then
+            MINIO_ROOT_USER="$(cat "$ROOT_USER_FILE")"
+            export MINIO_ROOT_USER
+        fi
+        if [ -f "$SECRET_KEY_FILE" ]; then
+            MINIO_ROOT_PASSWORD="$(cat "$SECRET_KEY_FILE")"
+            export MINIO_ROOT_PASSWORD
+        fi
+    fi
+}
+
 ## Set KMS_MASTER_KEY from docker secrets if provided
 docker_kms_encryption_env() {
-    KMS_MASTER_KEY_FILE="/run/secrets/$MINIO_KMS_MASTER_KEY_FILE"
+    if [ -f "$MINIO_KMS_MASTER_KEY_FILE" ]; then
+        KMS_MASTER_KEY_FILE="$MINIO_KMS_MASTER_KEY_FILE"
+    else
+        KMS_MASTER_KEY_FILE="/run/secrets/$MINIO_KMS_MASTER_KEY_FILE"
+    fi
 
     if [ -f "$KMS_MASTER_KEY_FILE" ]; then
         MINIO_KMS_MASTER_KEY="$(cat "$KMS_MASTER_KEY_FILE")"
         export MINIO_KMS_MASTER_KEY
-
     fi
 }
 
@@ -58,22 +93,27 @@ docker_sse_encryption_env() {
     if [ -f "$SSE_MASTER_KEY_FILE" ]; then
         MINIO_SSE_MASTER_KEY="$(cat "$SSE_MASTER_KEY_FILE")"
         export MINIO_SSE_MASTER_KEY
-
     fi
 }
 
 # su-exec to requested user, if service cannot run exec will fail.
 docker_switch_user() {
     if [ ! -z "${MINIO_USERNAME}" ] && [ ! -z "${MINIO_GROUPNAME}" ]; then
-        addgroup -S "$MINIO_GROUPNAME" >/dev/null 2>&1 && \
-            adduser -S -G "$MINIO_GROUPNAME" "$MINIO_USERNAME" >/dev/null 2>&1
-
-        exec su-exec "${MINIO_USERNAME}:${MINIO_GROUPNAME}" "$@"
+        if [ ! -z "${MINIO_UID}" ] && [ ! -z "${MINIO_GID}" ]; then
+            groupadd -g "$MINIO_GID" "$MINIO_GROUPNAME" && \
+                useradd -u "$MINIO_UID" -g "$MINIO_GROUPNAME" "$MINIO_USERNAME"
+        else
+            groupadd "$MINIO_GROUPNAME" && \
+                useradd -g "$MINIO_GROUPNAME" "$MINIO_USERNAME"
+        fi
+        exec setpriv --reuid="${MINIO_USERNAME}" --regid="${MINIO_GROUPNAME}" --keep-groups "$@"
     else
-        # fallback
         exec "$@"
     fi
 }
+
+## Set access env from secrets if necessary.
+docker_secrets_env_old
 
 ## Set access env from secrets if necessary.
 docker_secrets_env

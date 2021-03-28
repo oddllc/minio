@@ -1,5 +1,5 @@
 /*
- * MinIO Cloud Storage, (C) 2018 MinIO, Inc.
+ * MinIO Cloud Storage, (C) 2018, 2020 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,8 @@
 
 package log
 
+import "strings"
+
 // Args - defines the arguments for the API.
 type Args struct {
 	Bucket   string            `json:"bucket,omitempty"`
@@ -25,9 +27,9 @@ type Args struct {
 
 // Trace - defines the trace.
 type Trace struct {
-	Message   string            `json:"message,omitempty"`
-	Source    []string          `json:"source,omitempty"`
-	Variables map[string]string `json:"variables,omitempty"`
+	Message   string                 `json:"message,omitempty"`
+	Source    []string               `json:"source,omitempty"`
+	Variables map[string]interface{} `json:"variables,omitempty"`
 }
 
 // API - defines the api type and its args.
@@ -49,4 +51,19 @@ type Entry struct {
 	UserAgent    string `json:"userAgent,omitempty"`
 	Message      string `json:"message,omitempty"`
 	Trace        *Trace `json:"error,omitempty"`
+}
+
+// Info holds console log messages
+type Info struct {
+	Entry
+	ConsoleMsg string
+	NodeName   string `json:"node"`
+	Err        error  `json:"-"`
+}
+
+// SendLog returns true if log pertains to node specified in args.
+func (l Info) SendLog(node, logKind string) bool {
+	nodeFltr := (node == "" || strings.EqualFold(node, l.NodeName))
+	typeFltr := strings.EqualFold(logKind, "all") || strings.EqualFold(l.LogKind, logKind)
+	return nodeFltr && typeFltr
 }

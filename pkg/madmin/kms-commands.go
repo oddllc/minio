@@ -17,16 +17,39 @@
 package madmin
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/url"
 )
 
+// CreateKey tries to create a new master key with the given keyID
+// at the KMS connected to a MinIO server.
+func (adm *AdminClient) CreateKey(ctx context.Context, keyID string) error {
+	// POST /minio/admin/v3/kms/key/create?key-id=<keyID>
+	qv := url.Values{}
+	qv.Set("key-id", keyID)
+	reqData := requestData{
+		relPath:     adminAPIPrefix + "/kms/key/create",
+		queryValues: qv,
+	}
+
+	resp, err := adm.executeMethod(ctx, http.MethodPost, reqData)
+	if err != nil {
+		return err
+	}
+	defer closeResponse(resp)
+	if resp.StatusCode != http.StatusOK {
+		return httpRespToErrorResponse(resp)
+	}
+	return nil
+}
+
 // GetKeyStatus requests status information about the key referenced by keyID
 // from the KMS connected to a MinIO by performing a Admin-API request.
-// It basically hits the `/minio/admin/v2/kms/key/status` API endpoint.
-func (adm *AdminClient) GetKeyStatus(keyID string) (*KMSKeyStatus, error) {
-	// GET /minio/admin/v2/kms/key/status?key-id=<keyID>
+// It basically hits the `/minio/admin/v3/kms/key/status` API endpoint.
+func (adm *AdminClient) GetKeyStatus(ctx context.Context, keyID string) (*KMSKeyStatus, error) {
+	// GET /minio/admin/v3/kms/key/status?key-id=<keyID>
 	qv := url.Values{}
 	qv.Set("key-id", keyID)
 	reqData := requestData{
@@ -34,7 +57,7 @@ func (adm *AdminClient) GetKeyStatus(keyID string) (*KMSKeyStatus, error) {
 		queryValues: qv,
 	}
 
-	resp, err := adm.executeMethod("GET", reqData)
+	resp, err := adm.executeMethod(ctx, http.MethodGet, reqData)
 	if err != nil {
 		return nil, err
 	}
@@ -57,6 +80,5 @@ func (adm *AdminClient) GetKeyStatus(keyID string) (*KMSKeyStatus, error) {
 type KMSKeyStatus struct {
 	KeyID         string `json:"key-id"`
 	EncryptionErr string `json:"encryption-error,omitempty"` // An empty error == success
-	UpdateErr     string `json:"update-error,omitempty"`     // An empty error == success
 	DecryptionErr string `json:"decryption-error,omitempty"` // An empty error == success
 }

@@ -17,10 +17,12 @@
 package cmd
 
 import (
+	"encoding/hex"
 	"fmt"
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"runtime"
 	"strings"
@@ -73,7 +75,7 @@ func TestReleaseTagToNFromTimeConversion(t *testing.T) {
 		if err != nil && err.Error() != testCase.errStr {
 			t.Errorf("Test %d: Expected %v but got %v", i+1, testCase.errStr, err.Error())
 		}
-		if err == nil && tagTime != testCase.t {
+		if err == nil && !tagTime.Equal(testCase.t) {
 			t.Errorf("Test %d: Expected %v but got %v", i+1, testCase.t, tagTime)
 		}
 	}
@@ -81,10 +83,10 @@ func TestReleaseTagToNFromTimeConversion(t *testing.T) {
 }
 
 func TestDownloadURL(t *testing.T) {
-	sci := os.Getenv("SIMPLE_CI")
+	sci := os.Getenv("MINIO_CI_CD")
 
-	os.Setenv("SIMPLE_CI", "")
-	defer os.Setenv("SIMPLE_CI", sci)
+	os.Setenv("MINIO_CI_CD", "")
+	defer os.Setenv("MINIO_CI_CD", sci)
 
 	minioVersion1 := releaseTimeToReleaseTag(UTCNow())
 	durl := getDownloadURL(minioVersion1)
@@ -136,20 +138,20 @@ func TestUserAgent(t *testing.T) {
 		{
 			envName:     "MESOS_CONTAINER_NAME",
 			envValue:    "mesos-11111",
-			mode:        globalMinioModeXL,
-			expectedStr: fmt.Sprintf("MinIO (%s; %s; %s; %s; source) MinIO/DEVELOPMENT.GOGET MinIO/DEVELOPMENT.GOGET MinIO/DEVELOPMENT.GOGET MinIO/universe-%s", runtime.GOOS, runtime.GOARCH, globalMinioModeXL, "dcos", "mesos-1111"),
+			mode:        globalMinioModeErasure,
+			expectedStr: fmt.Sprintf("MinIO (%s; %s; %s; %s; source) MinIO/DEVELOPMENT.GOGET MinIO/DEVELOPMENT.GOGET MinIO/DEVELOPMENT.GOGET MinIO/universe-%s", runtime.GOOS, runtime.GOARCH, globalMinioModeErasure, "dcos", "mesos-1111"),
 		},
 		{
 			envName:     "KUBERNETES_SERVICE_HOST",
 			envValue:    "10.11.148.5",
-			mode:        globalMinioModeXL,
-			expectedStr: fmt.Sprintf("MinIO (%s; %s; %s; %s; source) MinIO/DEVELOPMENT.GOGET MinIO/DEVELOPMENT.GOGET MinIO/DEVELOPMENT.GOGET", runtime.GOOS, runtime.GOARCH, globalMinioModeXL, "kubernetes"),
+			mode:        globalMinioModeErasure,
+			expectedStr: fmt.Sprintf("MinIO (%s; %s; %s; %s; source) MinIO/DEVELOPMENT.GOGET MinIO/DEVELOPMENT.GOGET MinIO/DEVELOPMENT.GOGET", runtime.GOOS, runtime.GOARCH, globalMinioModeErasure, "kubernetes"),
 		},
 	}
 
 	for i, testCase := range testCases {
-		sci := os.Getenv("SIMPLE_CI")
-		os.Setenv("SIMPLE_CI", "")
+		sci := os.Getenv("MINIO_CI_CD")
+		os.Setenv("MINIO_CI_CD", "")
 
 		os.Setenv(testCase.envName, testCase.envValue)
 		if testCase.envName == "MESOS_CONTAINER_NAME" {
@@ -163,7 +165,7 @@ func TestUserAgent(t *testing.T) {
 		if str != expectedStr {
 			t.Errorf("Test %d: expected: %s, got: %s", i+1, expectedStr, str)
 		}
-		os.Setenv("SIMPLE_CI", sci)
+		os.Setenv("MINIO_CI_CD", sci)
 		os.Unsetenv("MARATHON_APP_LABEL_DCOS_PACKAGE_VERSION")
 		os.Unsetenv(testCase.envName)
 	}
@@ -171,9 +173,9 @@ func TestUserAgent(t *testing.T) {
 
 // Tests if the environment we are running is in DCOS.
 func TestIsDCOS(t *testing.T) {
-	sci := os.Getenv("SIMPLE_CI")
-	os.Setenv("SIMPLE_CI", "")
-	defer os.Setenv("SIMPLE_CI", sci)
+	sci := os.Getenv("MINIO_CI_CD")
+	os.Setenv("MINIO_CI_CD", "")
+	defer os.Setenv("MINIO_CI_CD", sci)
 
 	os.Setenv("MESOS_CONTAINER_NAME", "mesos-1111")
 	dcos := IsDCOS()
@@ -190,9 +192,9 @@ func TestIsDCOS(t *testing.T) {
 
 // Tests if the environment we are running is in kubernetes.
 func TestIsKubernetes(t *testing.T) {
-	sci := os.Getenv("SIMPLE_CI")
-	os.Setenv("SIMPLE_CI", "")
-	defer os.Setenv("SIMPLE_CI", sci)
+	sci := os.Getenv("MINIO_CI_CD")
+	os.Setenv("MINIO_CI_CD", "")
+	defer os.Setenv("MINIO_CI_CD", sci)
 
 	os.Setenv("KUBERNETES_SERVICE_HOST", "10.11.148.5")
 	kubernetes := IsKubernetes()
@@ -271,7 +273,12 @@ func TestDownloadReleaseData(t *testing.T) {
 	}
 
 	for _, testCase := range testCases {
-		result, err := downloadReleaseURL(testCase.releaseChecksumURL, 1*time.Second, "")
+		u, err := url.Parse(testCase.releaseChecksumURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		result, err := downloadReleaseURL(u, 1*time.Second, "")
 		if testCase.expectedErr == nil {
 			if err != nil {
 				t.Fatalf("error: expected: %v, got: %v", testCase.expectedErr, err)
@@ -294,31 +301,29 @@ func TestParseReleaseData(t *testing.T) {
 		data              string
 		expectedResult    time.Time
 		expectedSha256hex string
-		expectedErr       error
+		expectedErr       bool
 	}{
-		{"more than two fields", time.Time{}, "", fmt.Errorf("Unknown release data `more than two fields`")},
-		{"more than", time.Time{}, "", fmt.Errorf("Unknown release information `than`")},
-		{"more than.two.fields", time.Time{}, "", fmt.Errorf("Unknown release `than.two.fields`")},
-		{"more minio.RELEASE.fields", time.Time{}, "", fmt.Errorf(`Unknown release tag format. parsing time "fields" as "2006-01-02T15-04-05Z": cannot parse "fields" as "2006"`)},
-		{"more minio.RELEASE.2016-10-07T01-16-39Z", releaseTime, "more", nil},
-		{"fbe246edbd382902db9a4035df7dce8cb441357d minio.RELEASE.2016-10-07T01-16-39Z\n", releaseTime, "fbe246edbd382902db9a4035df7dce8cb441357d", nil},
-		{"fbe246edbd382902db9a4035df7dce8cb441357d minio.RELEASE.2016-10-07T01-16-39Z.customer-hotfix\n", releaseTime, "fbe246edbd382902db9a4035df7dce8cb441357d", nil},
+		{"more than two fields", time.Time{}, "", true},
+		{"more than", time.Time{}, "", true},
+		{"more than.two.fields", time.Time{}, "", true},
+		{"more minio.RELEASE.fields", time.Time{}, "", true},
+		{"more minio.RELEASE.2016-10-07T01-16-39Z", time.Time{}, "", true},
+		{"fbe246edbd382902db9a4035df7dce8cb441357d minio.RELEASE.2016-10-07T01-16-39Z\n", releaseTime, "fbe246edbd382902db9a4035df7dce8cb441357d", false},
+		{"fbe246edbd382902db9a4035df7dce8cb441357d minio.RELEASE.2016-10-07T01-16-39Z.customer-hotfix\n", releaseTime, "fbe246edbd382902db9a4035df7dce8cb441357d", false},
 	}
 
 	for i, testCase := range testCases {
-		sha256Hex, result, err := parseReleaseData(testCase.data)
-		if testCase.expectedErr == nil {
+		sha256Sum, result, err := parseReleaseData(testCase.data)
+		if !testCase.expectedErr {
 			if err != nil {
-				t.Errorf("error case %d: expected: %v, got: %v", i+1, testCase.expectedErr, err)
+				t.Errorf("error case %d: expected no error, got: %v", i+1, err)
 			}
 		} else if err == nil {
-			t.Errorf("error case %d: expected: %v, got: %v", i+1, testCase.expectedErr, err)
-		} else if testCase.expectedErr.Error() != err.Error() {
-			t.Errorf("error case %d: expected: %v, got: %v", i+1, testCase.expectedErr, err)
+			t.Errorf("error case %d: expected error got: %v", i+1, err)
 		}
 		if err == nil {
-			if sha256Hex != testCase.expectedSha256hex {
-				t.Errorf("case %d: result: expected: %v, got: %v", i+1, testCase.expectedSha256hex, sha256Hex)
+			if hex.EncodeToString(sha256Sum) != testCase.expectedSha256hex {
+				t.Errorf("case %d: result: expected: %v, got: %x", i+1, testCase.expectedSha256hex, sha256Sum)
 			}
 			if !testCase.expectedResult.Equal(result) {
 				t.Errorf("case %d: result: expected: %v, got: %v", i+1, testCase.expectedResult, result)

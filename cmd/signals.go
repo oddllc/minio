@@ -18,6 +18,8 @@ package cmd
 
 import (
 	"context"
+	"errors"
+	"net/http"
 	"os"
 	"strings"
 
@@ -28,8 +30,10 @@ func handleSignals() {
 	// Custom exit function
 	exit := func(success bool) {
 		// If global profiler is set stop before we exit.
-		if globalProfiler != nil {
-			globalProfiler.Stop()
+		globalProfilerMu.Lock()
+		defer globalProfilerMu.Unlock()
+		for _, p := range globalProfiler {
+			p.Stop()
 		}
 
 		if success {
@@ -42,22 +46,21 @@ func handleSignals() {
 	stopProcess := func() bool {
 		var err, oerr error
 
+		// send signal to various go-routines that they need to quit.
+		cancelGlobalContext()
+
 		if globalNotificationSys != nil {
 			globalNotificationSys.RemoveAllRemoteTargets()
 		}
 
-		// Stop watching for any certificate changes.
-		globalTLSCerts.Stop()
-
 		if httpServer := newHTTPServerFn(); httpServer != nil {
 			err = httpServer.Shutdown()
-			logger.LogIf(context.Background(), err)
+			if !errors.Is(err, http.ErrServerClosed) {
+				logger.LogIf(context.Background(), err)
+			}
 		}
 
-		// send signal to various go-routines that they need to quit.
-		close(GlobalServiceDoneCh)
-
-		if objAPI := newObjectLayerWithoutSafeModeFn(); objAPI != nil {
+		if objAPI := newObjectLayerFn(); objAPI != nil {
 			oerr = objAPI.Shutdown(context.Background())
 			logger.LogIf(context.Background(), oerr)
 		}
@@ -67,14 +70,8 @@ func handleSignals() {
 
 	for {
 		select {
-		case err := <-globalHTTPServerErrorCh:
-			if objAPI := newObjectLayerWithoutSafeModeFn(); objAPI != nil {
-				objAPI.Shutdown(context.Background())
-			}
-			if err != nil {
-				logger.Fatal(err, "Unable to start MinIO server")
-			}
-			exit(true)
+		case <-globalHTTPServerErrorCh:
+			exit(stopProcess())
 		case osSignal := <-globalOSSignalCh:
 			logger.Info("Exiting on signal: %s", strings.ToUpper(osSignal.String()))
 			exit(stopProcess())

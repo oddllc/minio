@@ -25,11 +25,26 @@ import (
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/cmd/logger/message/log"
 	"github.com/minio/minio/pkg/color"
+	"github.com/minio/minio/pkg/console"
 )
 
 // Target implements loggerTarget to send log
 // in plain or json format to the standard output.
 type Target struct{}
+
+// Validate - validate if the tty can be written to
+func (c *Target) Validate() error {
+	return nil
+}
+
+// Endpoint returns the backend endpoint
+func (c *Target) Endpoint() string {
+	return ""
+}
+
+func (c *Target) String() string {
+	return "console"
+}
 
 // Send log message 'e' to console
 func (c *Target) Send(e interface{}, logKind string) error {
@@ -61,7 +76,7 @@ func (c *Target) Send(e interface{}, logKind string) error {
 			if tagString != "" {
 				tagString += ", "
 			}
-			tagString += key + "=" + value
+			tagString += fmt.Sprintf("%s=%v", key, value)
 		}
 	}
 
@@ -109,7 +124,7 @@ func (c *Target) Send(e interface{}, logKind string) error {
 		apiString, timeString, deploymentID, requestID, remoteHost, host, userAgent,
 		msg, tagString, strings.Join(trace, "\n"))
 
-	fmt.Println(output)
+	console.Println(output)
 	return nil
 }
 

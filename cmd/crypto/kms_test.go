@@ -16,8 +16,8 @@ package crypto
 
 import (
 	"bytes"
+	"fmt"
 	"path"
-	"strings"
 	"testing"
 )
 
@@ -57,38 +57,48 @@ func TestMasterKeyKMS(t *testing.T) {
 		if !test.ShouldFail && !bytes.Equal(key[:], unsealedKey[:]) {
 			t.Errorf("Test %d: The generated and unsealed key differ", i)
 		}
-
-		rotatedKey, err := kms.UpdateKey(test.UnsealKeyID, sealedKey, test.UnsealContext)
-		if err == nil && test.ShouldFail {
-			t.Errorf("Test %d: KMS updated the generated key successfully but should have failed", i)
-		}
-		if !test.ShouldFail && !bytes.Equal(rotatedKey, sealedKey[:]) {
-			t.Errorf("Test %d: The updated and sealed key differ", i)
-		}
-
 	}
 }
 
-var contextWriteToTests = []struct {
+var contextMarshalTextTests = []struct {
 	Context      Context
 	ExpectedJSON string
 }{
-	{Context: Context{}, ExpectedJSON: "{}"},                                                    // 0
-	{Context: Context{"a": "b"}, ExpectedJSON: `{"a":"b"}`},                                     // 1
-	{Context: Context{"a": "b", "c": "d"}, ExpectedJSON: `{"a":"b","c":"d"}`},                   // 2
-	{Context: Context{"c": "d", "a": "b"}, ExpectedJSON: `{"a":"b","c":"d"}`},                   // 3
-	{Context: Context{"0": "1", "-": "2", ".": "#"}, ExpectedJSON: `{"-":"2",".":"#","0":"1"}`}, // 4
+	0: {Context: Context{}, ExpectedJSON: "{}"},
+	1: {Context: Context{"a": "b"}, ExpectedJSON: `{"a":"b"}`},
+	2: {Context: Context{"a": "b", "c": "d"}, ExpectedJSON: `{"a":"b","c":"d"}`},
+	3: {Context: Context{"c": "d", "a": "b"}, ExpectedJSON: `{"a":"b","c":"d"}`},
+	4: {Context: Context{"0": "1", "-": "2", ".": "#"}, ExpectedJSON: `{"-":"2",".":"#","0":"1"}`},
+	// rfc 8259 escapes
+	5: {Context: Context{"0": "1", "key\\": "val\tue\r\n", "\"": "\""}, ExpectedJSON: `{"\"":"\"","0":"1","key\\":"val\tue\r\n"}`},
+	// html sensitive escapes
+	6: {Context: Context{"a": "<>&"}, ExpectedJSON: `{"a":"\u003c\u003e\u0026"}`},
 }
 
-func TestContextWriteTo(t *testing.T) {
-	for i, test := range contextWriteToTests {
-		var jsonContext strings.Builder
-		if _, err := test.Context.WriteTo(&jsonContext); err != nil {
-			t.Errorf("Test %d: Failed to encode context: %v", i, err)
-			continue
+func TestContextMarshalText(t *testing.T) {
+	for i, test := range contextMarshalTextTests {
+		text, err := test.Context.MarshalText()
+		if err != nil {
+			t.Fatalf("Test %d: Failed to encode context: %v", i, err)
 		}
-		if s := jsonContext.String(); s != test.ExpectedJSON {
-			t.Errorf("Test %d: JSON representation differ - got: '%s' want: '%s'", i, s, test.ExpectedJSON)
+		if string(text) != test.ExpectedJSON {
+			t.Errorf("Test %d: JSON representation differ - got: '%s' want: '%s'", i, string(text), test.ExpectedJSON)
 		}
+	}
+}
+
+func BenchmarkContext(b *testing.B) {
+	tests := []Context{{}, {"bucket": "warp-benchmark-bucket"}, {"0": "1", "-": "2", ".": "#"}, {"34trg": "dfioutr89", "ikjfdghkjf": "jkedfhgfjkhg", "sdfhsdjkh": "if88889", "asddsirfh804": "kjfdshgdfuhgfg78-45604586#$%<>&"}}
+	for _, test := range tests {
+		b.Run(fmt.Sprintf("%d-elems", len(test)), func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_, err := test.MarshalText()
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }
